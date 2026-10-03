@@ -21,9 +21,11 @@ bot = commands.Bot(
 
 created_channels = {}
 
+ANTI_SCAM_MESSAGE = "Don't type here, and this server is only for Fake social media spam messages and they can be kicked immediately if anyone sends a message here."
+
 
 class AntiScamPanel(discord.ui.LayoutView):
-    def __init__(self, message):
+    def __init__(self):
         super().__init__(timeout=None)
         self.kicks = 0
 
@@ -33,7 +35,7 @@ class AntiScamPanel(discord.ui.LayoutView):
                 spacing=discord.SeparatorSpacing.small,
                 visible=True
             ),
-            discord.ui.TextDisplay(message),
+            discord.ui.TextDisplay(ANTI_SCAM_MESSAGE),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
                 visible=True
@@ -58,35 +60,35 @@ class AntiScamPanel(discord.ui.LayoutView):
 
 
 class AntiScamData:
-    def __init__(self, message):
-        self.message = message
-        self.panel = AntiScamPanel(message)
+    def __init__(self):
+        self.panel = AntiScamPanel()
         self.kicks = 0
 
 
-@bot.event
-async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-        print(f"Logged in as {bot.user} ({bot.user.id})")
-        print(f"Synced {len(synced)} command(s)")
-    except Exception as error:
-        print(f"Command sync error: {error}")
-
-
-@bot.tree.command(
+create_group = app_commands.Group(
     name="create",
-    description="Create an anti-scam moderation channel"
+    description="Create server tools"
+)
+
+
+anti_scam_group = app_commands.Group(
+    name="anti",
+    description="Anti moderation tools",
+    parent=create_group
+)
+
+
+@anti_scam_group.command(
+    name="scam",
+    description="Create an anti-scam channel"
 )
 @app_commands.describe(
-    name="The exact name of the channel to create",
-    message="The warning message displayed in the channel"
+    name="The exact name of the channel to create"
 )
 @app_commands.checks.has_permissions(manage_channels=True)
-async def create(
+async def anti_scam(
     interaction: discord.Interaction,
-    name: str,
-    message: str
+    name: str
 ):
     if not interaction.guild:
         await interaction.response.send_message(
@@ -123,12 +125,10 @@ async def create(
     try:
         channel = await interaction.guild.create_text_channel(name)
 
-        data = AntiScamData(message)
+        data = AntiScamData()
         created_channels[channel.id] = data
 
-        await channel.send(
-            view=data.panel
-        )
+        await channel.send(view=data.panel)
 
         await interaction.followup.send(
             f"Created {channel.mention}.",
@@ -147,8 +147,8 @@ async def create(
         )
 
 
-@create.error
-async def create_error(
+@anti_scam.error
+async def anti_scam_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError
 ):
@@ -167,6 +167,16 @@ async def create_error(
             message,
             ephemeral=True
         )
+
+
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"Logged in as {bot.user} ({bot.user.id})")
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as error:
+        print(f"Command sync error: {error}")
 
 
 @bot.event
@@ -201,11 +211,14 @@ async def on_message(message: discord.Message):
         pass
 
     try:
-        await member.kick(reason="Message sent in anti-scam channel")
+        await member.kick(
+            reason="Message sent in anti-scam channel"
+        )
+
         data.kicks += 1
         data.panel.kicks = data.kicks
         data.panel.update_kicks()
-        await data.panel.container.view.message.edit(view=data.panel)
+
     except (discord.Forbidden, discord.NotFound, discord.HTTPException):
         pass
 
@@ -227,5 +240,7 @@ async def start_bot():
             print(f"Bot error: {error}")
             await asyncio.sleep(30)
 
+
+bot.tree.add_command(create_group)
 
 asyncio.run(start_bot())
