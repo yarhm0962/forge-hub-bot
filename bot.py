@@ -415,9 +415,7 @@ def decode_lua_string_token(value):
         content=content[1:]
     return content.encode("utf-8")
 
-# ---- string pooling with XOR encryption ----
-
-MAX_ENCRYPT_BYTES=400
+# ---- string pool (char-code encoded, no XOR/Base64) ----
 
 def pool_strings(tokens,rng,used):
     entries=[]
@@ -451,80 +449,32 @@ def pool_strings(tokens,rng,used):
         else:
             out.append(t)
 
-    bxor_name=generate_obfuscated_name(rng,used,14)
-    key_name=generate_obfuscated_name(rng,used,14)
-    raw_name=generate_obfuscated_name(rng,used,14)
-    i_name=generate_obfuscated_name(rng,used,10)
-    j_name=generate_obfuscated_name(rng,used,10)
-    s_name=generate_obfuscated_name(rng,used,10)
-    o_name=generate_obfuscated_name(rng,used,10)
-
-    key_len=rng.randint(3,6)
-    key=[rng.randint(1,255) for _ in range(key_len)]
-
-    encrypted_literals=[]
-    plain_literals=[]  # (idx, literal_text) for entries too big to encrypt
+    CHUNK=200
+    lines=[f"local {pool_name}={{}}"]
     for idx,raw in enumerate(pool_values):
         try:
             data=decode_lua_string_token(raw)
         except Exception:
             data=None
-        if data is None or len(data)>MAX_ENCRYPT_BYTES:
-            plain_literals.append((idx,raw))
-            encrypted_literals.append(None)
-            continue
-        xored=bytes(b ^ key[j%key_len] for j,b in enumerate(data))
-        esc="".join(f"\\{b:03d}" for b in xored)
-        encrypted_literals.append('"'+esc+'"')
-
-    raw_items=[]
-    for idx in range(len(pool_values)):
-        if encrypted_literals[idx] is not None:
-            raw_items.append(encrypted_literals[idx])
+        pos=idx+1
+        if data is not None and len(data)>0:
+            if len(data)<=CHUNK:
+                char_args=",".join(str(b) for b in data)
+                lines.append(f"{pool_name}[{pos}]=string.char({char_args})")
+            else:
+                parts=[]
+                for ci in range(0,len(data),CHUNK):
+                    chunk=data[ci:ci+CHUNK]
+                    char_args=",".join(str(b) for b in chunk)
+                    parts.append(f"string.char({char_args})")
+                lines.append(f"{pool_name}[{pos}]={'..'.join(parts)}")
+        elif data is not None:
+            lines.append(f'{pool_name}[{pos}]=""')
         else:
-            raw_items.append(None)  # placeholder, filled directly in pool via plain assignment
+            lines.append(f"{pool_name}[{pos}]={raw}")
 
-    key_src="{"+",".join(str(k) for k in key)+"}"
-    raw_src_items=[]
-    for idx,item in enumerate(raw_items):
-        raw_src_items.append(item if item is not None else '""')
-    raw_src="{"+",".join(raw_src_items)+"}"
-
-    boilerplate=f'''
-local {bxor_name}=function(a,b)
-local r,p=0,1
-while a>0 or b>0 do
-local x,y=a%2,b%2
-if x~=y then r=r+p end
-a,b,p=(a-x)/2,(b-y)/2,p*2
-end
-return r
-end
-local {key_name}={key_src}
-local {raw_name}={raw_src}
-local {pool_name}={{}}
-for {i_name}=1,#{raw_name} do
-local {s_name}={raw_name}[{i_name}]
-local {o_name}={{}}
-for {j_name}=1,#{s_name} do
-{o_name}[{j_name}]=string.char({bxor_name}(string.byte({s_name},{j_name}),{key_name}[(({j_name}-1)%#{key_name})+1]))
-end
-{pool_name}[{i_name}]=table.concat({o_name})
-end
-'''
-    decl_tokens=lua_lex(boilerplate)
-
-    # overwrite plain (non-encrypted, oversized) entries directly after decode loop
-    patch_tokens=[]
-    for idx,raw in plain_literals:
-        patch_tokens.append(LuaToken("ident",pool_name,True))
-        patch_tokens.append(LuaToken("op","["))
-        patch_tokens.append(LuaToken("number",str(idx+1)))
-        patch_tokens.append(LuaToken("op","]"))
-        patch_tokens.append(LuaToken("op","="))
-        patch_tokens.append(LuaToken("string",raw))
-
-    return out, decl_tokens+patch_tokens
+    decl_tokens=lua_lex("\n".join(lines)+"\n")
+    return out,decl_tokens
 
 # ---- junk statement insertion (inserted only at verified statement boundaries, i.e. nl==True points) ----
 
@@ -554,6 +504,24 @@ def insert_junk(tokens,rng,used,rate=0.12,cap=40):
             inserted+=1
         out.append(t)
     return out
+
+# ---- anti-environment and anti-tamper injection ----
+
+def make_anti_env_tamper_tokens(rng,used):
+    v1=generate_obfuscated_name(rng,used,12)
+    v2=generate_obfuscated_name(rng,used,12)
+    v3=generate_obfuscated_name(rng,used,12)
+    v4=generate_obfuscated_name(rng,used,12)
+    v5=generate_obfuscated_name(rng,used,12)
+    src=(
+        f'local {v1}=typeof~=nil and type(typeof)=="function"\n'
+        f'local {v2}=game~=nil and {v1} and typeof(game)=="Instance"\n'
+        f'local {v3}=workspace~=nil and {v1} and typeof(workspace)=="Instance"\n'
+        f'local {v4}=debug==nil or debug.getinfo==nil\n'
+        f'local {v5}=type(rawget)=="function" and type(rawset)=="function"\n'
+        f'if not({v2} and {v3} and {v4} and {v5})then return end\n'
+    )
+    return lua_lex(src)
 
 # ---- rendering ----
 
@@ -626,11 +594,17 @@ def obfuscate_lua(source,seed=None):
     tokens=transform_numbers(tokens,rng)
     tokens,pool_decl=pool_strings(tokens,rng,used)
     tokens=insert_junk(tokens,rng,used)
+    anti_env=make_anti_env_tamper_tokens(rng,used)
 
     if pool_decl:
         if tokens:
             tokens[0]=LuaToken(tokens[0].kind,tokens[0].value,True)
         tokens=pool_decl+tokens
+
+    if anti_env:
+        if tokens:
+            tokens[0]=LuaToken(tokens[0].kind,tokens[0].value,True)
+        tokens=anti_env+tokens
 
     output=render_lua(tokens)
     if not output.endswith("\n"):
@@ -739,9 +713,11 @@ class ObfuscatePanel(discord.ui.LayoutView):
             discord.ui.TextDisplay(
                 "### 🛡️ Protection\n"
                 "• Identifier mangling (locals, params, loop variables)\n"
-                "• Encrypted string pool (XOR-keyed, decoded at runtime)\n"
+                "• String pool with char-code encoding\n"
                 "• Nested numeric literal masking\n"
                 "• Dead-code / junk statement injection\n"
+                "• Anti-Environment detection (Roblox context verified)\n"
+                "• Anti-Tamper runtime validation\n"
                 "• Layout-safe statement rendering\n"
                 "• Randomized transformation seed"
             ),
