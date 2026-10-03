@@ -1,262 +1,182 @@
-import asyncio
 import os
-
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is not configured.")
-
+    raise RuntimeError("DISCORD_TOKEN environment variable is missing")
 
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
+
+created_channels = {}
 
 
-class AntiScamView(discord.ui.LayoutView):
-    def __init__(self, message_text: str, kicks: int = 0):
+class AntiScamPanel(discord.ui.LayoutView):
+    def __init__(self, message):
         super().__init__(timeout=None)
+        self.kicks = 0
 
-        label = "kick: 1" if kicks == 1 else f"kicks: {kicks}"
-
-        container = discord.ui.Container(
+        self.container = discord.ui.Container(
             discord.ui.TextDisplay("## Don't Type Here"),
             discord.ui.Separator(
-                visible=True,
-                spacing=discord.SeparatorSpacing.small
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
             ),
-            discord.ui.TextDisplay(message_text),
+            discord.ui.TextDisplay(message),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
             discord.ui.ActionRow(
                 discord.ui.Button(
-                    label=label,
+                    label="kicks: 0",
                     style=discord.ButtonStyle.secondary,
-                    disabled=True,
-                    custom_id="anti_scam_kick_counter"
+                    disabled=True
                 )
             )
         )
 
-        self.add_item(container)
+        self.add_item(self.container)
+
+    def update_kicks(self):
+        for item in self.container.children:
+            if isinstance(item, discord.ui.ActionRow):
+                for button in item.children:
+                    if isinstance(button, discord.ui.Button):
+                        button.label = f"kicks: {self.kicks}"
 
 
 class AntiScamData:
-    def __init__(self, message_id: int, warning: str):
-        self.message_id = message_id
-        self.warning = warning
+    def __init__(self, message):
+        self.message = message
+        self.panel = AntiScamPanel(message)
         self.kicks = 0
 
 
-anti_scam_channels: dict[int, AntiScamData] = {}
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"Logged in as {bot.user} ({bot.user.id})")
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as error:
+        print(f"Command sync error: {error}")
 
 
-class CreateGroup(app_commands.Group):
-    def __init__(self):
-        super().__init__(
-            name="create",
-            description="Create server management features."
-        )
-
-
-class AntiGroup(app_commands.Group):
-    def __init__(self):
-        super().__init__(
-            name="anti",
-            description="Create anti-abuse features."
-        )
-
-
-create_group = CreateGroup()
-anti_group = AntiGroup()
-
-
-@anti_group.command(
-    name="scam",
-    description="Create an anti-scam channel."
+@bot.tree.command(
+    name="create",
+    description="Create an anti-scam moderation channel"
 )
 @app_commands.describe(
-    name="The exact name of the channel to create.",
-    message="The warning message displayed in the channel."
+    name="The exact name of the channel to create",
+    message="The warning message displayed in the channel"
 )
-@app_commands.default_permissions(manage_guild=True)
-async def anti_scam(
+@app_commands.checks.has_permissions(manage_channels=True)
+async def create(
     interaction: discord.Interaction,
     name: str,
     message: str
 ):
-    guild = interaction.guild
-
-    if guild is None:
+    if not interaction.guild:
         await interaction.response.send_message(
             "This command can only be used inside a server.",
             ephemeral=True
         )
         return
 
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(
-            "You need Manage Server permission to use this command.",
-            ephemeral=True
-        )
-        return
-
-    bot_member = guild.me
-
-    if bot_member is None:
-        await interaction.response.send_message(
-            "I could not determine my permissions in this server.",
-            ephemeral=True
-        )
-        return
-
-    missing = []
-
-    if not bot_member.guild_permissions.manage_channels:
-        missing.append("Manage Channels")
-
-    if not bot_member.guild_permissions.kick_members:
-        missing.append("Kick Members")
-
-    if not bot_member.guild_permissions.send_messages:
-        missing.append("Send Messages")
-
-    if missing:
-        await interaction.response.send_message(
-            "I am missing: " + ", ".join(missing),
-            ephemeral=True
-        )
-        return
-
-    if not name.strip():
-        await interaction.response.send_message(
-            "The channel name cannot be empty.",
-            ephemeral=True
-        )
-        return
-
-    if not message.strip():
-        await interaction.response.send_message(
-            "The message cannot be empty.",
-            ephemeral=True
-        )
-        return
-
-    existing = discord.utils.find(
-        lambda channel: channel.name == name,
-        guild.text_channels
-    )
-
-    if existing:
-        await interaction.response.send_message(
-            f"A channel named `{name}` already exists.",
-            ephemeral=True
-        )
-        return
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True
-        ),
-        bot_member: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_messages=True,
-            manage_channels=True
-        )
-    }
-
     await interaction.response.defer(ephemeral=True)
 
-    try:
-        channel = await guild.create_text_channel(
-            name=name,
-            overwrites=overwrites,
-            reason=f"Anti-scam channel created by {interaction.user}"
-        )
-    except discord.Forbidden:
+    me = interaction.guild.me
+
+    if me is None:
         await interaction.followup.send(
-            "I don't have permission to create that channel.",
-            ephemeral=True
-        )
-        return
-    except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"Discord returned an error while creating the channel: {error}",
+            "I could not verify my server permissions.",
             ephemeral=True
         )
         return
 
-    data = AntiScamData(
-        message_id=0,
-        warning=message
-    )
+    if not me.guild_permissions.manage_channels:
+        await interaction.followup.send(
+            "I need the Manage Channels permission.",
+            ephemeral=True
+        )
+        return
 
-    anti_scam_channels[channel.id] = data
+    if not me.guild_permissions.kick_members:
+        await interaction.followup.send(
+            "I need the Kick Members permission.",
+            ephemeral=True
+        )
+        return
 
     try:
-        panel = await channel.send(
-            view=AntiScamView(message, 0)
+        channel = await interaction.guild.create_text_channel(name)
+
+        data = AntiScamData(message)
+        created_channels[channel.id] = data
+
+        await channel.send(
+            view=data.panel
         )
 
-        data.message_id = panel.id
+        await interaction.followup.send(
+            f"Created {channel.mention}.",
+            ephemeral=True
+        )
 
     except discord.Forbidden:
-        anti_scam_channels.pop(channel.id, None)
-
-        try:
-            await channel.delete(
-                reason="Could not send anti-scam panel"
-            )
-        except discord.HTTPException:
-            pass
-
         await interaction.followup.send(
-            "The channel was created, but I could not send the anti-scam panel.",
+            "I don't have permission to create or manage that channel.",
             ephemeral=True
         )
-        return
-
     except discord.HTTPException as error:
-        anti_scam_channels.pop(channel.id, None)
-
-        try:
-            await channel.delete(
-                reason="Could not send anti-scam panel"
-            )
-        except discord.HTTPException:
-            pass
-
         await interaction.followup.send(
-            f"Could not send the anti-scam panel: {error}",
+            f"Discord returned an error: {error}",
             ephemeral=True
         )
-        return
-
-    await interaction.followup.send(
-        f"Created {channel.mention} successfully.",
-        ephemeral=True
-    )
 
 
-async def handle_anti_scam_message(message: discord.Message):
+@create.error
+async def create_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need the Manage Channels permission to use this command."
+    else:
+        message = f"Command error: {error}"
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            message,
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            message,
+            ephemeral=True
+        )
+
+
+@bot.event
+async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    data = anti_scam_channels.get(message.channel.id)
+    data = created_channels.get(message.channel.id)
 
     if data is None:
-        return
-
-    if message.guild is None:
         return
 
     member = message.author
@@ -264,65 +184,30 @@ async def handle_anti_scam_message(message: discord.Message):
     if not isinstance(member, discord.Member):
         return
 
-    if member.id == message.guild.owner_id:
-        return
-
     if member.guild_permissions.administrator:
         return
 
-    bot_member = message.guild.me
+    me = message.guild.me
 
-    if bot_member is None:
+    if me is None or not me.guild_permissions.kick_members:
         return
 
-    if member.top_role >= bot_member.top_role:
+    if member.top_role >= me.top_role:
         return
 
     try:
-        await member.kick(
-            reason=f"Message sent in anti-scam channel #{message.channel.name}"
-        )
-    except discord.Forbidden:
-        return
-    except discord.HTTPException:
-        return
-
-    data.kicks += 1
+        await message.delete()
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
 
     try:
-        panel = await message.channel.fetch_message(data.message_id)
-
-        await panel.edit(
-            view=AntiScamView(
-                data.warning,
-                data.kicks
-            )
-        )
-    except discord.NotFound:
+        await member.kick(reason="Message sent in anti-scam channel")
+        data.kicks += 1
+        data.panel.kicks = data.kicks
+        data.panel.update_kicks()
+        await data.panel.container.view.message.edit(view=data.panel)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
         pass
-    except discord.Forbidden:
-        pass
-    except discord.HTTPException:
-        pass
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    await handle_anti_scam_message(message)
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} ({bot.user.id})")
-
-    if not getattr(bot, "_commands_synced", False):
-        try:
-            synced = await bot.tree.sync()
-            bot._commands_synced = True
-            print(f"Synced {len(synced)} application command(s)")
-        except discord.HTTPException as error:
-            print(f"Command sync failed: {error}")
 
 
 async def start_bot():
@@ -330,41 +215,16 @@ async def start_bot():
         try:
             await bot.start(TOKEN)
             break
-
-        except discord.LoginFailure:
-            print("Discord rejected the bot token.")
-            print("Check DISCORD_TOKEN in Render.")
-            await asyncio.sleep(60)
-
         except discord.HTTPException as error:
-            if error.status == 429:
-                retry_after = 60.0
-
-                try:
-                    retry_after = float(
-                        error.response.headers.get(
-                            "Retry-After",
-                            retry_after
-                        )
-                    )
-                except (AttributeError, TypeError, ValueError):
-                    pass
-
-                retry_after = max(retry_after, 5.0)
-
-                print(
-                    f"Discord rate-limited the bot. "
-                    f"Waiting {retry_after:.1f} seconds before retrying."
-                )
-
-                await asyncio.sleep(retry_after)
-                continue
-
-            print(f"Discord HTTP error: {error}")
-            await asyncio.sleep(30)
-
+            retry_after = getattr(error, "retry_after", 30)
+            print(f"Discord connection error: {error}")
+            print(f"Retrying in {retry_after:.1f} seconds...")
+            await asyncio.sleep(retry_after)
+        except discord.LoginFailure:
+            print("Invalid Discord bot token.")
+            break
         except Exception as error:
-            print(f"Unexpected startup error: {error}")
+            print(f"Bot error: {error}")
             await asyncio.sleep(30)
 
 
