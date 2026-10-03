@@ -232,13 +232,16 @@ class ObfuscatePanel(discord.ui.LayoutView):
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
             discord.ui.TextDisplay("Your Lua source was transformed successfully."),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay(f"### 📥 Download\\n[**{name}**](attachment://{name})"),
-            discord.ui.TextDisplay(f"**Original Size**\\n`{original:,} bytes`\\n\\n**Protected Size**\\n`{protected:,} bytes`\\n\\n**SHA-256**\\n`{digest[:16]}...`"),
+            discord.ui.TextDisplay("### 📥 Protected File"),
+            discord.ui.File(f"attachment://{name}"),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay("### ⚙️ Protection\\nIdentifier mangling, number transformation, and string pooling are enabled at strength 5."),
+            discord.ui.TextDisplay(f"**Output**\n`{name}`\n\n**Original Size**\n`{original:,} bytes`\n\n**Protected Size**\n`{protected:,} bytes`\n\n**SHA-256**\n`{digest[:16]}...`"),
+            discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
+            discord.ui.TextDisplay("### ⚙️ Protection\nIdentifier mangling, number transformation, and string pooling are enabled at strength 5."),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
             discord.ui.TextDisplay("The output is source transformation, not encryption. Test the generated file before production use.")
-        ); self.add_item(self.container)
+        )
+        self.add_item(self.container)
 
 create_group=app_commands.Group(name="create",description="Create server tools")
 anti_group=app_commands.Group(name="anti",description="Anti moderation tools",parent=create_group)
@@ -320,7 +323,7 @@ async def obfuscate(interaction:discord.Interaction,file:discord.Attachment):
         data=protected.encode("utf-8"); digest=sha256_text(protected); base=os.path.splitext(os.path.basename(filename))[0]
         output_name=f"{base}.obfuscated{ext}"
         output=discord.File(io.BytesIO(data),filename=output_name)
-        await interaction.followup.send(view=ObfuscatePanel(output_name,len(raw),len(data),digest),file=output)
+        await interaction.followup.send(view=ObfuscatePanel(output_name,len(raw),len(data),digest),files=[output])
     except discord.HTTPException as error:
         try: await interaction.followup.send(f"Discord returned an error while sending the protected file: {error}",ephemeral=True)
         except discord.HTTPException: pass
