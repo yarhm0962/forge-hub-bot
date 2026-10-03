@@ -27,8 +27,8 @@ created_channels = {}
 
 ANTI_SCAM_MESSAGE = (
     "This channel is protected by the server moderation system.\n\n"
-    "Do not send messages here. Any message sent in this channel may result "
-    "in an immediate kick from the server.\n\n"
+    "Please do not send messages here. Messages sent in this channel "
+    "may result in an immediate kick from the server.\n\n"
     "If you have read and understood this notice, react with 👍 below."
 )
 
@@ -104,9 +104,9 @@ class AntiScamPanel(discord.ui.LayoutView):
                 visible=True
             ),
             discord.ui.TextDisplay(
-                "### ⚠️ Moderation Notice\n"
-                "Messages sent here are monitored automatically. "
-                "Please read the notice above before interacting with this channel."
+                "### ⚠️ Automatic Moderation\n"
+                "This channel is monitored automatically. "
+                "Please read the notice before interacting."
             ),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
@@ -144,11 +144,14 @@ class InsightsPanel(discord.ui.LayoutView):
         net_growth = joins - leaves
 
         if net_growth > 0:
-            growth_text = f"📈 +{net_growth}"
+            growth = f"+{net_growth:,}"
+            growth_status = "📈 Positive growth"
         elif net_growth < 0:
-            growth_text = f"📉 {net_growth}"
+            growth = f"{net_growth:,}"
+            growth_status = "📉 Negative growth"
         else:
-            growth_text = "➖ 0"
+            growth = "0"
+            growth_status = "➖ No net change"
 
         self.container = discord.ui.Container(
             discord.ui.TextDisplay("## 📊 Server Insights"),
@@ -158,52 +161,73 @@ class InsightsPanel(discord.ui.LayoutView):
             ),
             discord.ui.TextDisplay(
                 f"### {guild.name}\n"
-                "Here is the server's activity summary for the last 30 days."
+                "A quick overview of member activity during the "
+                "most recent 30-day period."
             ),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
                 visible=True
             ),
             discord.ui.TextDisplay(
-                f"👥 **Current Members**\n"
+                f"👥 **Members**\n"
                 f"`{current_members:,}`"
             ),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
+            discord.ui.TextDisplay(
+                f"🟢 **Joined**\n"
+                f"`{joins:,}` members joined in the last 30 days."
             ),
             discord.ui.TextDisplay(
-                f"🟢 **Joined — Last 30 Days**\n"
-                f"`{joins:,}`"
-            ),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
+                f"🔴 **Left**\n"
+                f"`{leaves:,}` members left in the last 30 days."
             ),
             discord.ui.TextDisplay(
-                f"🔴 **Left — Last 30 Days**\n"
-                f"`{leaves:,}`"
-            ),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(
-                f"📈 **Net Growth — Last 30 Days**\n"
-                f"`{growth_text}`"
+                f"📈 **Net Growth**\n"
+                f"`{growth}` members"
             ),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
                 visible=True
             ),
             discord.ui.TextDisplay(
-                "### ℹ️ About These Numbers\n"
-                "Join and leave totals are tracked automatically by the bot "
-                "and calculated over a rolling 30-day period."
+                f"**{growth_status}**\n"
+                "Statistics are calculated from member events recorded "
+                "by the bot over a rolling 30-day window."
             )
         )
 
         self.add_item(self.container)
+
+
+class PurgePanel(discord.ui.LayoutView):
+    def __init__(self, count, deleted):
+        super().__init__(timeout=None)
+
+        self.container = discord.ui.Container(
+            discord.ui.TextDisplay("## 🧹 Messages Cleared"),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                f"Successfully cleared **{deleted:,}** message"
+                f"{'s' if deleted != 1 else ''} from this channel."
+            ),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                f"**Requested:** `{count:,}`\n"
+                f"**Deleted:** `{deleted:,}`\n"
+                f"**Channel:** {self._channel_name}"
+            )
+        )
+
+        self.add_item(self.container)
+
+    @property
+    def _channel_name(self):
+        return "this channel"
 
 
 create_group = app_commands.Group(
@@ -270,13 +294,14 @@ async def anti_scam(
     try:
         channel = await interaction.guild.create_text_channel(name)
 
-        data = AntiScamPanel()
+        panel = AntiScamPanel()
+
         created_channels[channel.id] = {
-            "panel": data,
+            "panel": panel,
             "message": None
         }
 
-        sent_message = await channel.send(view=data)
+        sent_message = await channel.send(view=panel)
 
         created_channels[channel.id]["message"] = sent_message
 
@@ -304,7 +329,7 @@ async def anti_scam(
 
 @server_group.command(
     name="insights",
-    description="View the server's last 30 days of member insights"
+    description="View member activity from the last 30 days"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def server_insights(
@@ -321,12 +346,98 @@ async def server_insights(
     cleanup_events(data)
     save_insights(insights_data)
 
-    view = InsightsPanel(interaction.guild)
-
     await interaction.response.send_message(
-        view=view,
-        ephemeral=False
+        view=InsightsPanel(interaction.guild)
     )
+
+
+@bot.tree.command(
+    name="purge",
+    description="Delete recent messages from the current channel"
+)
+@app_commands.describe(
+    count="Number of messages to delete (1-1000)"
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def purge(
+    interaction: discord.Interaction,
+    count: app_commands.Range[int, 1, 1000]
+):
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "This command can only be used in a text channel.",
+            ephemeral=True
+        )
+        return
+
+    permissions = interaction.channel.permissions_for(
+        interaction.guild.me
+    )
+
+    if not permissions.manage_messages:
+        await interaction.response.send_message(
+            "I need the Manage Messages permission in this channel.",
+            ephemeral=True
+        )
+        return
+
+    if not permissions.read_message_history:
+        await interaction.response.send_message(
+            "I need the Read Message History permission in this channel.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        deleted_messages = await interaction.channel.purge(
+            limit=count,
+            bulk=True,
+            reason=f"Purge requested by {interaction.user}"
+        )
+
+        deleted = len(deleted_messages)
+
+        panel = PurgePanel(count, deleted)
+
+        await interaction.followup.send(
+            view=panel,
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to delete messages in this channel.",
+            ephemeral=True
+        )
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"Discord returned an error while purging messages: {error}",
+            ephemeral=True
+        )
+
+
+@anti_scam.error
+async def anti_scam_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need the Manage Channels permission to use this command."
+    else:
+        message = f"Command error: {error}"
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            message,
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            message,
+            ephemeral=True
+        )
 
 
 @server_insights.error
@@ -351,13 +462,15 @@ async def server_insights_error(
         )
 
 
-@anti_scam.error
-async def anti_scam_error(
+@purge.error
+async def purge_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError
 ):
     if isinstance(error, app_commands.MissingPermissions):
-        message = "You need the Manage Channels permission to use this command."
+        message = "You need the Manage Messages permission to use this command."
+    elif isinstance(error, app_commands.RangeError):
+        message = "Count must be between 1 and 1000."
     else:
         message = f"Command error: {error}"
 
