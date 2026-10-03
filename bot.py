@@ -505,7 +505,8 @@ class ObfuscatePanel(discord.ui.LayoutView):
             discord.ui.TextDisplay(
                 "📎 **The protected Lua file is attached to this message.**\n"
                 "Download the attachment below to use the obfuscated source."
-            )
+            ),
+            discord.ui.File(f"attachment://{name}")
         )
         self.add_item(self.container)
 
