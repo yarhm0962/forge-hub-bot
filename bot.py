@@ -1,10 +1,14 @@
 import os
+import json
 import asyncio
+from datetime import datetime, timedelta, timezone
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+DATA_FILE = "server_insights.json"
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN environment variable is missing")
@@ -21,7 +25,66 @@ bot = commands.Bot(
 
 created_channels = {}
 
-ANTI_SCAM_MESSAGE = "Don't type here, and this server is only for Fake social media spam messages and they can be kicked immediately if anyone sends a message here."
+ANTI_SCAM_MESSAGE = (
+    "This channel is protected by the server moderation system.\n\n"
+    "Do not send messages here. Any message sent in this channel may result "
+    "in an immediate kick from the server.\n\n"
+    "If you have read and understood this notice, react with 👍 below."
+)
+
+
+def load_insights():
+    if not os.path.exists(DATA_FILE):
+        return {}
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_insights(data):
+    temporary_file = f"{DATA_FILE}.tmp"
+
+    with open(temporary_file, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2)
+
+    os.replace(temporary_file, DATA_FILE)
+
+
+insights_data = load_insights()
+
+
+def guild_data(guild_id):
+    key = str(guild_id)
+
+    if key not in insights_data:
+        insights_data[key] = {
+            "joins": [],
+            "leaves": []
+        }
+
+    return insights_data[key]
+
+
+def cleanup_events(data):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+
+    for event_type in ("joins", "leaves"):
+        cleaned = []
+
+        for timestamp in data.get(event_type, []):
+            try:
+                event_time = datetime.fromisoformat(timestamp)
+
+                if event_time >= cutoff:
+                    cleaned.append(timestamp)
+            except ValueError:
+                continue
+
+        data[event_type] = cleaned
 
 
 class AntiScamPanel(discord.ui.LayoutView):
@@ -30,12 +93,21 @@ class AntiScamPanel(discord.ui.LayoutView):
         self.kicks = 0
 
         self.container = discord.ui.Container(
-            discord.ui.TextDisplay("## Don't Type Here"),
+            discord.ui.TextDisplay("## 🛡️ Anti-Scam Protection"),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
                 visible=True
             ),
             discord.ui.TextDisplay(ANTI_SCAM_MESSAGE),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                "### ⚠️ Moderation Notice\n"
+                "Messages sent here are monitored automatically. "
+                "Please read the notice above before interacting with this channel."
+            ),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
                 visible=True
@@ -59,10 +131,79 @@ class AntiScamPanel(discord.ui.LayoutView):
                         button.label = f"kicks: {self.kicks}"
 
 
-class AntiScamData:
-    def __init__(self):
-        self.panel = AntiScamPanel()
-        self.kicks = 0
+class InsightsPanel(discord.ui.LayoutView):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+
+        data = guild_data(guild.id)
+        cleanup_events(data)
+
+        joins = len(data["joins"])
+        leaves = len(data["leaves"])
+        current_members = guild.member_count or 0
+        net_growth = joins - leaves
+
+        if net_growth > 0:
+            growth_text = f"📈 +{net_growth}"
+        elif net_growth < 0:
+            growth_text = f"📉 {net_growth}"
+        else:
+            growth_text = "➖ 0"
+
+        self.container = discord.ui.Container(
+            discord.ui.TextDisplay("## 📊 Server Insights"),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                f"### {guild.name}\n"
+                "Here is the server's activity summary for the last 30 days."
+            ),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                f"👥 **Current Members**\n"
+                f"`{current_members:,}`"
+            ),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                f"🟢 **Joined — Last 30 Days**\n"
+                f"`{joins:,}`"
+            ),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                f"🔴 **Left — Last 30 Days**\n"
+                f"`{leaves:,}`"
+            ),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                f"📈 **Net Growth — Last 30 Days**\n"
+                f"`{growth_text}`"
+            ),
+            discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.small,
+                visible=True
+            ),
+            discord.ui.TextDisplay(
+                "### ℹ️ About These Numbers\n"
+                "Join and leave totals are tracked automatically by the bot "
+                "and calculated over a rolling 30-day period."
+            )
+        )
+
+        self.add_item(self.container)
 
 
 create_group = app_commands.Group(
@@ -70,17 +211,21 @@ create_group = app_commands.Group(
     description="Create server tools"
 )
 
-
-anti_scam_group = app_commands.Group(
+anti_group = app_commands.Group(
     name="anti",
     description="Anti moderation tools",
     parent=create_group
 )
 
+server_group = app_commands.Group(
+    name="server",
+    description="Server information and tools"
+)
 
-@anti_scam_group.command(
+
+@anti_group.command(
     name="scam",
-    description="Create an anti-scam channel"
+    description="Create an anti-scam protection channel"
 )
 @app_commands.describe(
     name="The exact name of the channel to create"
@@ -125,10 +270,20 @@ async def anti_scam(
     try:
         channel = await interaction.guild.create_text_channel(name)
 
-        data = AntiScamData()
-        created_channels[channel.id] = data
+        data = AntiScamPanel()
+        created_channels[channel.id] = {
+            "panel": data,
+            "message": None
+        }
 
-        await channel.send(view=data.panel)
+        sent_message = await channel.send(view=data)
+
+        created_channels[channel.id]["message"] = sent_message
+
+        try:
+            await sent_message.add_reaction("👍")
+        except discord.HTTPException:
+            pass
 
         await interaction.followup.send(
             f"Created {channel.mention}.",
@@ -143,6 +298,55 @@ async def anti_scam(
     except discord.HTTPException as error:
         await interaction.followup.send(
             f"Discord returned an error: {error}",
+            ephemeral=True
+        )
+
+
+@server_group.command(
+    name="insights",
+    description="View the server's last 30 days of member insights"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def server_insights(
+    interaction: discord.Interaction
+):
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True
+        )
+        return
+
+    data = guild_data(interaction.guild.id)
+    cleanup_events(data)
+    save_insights(insights_data)
+
+    view = InsightsPanel(interaction.guild)
+
+    await interaction.response.send_message(
+        view=view,
+        ephemeral=False
+    )
+
+
+@server_insights.error
+async def server_insights_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need the Manage Server permission to use this command."
+    else:
+        message = f"Command error: {error}"
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            message,
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            message,
             ephemeral=True
         )
 
@@ -170,9 +374,34 @@ async def anti_scam_error(
 
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    data = guild_data(member.guild.id)
+
+    data["joins"].append(
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    cleanup_events(data)
+    save_insights(insights_data)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    data = guild_data(member.guild.id)
+
+    data["leaves"].append(
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    cleanup_events(data)
+    save_insights(insights_data)
+
+
+@bot.event
 async def on_ready():
     try:
         synced = await bot.tree.sync()
+
         print(f"Logged in as {bot.user} ({bot.user.id})")
         print(f"Synced {len(synced)} command(s)")
     except Exception as error:
@@ -207,7 +436,11 @@ async def on_message(message: discord.Message):
 
     try:
         await message.delete()
-    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+    except (
+        discord.Forbidden,
+        discord.NotFound,
+        discord.HTTPException
+    ):
         pass
 
     try:
@@ -215,11 +448,27 @@ async def on_message(message: discord.Message):
             reason="Message sent in anti-scam channel"
         )
 
-        data.kicks += 1
-        data.panel.kicks = data.kicks
-        data.panel.update_kicks()
+        panel = data["panel"]
+        panel.kicks += 1
+        panel.update_kicks()
 
-    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        sent_message = data["message"]
+
+        if sent_message:
+            try:
+                await sent_message.edit(view=panel)
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                pass
+
+    except (
+        discord.Forbidden,
+        discord.NotFound,
+        discord.HTTPException
+    ):
         pass
 
 
@@ -228,19 +477,25 @@ async def start_bot():
         try:
             await bot.start(TOKEN)
             break
+
         except discord.HTTPException as error:
             retry_after = getattr(error, "retry_after", 30)
+
             print(f"Discord connection error: {error}")
             print(f"Retrying in {retry_after:.1f} seconds...")
+
             await asyncio.sleep(retry_after)
+
         except discord.LoginFailure:
             print("Invalid Discord bot token.")
             break
+
         except Exception as error:
             print(f"Bot error: {error}")
             await asyncio.sleep(30)
 
 
 bot.tree.add_command(create_group)
+bot.tree.add_command(server_group)
 
 asyncio.run(start_bot())
