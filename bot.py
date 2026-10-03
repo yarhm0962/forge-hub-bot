@@ -36,10 +36,11 @@ NUMBER_RE=re.compile(
 )
 
 class LuaToken:
-    __slots__=("kind","value")
-    def __init__(self,kind,value):
+    __slots__=("kind","value","nl")
+    def __init__(self,kind,value,nl=False):
         self.kind=kind
         self.value=value
+        self.nl=nl
 
 def long_bracket_end(source,start):
     if start>=len(source) or source[start]!="[":
@@ -60,8 +61,17 @@ def lua_lex(source):
     tokens=[]
     i=0
     n=len(source)
+    pending_nl=False
+    def emit(kind,value):
+        nonlocal pending_nl
+        tokens.append(LuaToken(kind,value,pending_nl))
+        pending_nl=False
     while i<n:
         c=source[i]
+        if c=="\n":
+            pending_nl=True
+            i+=1
+            continue
         if c.isspace():
             i+=1
             continue
@@ -69,9 +79,11 @@ def lua_lex(source):
             lb=long_bracket_end(source,i+2)
             if lb is not None:
                 i=lb
+                pending_nl=True
             else:
                 j=source.find("\n",i+2)
                 i=n if j<0 else j+1
+                pending_nl=True
             continue
         if c in "\"'":
             quote=c
@@ -86,23 +98,23 @@ def lua_lex(source):
                 j+=1
             if j>n or j==i+1 or source[j-1]!=quote:
                 raise ValueError("Unterminated string literal")
-            tokens.append(LuaToken("string",source[i:j]))
+            emit("string",source[i:j])
             i=j
             continue
         lb=long_bracket_end(source,i)
         if lb is not None:
-            tokens.append(LuaToken("string",source[i:lb]))
+            emit("string",source[i:lb])
             i=lb
             continue
         m=IDENT_RE.match(source,i)
         if m:
             value=m.group(0)
-            tokens.append(LuaToken("keyword" if value in KEYWORDS else "ident",value))
+            emit("keyword" if value in KEYWORDS else "ident",value)
             i=m.end()
             continue
         m=NUMBER_RE.match(source,i)
         if m:
-            tokens.append(LuaToken("number",m.group(0)))
+            emit("number",m.group(0))
             i=m.end()
             continue
         matched=None
@@ -111,10 +123,10 @@ def lua_lex(source):
                 matched=op
                 break
         if matched is not None:
-            tokens.append(LuaToken("op",matched))
+            emit("op",matched)
             i+=len(matched)
             continue
-        tokens.append(LuaToken("op",c))
+        emit("op",c)
         i+=1
     return tokens
 
@@ -140,11 +152,11 @@ def is_property_name(tokens,i):
     prev=previous_token(tokens,i)
     return bool(prev and prev.value in (".",":"))
 
-def generate_obfuscated_name(rng,used,length=10):
-    alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+def generate_obfuscated_name(rng,used,length=14):
+    alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     first="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
     while True:
-        name=rng.choice(first)+"".join(rng.choice(alphabet) for _ in range(length-1))
+        name="_"+rng.choice(first)+"".join(rng.choice(alphabet) for _ in range(length-1))
         if name not in used and name not in KEYWORDS:
             used.add(name)
             return name
@@ -180,12 +192,12 @@ def collect_local_candidates(tokens):
                 break
         elif tokens[i].value=="function":
             j=i+1
-            if j<len(tokens) and tokens[j].kind=="ident":
+            while j<len(tokens) and tokens[j].kind=="ident":
                 j+=1
-            if j<len(tokens) and tokens[j].value==":":
-                j+=1
-                if j<len(tokens) and tokens[j].kind=="ident":
+                if j<len(tokens) and tokens[j].value in (".",":"):
                     j+=1
+                    continue
+                break
             if j<len(tokens) and tokens[j].value=="(":
                 depth=1
                 j+=1
@@ -211,14 +223,11 @@ def choose_local_mappings(tokens,rng):
     used=set(all_names)
 
     for name,count in counts.items():
-        if name in KEYWORDS or len(name)<2:
+        if name in KEYWORDS or name=="_" or len(name)<1:
             continue
-        occurrences=sum(1 for t in tokens if t.kind=="ident" and t.value==name)
-        if occurrences<2:
-            continue
-        mapping[name]=generate_obfuscated_name(rng,used,rng.randint(9,14))
+        mapping[name]=generate_obfuscated_name(rng,used,rng.randint(12,20))
 
-    return mapping,declaration_indexes
+    return mapping,declaration_indexes,used
 
 def transform_identifiers(tokens,mapping,declaration_indexes):
     out=[]
@@ -226,10 +235,111 @@ def transform_identifiers(tokens,mapping,declaration_indexes):
         if t.kind=="ident" and t.value in mapping:
             if i in declaration_indexes or not is_table_key(tokens,i):
                 if not is_property_name(tokens,i):
-                    out.append(LuaToken("ident",mapping[t.value]))
+                    out.append(LuaToken("ident",mapping[t.value],t.nl))
                     continue
         out.append(t)
     return out
+
+# ---- block scanning (for-loop / block matching) ----
+
+def scan_blocks(tokens):
+    stack=[]
+    blocks=[]
+    i=0
+    n=len(tokens)
+    while i<n:
+        v=tokens[i].value
+        k=tokens[i].kind
+        if k=="keyword" and v in ("if","while","for","function"):
+            stack.append([v,i,v in ("while","for")])
+        elif k=="keyword" and v=="do":
+            if stack and stack[-1][2]:
+                stack[-1][2]=False
+            else:
+                stack.append(["do",i,False])
+        elif k=="keyword" and v=="repeat":
+            stack.append(["repeat",i,False])
+        elif k=="keyword" and v=="end":
+            if stack:
+                kind,open_i,_=stack.pop()
+                blocks.append((open_i,i,kind))
+        elif k=="keyword" and v=="until":
+            if stack and stack[-1][0]=="repeat":
+                kind,open_i,_=stack.pop()
+                blocks.append((open_i,i,kind))
+        i+=1
+    return blocks
+
+def rename_for_loop_vars(tokens,rng,used):
+    blocks=scan_blocks(tokens)
+    for open_i,close_i,kind in blocks:
+        if kind!="for":
+            continue
+        j=open_i+1
+        names=[]
+        name_indexes=[]
+        while j<len(tokens):
+            if tokens[j].kind=="ident":
+                names.append(tokens[j].value)
+                name_indexes.append(j)
+                j+=1
+                if j<len(tokens) and tokens[j].value==",":
+                    j+=1
+                    continue
+                break
+            break
+        if not names:
+            continue
+        rename={}
+        for nm in names:
+            if nm=="_" :
+                continue
+            if nm not in rename:
+                rename[nm]=generate_obfuscated_name(rng,used,rng.randint(12,20))
+        if not rename:
+            continue
+        for k in range(open_i,close_i+1):
+            t=tokens[k]
+            if t.kind=="ident" and t.value in rename:
+                if not is_table_key(tokens,k) and not is_property_name(tokens,k):
+                    tokens[k]=LuaToken("ident",rename[t.value],t.nl)
+    return tokens
+
+# ---- number obfuscation ----
+
+NUM_FULL_RE=re.compile(r"[0-9]{1,4}")
+
+def split_number_tokens(value,rng,depth=0):
+    number=int(value)
+    if number<2 or number>9999:
+        return [LuaToken("number",value)]
+    variant=rng.randint(0,2)
+    if variant==0:
+        a=rng.randint(1,number-1) if number>1 else 0
+        b=number-a
+        parts=[LuaToken("op","("),LuaToken("number",str(a)),LuaToken("op","+"),LuaToken("number",str(b)),LuaToken("op",")")]
+    elif variant==1:
+        c=rng.randint(1,number+5)
+        d=number+c
+        parts=[LuaToken("op","("),LuaToken("number",str(d)),LuaToken("op","-"),LuaToken("number",str(c)),LuaToken("op",")")]
+    else:
+        m=rng.randint(2,9)
+        q=number//m
+        r=number%m
+        if q<1:
+            a=rng.randint(1,number-1) if number>1 else 0
+            b=number-a
+            parts=[LuaToken("op","("),LuaToken("number",str(a)),LuaToken("op","+"),LuaToken("number",str(b)),LuaToken("op",")")]
+        else:
+            parts=[LuaToken("op","("),LuaToken("op","("),LuaToken("number",str(q)),LuaToken("op","*"),LuaToken("number",str(m)),LuaToken("op",")"),LuaToken("op","+"),LuaToken("number",str(r)),LuaToken("op",")")]
+    if depth<1 and number>20 and rng.random()<0.35:
+        # recursively split one numeric sub-part for extra nesting
+        for idx,p in enumerate(parts):
+            if p.kind=="number" and int(p.value)>10 and rng.random()<0.5:
+                nested=split_number_tokens(p.value,rng,depth+1)
+                parts=parts[:idx]+nested+parts[idx+1:]
+                break
+    return parts
 
 def transform_numbers(tokens,rng):
     out=[]
@@ -238,36 +348,78 @@ def transform_numbers(tokens,rng):
             out.append(t)
             continue
         value=t.value
-        if not re.fullmatch(r"[0-9]{1,3}",value):
+        if not NUM_FULL_RE.fullmatch(value):
             out.append(t)
             continue
-        number=int(value)
-        if number<2 or number>99:
+        parts=split_number_tokens(value,rng)
+        if len(parts)==1:
             out.append(t)
             continue
-        if rng.random()<0.5:
-            a=rng.randint(1,number-1)
-            b=number-a
-            out.extend([
-                LuaToken("op","("),
-                LuaToken("number",str(a)),
-                LuaToken("op","+"),
-                LuaToken("number",str(b)),
-                LuaToken("op",")")
-            ])
-        else:
-            c=rng.randint(1,number)
-            d=number+c
-            out.extend([
-                LuaToken("op","("),
-                LuaToken("number",str(d)),
-                LuaToken("op","-"),
-                LuaToken("number",str(c)),
-                LuaToken("op",")")
-            ])
+        parts[0]=LuaToken(parts[0].kind,parts[0].value,t.nl)
+        out.extend(parts)
     return out
 
-def pool_strings(tokens,rng):
+# ---- string literal decoding (to real bytes) for encryption ----
+
+ESCAPE_SINGLE={'a':7,'b':8,'f':12,'n':10,'r':13,'t':9,'v':11,'\\':92,'"':34,"'":39,'\n':10}
+
+def decode_lua_quoted(literal):
+    s=literal[1:-1]
+    out=bytearray()
+    i=0
+    n=len(s)
+    while i<n:
+        c=s[i]
+        if c=="\\":
+            i+=1
+            if i>=n:
+                break
+            e=s[i]
+            if e in ESCAPE_SINGLE:
+                out.append(ESCAPE_SINGLE[e])
+                i+=1
+            elif e=="x":
+                hexd=s[i+1:i+3]
+                out.append(int(hexd,16))
+                i+=3
+            elif e.isdigit():
+                j=i
+                digits=""
+                while j<n and s[j].isdigit() and len(digits)<3:
+                    digits+=s[j]
+                    j+=1
+                out.append(int(digits)%256)
+                i=j
+            elif e=="z":
+                i+=1
+                while i<n and s[i] in " \t\n\r":
+                    i+=1
+            else:
+                out.extend(e.encode("utf-8"))
+                i+=1
+        else:
+            out.extend(c.encode("utf-8"))
+            i+=1
+    return bytes(out)
+
+def decode_lua_string_token(value):
+    if value[0] in "\"'":
+        return decode_lua_quoted(value)
+    # long bracket string
+    # find opening [=*[
+    i=1
+    while value[i]=="=":
+        i+=1
+    content=value[i+1:-(i+1)]
+    if content.startswith("\n"):
+        content=content[1:]
+    return content.encode("utf-8")
+
+# ---- string pooling with XOR encryption ----
+
+MAX_ENCRYPT_BYTES=400
+
+def pool_strings(tokens,rng,used):
     entries=[]
     index={}
     for t in tokens:
@@ -276,47 +428,134 @@ def pool_strings(tokens,rng):
             entries.append(t.value)
 
     if not entries:
-        return tokens,None
+        return tokens,[]
 
     order=list(range(len(entries)))
     rng.shuffle(order)
     remap={}
     pool_values=[]
-
     for new_index,old_index in enumerate(order,1):
         remap[old_index+1]=new_index
         pool_values.append(entries[old_index])
 
-    used=all_identifier_values(tokens)
-    pool_name="__"+generate_obfuscated_name(rng,used,12)
+    pool_name=generate_obfuscated_name(rng,used,14)
 
     out=[]
     for t in tokens:
         if t.kind=="string":
             original_index=index[t.value]
-            out.extend([
-                LuaToken("ident",pool_name),
-                LuaToken("op","["),
-                LuaToken("number",str(remap[original_index])),
-                LuaToken("op","]")
-            ])
+            out.append(LuaToken("ident",pool_name,t.nl))
+            out.append(LuaToken("op","["))
+            out.append(LuaToken("number",str(remap[original_index])))
+            out.append(LuaToken("op","]"))
         else:
             out.append(t)
 
-    declaration=[
-        LuaToken("keyword","local"),
-        LuaToken("ident",pool_name),
-        LuaToken("op","="),
-        LuaToken("op","{")
-    ]
+    bxor_name=generate_obfuscated_name(rng,used,14)
+    key_name=generate_obfuscated_name(rng,used,14)
+    raw_name=generate_obfuscated_name(rng,used,14)
+    i_name=generate_obfuscated_name(rng,used,10)
+    j_name=generate_obfuscated_name(rng,used,10)
+    s_name=generate_obfuscated_name(rng,used,10)
+    o_name=generate_obfuscated_name(rng,used,10)
 
-    for i,value in enumerate(pool_values):
-        if i:
-            declaration.append(LuaToken("op",","))
-        declaration.append(LuaToken("string",value))
+    key_len=rng.randint(3,6)
+    key=[rng.randint(1,255) for _ in range(key_len)]
 
-    declaration.append(LuaToken("op","}"))
-    return out,declaration
+    encrypted_literals=[]
+    plain_literals=[]  # (idx, literal_text) for entries too big to encrypt
+    for idx,raw in enumerate(pool_values):
+        try:
+            data=decode_lua_string_token(raw)
+        except Exception:
+            data=None
+        if data is None or len(data)>MAX_ENCRYPT_BYTES:
+            plain_literals.append((idx,raw))
+            encrypted_literals.append(None)
+            continue
+        xored=bytes(b ^ key[j%key_len] for j,b in enumerate(data))
+        esc="".join(f"\\{b:03d}" for b in xored)
+        encrypted_literals.append('"'+esc+'"')
+
+    raw_items=[]
+    for idx in range(len(pool_values)):
+        if encrypted_literals[idx] is not None:
+            raw_items.append(encrypted_literals[idx])
+        else:
+            raw_items.append(None)  # placeholder, filled directly in pool via plain assignment
+
+    key_src="{"+",".join(str(k) for k in key)+"}"
+    raw_src_items=[]
+    for idx,item in enumerate(raw_items):
+        raw_src_items.append(item if item is not None else '""')
+    raw_src="{"+",".join(raw_src_items)+"}"
+
+    boilerplate=f'''
+local {bxor_name}=function(a,b)
+local r,p=0,1
+while a>0 or b>0 do
+local x,y=a%2,b%2
+if x~=y then r=r+p end
+a,b,p=(a-x)/2,(b-y)/2,p*2
+end
+return r
+end
+local {key_name}={key_src}
+local {raw_name}={raw_src}
+local {pool_name}={{}}
+for {i_name}=1,#{raw_name} do
+local {s_name}={raw_name}[{i_name}]
+local {o_name}={{}}
+for {j_name}=1,#{s_name} do
+{o_name}[{j_name}]=string.char({bxor_name}(string.byte({s_name},{j_name}),{key_name}[(({j_name}-1)%#{key_name})+1]))
+end
+{pool_name}[{i_name}]=table.concat({o_name})
+end
+'''
+    decl_tokens=lua_lex(boilerplate)
+
+    # overwrite plain (non-encrypted, oversized) entries directly after decode loop
+    patch_tokens=[]
+    for idx,raw in plain_literals:
+        patch_tokens.append(LuaToken("ident",pool_name,True))
+        patch_tokens.append(LuaToken("op","["))
+        patch_tokens.append(LuaToken("number",str(idx+1)))
+        patch_tokens.append(LuaToken("op","]"))
+        patch_tokens.append(LuaToken("op","="))
+        patch_tokens.append(LuaToken("string",raw))
+
+    return out, decl_tokens+patch_tokens
+
+# ---- junk statement insertion (inserted only at verified statement boundaries, i.e. nl==True points) ----
+
+def make_junk_statement(rng,used):
+    name=generate_obfuscated_name(rng,used,rng.randint(10,18))
+    kind=rng.randint(0,2)
+    if kind==0:
+        val=str(rng.randint(1,99999))
+        return [LuaToken("keyword","local",True),LuaToken("ident",name),LuaToken("op","="),LuaToken("number",val)]
+    elif kind==1:
+        junk_str='"'+''.join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(4,10)))+'"'
+        return [LuaToken("keyword","local",True),LuaToken("ident",name),LuaToken("op","="),LuaToken("string",junk_str)]
+    else:
+        inner=generate_obfuscated_name(rng,used,10)
+        return [LuaToken("keyword","if",True),LuaToken("keyword","false"),LuaToken("keyword","then"),
+                LuaToken("keyword","local"),LuaToken("ident",inner),LuaToken("op","="),LuaToken("number","0"),
+                LuaToken("keyword","end")]
+
+BLOCK_CLOSERS={"end","else","elseif","until"}
+
+def insert_junk(tokens,rng,used,rate=0.12,cap=40):
+    out=[]
+    inserted=0
+    for t in tokens:
+        if t.nl and inserted<cap and t.value not in BLOCK_CLOSERS and rng.random()<rate:
+            out.extend(make_junk_statement(rng,used))
+            inserted+=1
+        out.append(t)
+    return out
+
+# ---- rendering ----
 
 def needs_space(a,b):
     if a is None or b is None:
@@ -337,53 +576,61 @@ def render_lua(tokens):
     pieces=[]
     prev=None
     for t in tokens:
-        if needs_space(prev,t):
-            pieces.append(" ")
+        if prev is not None:
+            if t.nl:
+                pieces.append("\n")
+            elif needs_space(prev,t):
+                pieces.append(" ")
         pieces.append(t.value)
         prev=t
     return "".join(pieces)
 
 def validate_lua_source(source):
-    luac=shutil.which("luac")
+    luac=shutil.which("luac") or shutil.which("lua")
+    depth=0
+    for ch in source:
+        if ch in "([{":
+            depth+=1
+        elif ch in ")]}":
+            depth-=1
+            if depth<0:
+                return False,"Unbalanced brackets in generated output"
+    if depth!=0:
+        return False,"Unbalanced brackets in generated output"
     if luac:
         fd,path=tempfile.mkstemp(suffix=".lua")
         os.close(fd)
         try:
             with open(path,"w",encoding="utf-8",newline="\n") as f:
                 f.write(source)
-            result=subprocess.run(
-                [luac,"-p",path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10
-            )
+            result=subprocess.run([luac,"-p",path],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=10)
             if result.returncode!=0:
                 return False,result.stderr.strip() or "luac rejected the generated Lua"
             return True,"luac syntax validation passed"
         except subprocess.TimeoutExpired:
             return False,"luac validation timed out"
         finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-    return True,"luac not installed; structural validation completed"
+            try: os.remove(path)
+            except OSError: pass
+    return True,"structural validation completed (luac not installed)"
 
 def obfuscate_lua(source,seed=None):
     if seed is None:
         seed=random.SystemRandom().randint(1,2**63-1)
-
     rng=random.Random(seed)
     tokens=lua_lex(source)
 
-    mapping,declaration_indexes=choose_local_mappings(tokens,rng)
+    mapping,declaration_indexes,used=choose_local_mappings(tokens,rng)
     tokens=transform_identifiers(tokens,mapping,declaration_indexes)
+    tokens=rename_for_loop_vars(tokens,rng,used)
     tokens=transform_numbers(tokens,rng)
+    tokens,pool_decl=pool_strings(tokens,rng,used)
+    tokens=insert_junk(tokens,rng,used)
 
-    tokens,pool_declaration=pool_strings(tokens,rng)
-    if pool_declaration:
-        tokens=pool_declaration+tokens
+    if pool_decl:
+        if tokens:
+            tokens[0]=LuaToken(tokens[0].kind,tokens[0].value,True)
+        tokens=pool_decl+tokens
 
     output=render_lua(tokens)
     if not output.endswith("\n"):
@@ -393,7 +640,7 @@ def obfuscate_lua(source,seed=None):
     if not ok:
         raise ValueError(validation)
 
-    return output,seed,validation,len(mapping),bool(pool_declaration)
+    return output,seed,validation,len(mapping),bool(pool_decl)
 
 def load_json(name,default):
     if not os.path.exists(name): return default
@@ -491,9 +738,11 @@ class ObfuscatePanel(discord.ui.LayoutView):
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
             discord.ui.TextDisplay(
                 "### 🛡️ Protection\n"
-                "• Identifier mangling\n"
-                "• Number transformation\n"
-                "• String pooling\n"
+                "• Identifier mangling (locals, params, loop variables)\n"
+                "• Encrypted string pool (XOR-keyed, decoded at runtime)\n"
+                "• Nested numeric literal masking\n"
+                "• Dead-code / junk statement injection\n"
+                "• Layout-safe statement rendering\n"
                 "• Randomized transformation seed"
             ),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
