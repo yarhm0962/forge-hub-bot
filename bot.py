@@ -8,7 +8,8 @@ from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATA_FILE = "server_insights.json"
+INSIGHTS_FILE = "server_insights.json"
+ANTI_SCAM_FILE = "anti_scam_channels.json"
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN environment variable is missing")
@@ -23,8 +24,6 @@ bot = commands.Bot(
     intents=intents
 )
 
-created_channels = {}
-
 ANTI_SCAM_MESSAGE = (
     "This channel is protected by the server moderation system.\n\n"
     "Please do not send messages here. Messages sent in this channel "
@@ -32,32 +31,35 @@ ANTI_SCAM_MESSAGE = (
     "If you have read and understood this notice, react with 👍 below."
 )
 
+created_channels = {}
 
-def load_insights():
-    if not os.path.exists(DATA_FILE):
-        return {}
+
+def load_json(filename, default):
+    if not os.path.exists(filename):
+        return default
 
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as file:
+        with open(filename, "r", encoding="utf-8") as file:
             data = json.load(file)
-            return data if isinstance(data, dict) else {}
+            return data
     except (json.JSONDecodeError, OSError):
-        return {}
+        return default
 
 
-def save_insights(data):
-    temporary_file = f"{DATA_FILE}.tmp"
+def save_json(filename, data):
+    temporary_file = f"{filename}.tmp"
 
     with open(temporary_file, "w", encoding="utf-8") as file:
         json.dump(data, file, indent=2)
 
-    os.replace(temporary_file, DATA_FILE)
+    os.replace(temporary_file, filename)
 
 
-insights_data = load_insights()
+insights_data = load_json(INSIGHTS_FILE, {})
+anti_scam_data = load_json(ANTI_SCAM_FILE, {})
 
 
-def guild_data(guild_id):
+def guild_insights(guild_id):
     key = str(guild_id)
 
     if key not in insights_data:
@@ -88,9 +90,9 @@ def cleanup_events(data):
 
 
 class AntiScamPanel(discord.ui.LayoutView):
-    def __init__(self):
+    def __init__(self, kicks=0):
         super().__init__(timeout=None)
-        self.kicks = 0
+        self.kicks = kicks
 
         self.container = discord.ui.Container(
             discord.ui.TextDisplay("## 🛡️ Anti-Scam Protection"),
@@ -106,7 +108,8 @@ class AntiScamPanel(discord.ui.LayoutView):
             discord.ui.TextDisplay(
                 "### ⚠️ Automatic Moderation\n"
                 "This channel is monitored automatically. "
-                "Please read the notice before interacting."
+                "Messages sent here are removed and the sender may be "
+                "kicked from the server."
             ),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
@@ -114,7 +117,7 @@ class AntiScamPanel(discord.ui.LayoutView):
             ),
             discord.ui.ActionRow(
                 discord.ui.Button(
-                    label="kicks: 0",
+                    label=f"kicks: {kicks}",
                     style=discord.ButtonStyle.secondary,
                     disabled=True
                 )
@@ -135,7 +138,7 @@ class InsightsPanel(discord.ui.LayoutView):
     def __init__(self, guild):
         super().__init__(timeout=None)
 
-        data = guild_data(guild.id)
+        data = guild_insights(guild.id)
         cleanup_events(data)
 
         joins = len(data["joins"])
@@ -145,13 +148,13 @@ class InsightsPanel(discord.ui.LayoutView):
 
         if net_growth > 0:
             growth = f"+{net_growth:,}"
-            growth_status = "📈 Positive growth"
+            status = "📈 Growing"
         elif net_growth < 0:
             growth = f"{net_growth:,}"
-            growth_status = "📉 Negative growth"
+            status = "📉 Declining"
         else:
             growth = "0"
-            growth_status = "➖ No net change"
+            status = "➖ Stable"
 
         self.container = discord.ui.Container(
             discord.ui.TextDisplay("## 📊 Server Insights"),
@@ -161,27 +164,27 @@ class InsightsPanel(discord.ui.LayoutView):
             ),
             discord.ui.TextDisplay(
                 f"### {guild.name}\n"
-                "A quick overview of member activity during the "
-                "most recent 30-day period."
+                "A clean overview of member activity across "
+                "the last 30 days."
             ),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
                 visible=True
             ),
             discord.ui.TextDisplay(
-                f"👥 **Members**\n"
+                f"👥 **Current Members**\n"
                 f"`{current_members:,}`"
             ),
             discord.ui.TextDisplay(
-                f"🟢 **Joined**\n"
-                f"`{joins:,}` members joined in the last 30 days."
+                f"🟢 **New Members**\n"
+                f"`{joins:,}` joined during the last 30 days."
             ),
             discord.ui.TextDisplay(
-                f"🔴 **Left**\n"
-                f"`{leaves:,}` members left in the last 30 days."
+                f"🔴 **Departures**\n"
+                f"`{leaves:,}` left during the last 30 days."
             ),
             discord.ui.TextDisplay(
-                f"📈 **Net Growth**\n"
+                f"📈 **Net Change**\n"
                 f"`{growth}` members"
             ),
             discord.ui.Separator(
@@ -189,9 +192,9 @@ class InsightsPanel(discord.ui.LayoutView):
                 visible=True
             ),
             discord.ui.TextDisplay(
-                f"**{growth_status}**\n"
-                "Statistics are calculated from member events recorded "
-                "by the bot over a rolling 30-day window."
+                f"**{status}**\n"
+                "Join and leave activity is automatically tracked "
+                "over a rolling 30-day period."
             )
         )
 
@@ -210,7 +213,7 @@ class PurgePanel(discord.ui.LayoutView):
             ),
             discord.ui.TextDisplay(
                 f"Successfully cleared **{deleted:,}** message"
-                f"{'s' if deleted != 1 else ''} from this channel."
+                f"{'s' if deleted != 1 else ''}."
             ),
             discord.ui.Separator(
                 spacing=discord.SeparatorSpacing.small,
@@ -219,15 +222,15 @@ class PurgePanel(discord.ui.LayoutView):
             discord.ui.TextDisplay(
                 f"**Requested:** `{count:,}`\n"
                 f"**Deleted:** `{deleted:,}`\n"
-                f"**Channel:** {self._channel_name}"
+                f"**Channel:** {self.channel_name}"
             )
         )
 
         self.add_item(self.container)
 
     @property
-    def _channel_name(self):
-        return "this channel"
+    def channel_name(self):
+        return "Current channel"
 
 
 create_group = app_commands.Group(
@@ -296,19 +299,27 @@ async def anti_scam(
 
         panel = AntiScamPanel()
 
-        created_channels[channel.id] = {
-            "panel": panel,
-            "message": None
-        }
-
         sent_message = await channel.send(view=panel)
-
-        created_channels[channel.id]["message"] = sent_message
 
         try:
             await sent_message.add_reaction("👍")
         except discord.HTTPException:
             pass
+
+        anti_scam_data[str(channel.id)] = {
+            "guild_id": interaction.guild.id,
+            "channel_id": channel.id,
+            "message_id": sent_message.id,
+            "kicks": 0
+        }
+
+        save_json(ANTI_SCAM_FILE, anti_scam_data)
+
+        created_channels[channel.id] = {
+            "panel": panel,
+            "message": sent_message,
+            "guild_id": interaction.guild.id
+        }
 
         await interaction.followup.send(
             f"Created {channel.mention}.",
@@ -332,9 +343,7 @@ async def anti_scam(
     description="View member activity from the last 30 days"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
-async def server_insights(
-    interaction: discord.Interaction
-):
+async def server_insights(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message(
             "This command can only be used inside a server.",
@@ -342,9 +351,9 @@ async def server_insights(
         )
         return
 
-    data = guild_data(interaction.guild.id)
+    data = guild_insights(interaction.guild.id)
     cleanup_events(data)
-    save_insights(insights_data)
+    save_json(INSIGHTS_FILE, insights_data)
 
     await interaction.response.send_message(
         view=InsightsPanel(interaction.guild)
@@ -370,9 +379,16 @@ async def purge(
         )
         return
 
-    permissions = interaction.channel.permissions_for(
-        interaction.guild.me
-    )
+    me = interaction.guild.me
+
+    if me is None:
+        await interaction.response.send_message(
+            "I could not verify my permissions.",
+            ephemeral=True
+        )
+        return
+
+    permissions = interaction.channel.permissions_for(me)
 
     if not permissions.manage_messages:
         await interaction.response.send_message(
@@ -399,10 +415,8 @@ async def purge(
 
         deleted = len(deleted_messages)
 
-        panel = PurgePanel(count, deleted)
-
         await interaction.followup.send(
-            view=panel,
+            view=PurgePanel(count, deleted),
             ephemeral=True
         )
 
@@ -416,6 +430,179 @@ async def purge(
             f"Discord returned an error while purging messages: {error}",
             ephemeral=True
         )
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    data = guild_insights(member.guild.id)
+
+    data["joins"].append(
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    cleanup_events(data)
+    save_json(INSIGHTS_FILE, insights_data)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    data = guild_insights(member.guild.id)
+
+    data["leaves"].append(
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    cleanup_events(data)
+    save_json(INSIGHTS_FILE, insights_data)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    data = created_channels.get(message.channel.id)
+
+    if data is None:
+        return
+
+    member = message.author
+
+    if not isinstance(member, discord.Member):
+        return
+
+    if member.guild_permissions.administrator:
+        return
+
+    me = message.guild.me
+
+    if me is None:
+        return
+
+    if not me.guild_permissions.kick_members:
+        return
+
+    if member.top_role >= me.top_role:
+        return
+
+    try:
+        await message.delete()
+    except (
+        discord.Forbidden,
+        discord.NotFound,
+        discord.HTTPException
+    ):
+        pass
+
+    try:
+        await member.kick(
+            reason="Message sent in anti-scam channel"
+        )
+
+        data["panel"].kicks += 1
+        data["panel"].update_kicks()
+
+        record = anti_scam_data.get(str(message.channel.id))
+
+        if record:
+            record["kicks"] = data["panel"].kicks
+            save_json(ANTI_SCAM_FILE, anti_scam_data)
+
+        if data["message"]:
+            try:
+                await data["message"].edit(
+                    view=data["panel"]
+                )
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                pass
+
+    except (
+        discord.Forbidden,
+        discord.NotFound,
+        discord.HTTPException
+    ):
+        pass
+
+
+async def restore_anti_scam_channels():
+    stale_channels = []
+
+    for key, record in list(anti_scam_data.items()):
+        try:
+            channel_id = int(record["channel_id"])
+            message_id = int(record["message_id"])
+            guild_id = int(record["guild_id"])
+            kicks = int(record.get("kicks", 0))
+        except (KeyError, TypeError, ValueError):
+            stale_channels.append(key)
+            continue
+
+        guild = bot.get_guild(guild_id)
+
+        if guild is None:
+            continue
+
+        channel = guild.get_channel(channel_id)
+
+        if not isinstance(channel, discord.TextChannel):
+            stale_channels.append(key)
+            continue
+
+        panel = AntiScamPanel(kicks=kicks)
+
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            stale_channels.append(key)
+            continue
+        except discord.Forbidden:
+            created_channels[channel_id] = {
+                "panel": panel,
+                "message": None,
+                "guild_id": guild_id
+            }
+            continue
+        except discord.HTTPException:
+            continue
+
+        try:
+            await message.edit(view=panel)
+        except (
+            discord.Forbidden,
+            discord.NotFound,
+            discord.HTTPException
+        ):
+            pass
+
+        created_channels[channel_id] = {
+            "panel": panel,
+            "message": message,
+            "guild_id": guild_id
+        }
+
+    for key in stale_channels:
+        anti_scam_data.pop(key, None)
+
+    save_json(ANTI_SCAM_FILE, anti_scam_data)
+
+
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+
+        await restore_anti_scam_channels()
+
+        print(f"Logged in as {bot.user} ({bot.user.id})")
+        print(f"Synced {len(synced)} command(s)")
+        print(f"Restored {len(created_channels)} anti-scam channel(s)")
+
+    except Exception as error:
+        print(f"Startup error: {error}")
 
 
 @anti_scam.error
@@ -469,8 +656,6 @@ async def purge_error(
 ):
     if isinstance(error, app_commands.MissingPermissions):
         message = "You need the Manage Messages permission to use this command."
-    elif isinstance(error, app_commands.RangeError):
-        message = "Count must be between 1 and 1000."
     else:
         message = f"Command error: {error}"
 
@@ -484,105 +669,6 @@ async def purge_error(
             message,
             ephemeral=True
         )
-
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    data = guild_data(member.guild.id)
-
-    data["joins"].append(
-        datetime.now(timezone.utc).isoformat()
-    )
-
-    cleanup_events(data)
-    save_insights(insights_data)
-
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    data = guild_data(member.guild.id)
-
-    data["leaves"].append(
-        datetime.now(timezone.utc).isoformat()
-    )
-
-    cleanup_events(data)
-    save_insights(insights_data)
-
-
-@bot.event
-async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-
-        print(f"Logged in as {bot.user} ({bot.user.id})")
-        print(f"Synced {len(synced)} command(s)")
-    except Exception as error:
-        print(f"Command sync error: {error}")
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    data = created_channels.get(message.channel.id)
-
-    if data is None:
-        return
-
-    member = message.author
-
-    if not isinstance(member, discord.Member):
-        return
-
-    if member.guild_permissions.administrator:
-        return
-
-    me = message.guild.me
-
-    if me is None or not me.guild_permissions.kick_members:
-        return
-
-    if member.top_role >= me.top_role:
-        return
-
-    try:
-        await message.delete()
-    except (
-        discord.Forbidden,
-        discord.NotFound,
-        discord.HTTPException
-    ):
-        pass
-
-    try:
-        await member.kick(
-            reason="Message sent in anti-scam channel"
-        )
-
-        panel = data["panel"]
-        panel.kicks += 1
-        panel.update_kicks()
-
-        sent_message = data["message"]
-
-        if sent_message:
-            try:
-                await sent_message.edit(view=panel)
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-                pass
-
-    except (
-        discord.Forbidden,
-        discord.NotFound,
-        discord.HTTPException
-    ):
-        pass
 
 
 async def start_bot():
