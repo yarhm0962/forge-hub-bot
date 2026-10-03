@@ -230,11 +230,12 @@ class ObfuscatePanel(discord.ui.LayoutView):
         self.container=discord.ui.Container(
             discord.ui.TextDisplay("## 🔐 Obfuscation Complete"),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay("Your source file was transformed successfully. The protected file is attached below."),
+            discord.ui.TextDisplay("Your Lua source was transformed successfully."),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay(f"**Output**\n`{name}`\n\n**Original Size**\n`{original:,} bytes`\n\n**Protected Size**\n`{protected:,} bytes`\n\n**SHA-256**\n`{digest[:16]}...`"),
+            discord.ui.TextDisplay(f"### 📥 Download\\n[**{name}**](attachment://{name})"),
+            discord.ui.TextDisplay(f"**Original Size**\\n`{original:,} bytes`\\n\\n**Protected Size**\\n`{protected:,} bytes`\\n\\n**SHA-256**\\n`{digest[:16]}...`"),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay("### ⚙️ Protection\nIdentifier mangling, number transformation, and string pooling are enabled at strength 5."),
+            discord.ui.TextDisplay("### ⚙️ Protection\\nIdentifier mangling, number transformation, and string pooling are enabled at strength 5."),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
             discord.ui.TextDisplay("The output is source transformation, not encryption. Test the generated file before production use.")
         ); self.add_item(self.container)
