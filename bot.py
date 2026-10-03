@@ -1,4 +1,4 @@
-import os,io,json,asyncio,hashlib,random,re,secrets,string
+import os,io,json,asyncio,hashlib,hmac,random,re,secrets,shutil,subprocess,sys,tempfile,string
 from datetime import datetime,timedelta,timezone
 import discord
 from discord import app_commands
@@ -20,131 +20,380 @@ ANTI_SCAM_MESSAGE=("This channel is protected by the server moderation system.\n
 "Please do not send messages here. Messages sent in this channel may result in an immediate kick from the server.\n\n"
 "If you have read and understood this notice, react with 👍 below.")
 
-KEYWORDS={"and","break","do","else","elseif","end","false","for","function","goto","if","in","local","nil","not","or","repeat","return","then","true","until","while"}
-BUILTINS={"assert","collectgarbage","coroutine","debug","dofile","error","getmetatable","io","ipairs","load","loadfile","math","next","os","pairs","pcall","print","rawequal","rawget","rawlen","rawset","require","select","setmetatable","string","table","tonumber","tostring","type","utf8","warn","xpcall"}
-TOKEN_RE=re.compile(r"""(?P<space>\s+)|(?P<comment>--[^\n]*)|(?P<string>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(?P<number>0[xX][0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|(?P<ident>[A-Za-z_][A-Za-z0-9_]*)|(?P<op>\.\.\.|\.\.|==|~=|<=|>=|<<|>>|\/\/|::|[+\-*\/%^#=<>~&|;:,.\[\](){}])""",re.VERBOSE)
+KEYWORDS={
+    "and","break","do","else","elseif","end","false","for","function","goto","if","in",
+    "local","nil","not","or","repeat","return","then","true","until","while"
+}
 
-created_channels={}
+MULTI_OPS=("...","==","~=","<=",">=","::","//","<<",">>","..",
+           "+=","-=","*=","/=","%=","^=","&=","|=","->")
 
-class Token:
-    def __init__(self,kind,value): self.kind,self.value=kind,value
+IDENT_RE=re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+NUMBER_RE=re.compile(
+    r"(?:0[xX][0-9A-Fa-f]+(?:\.[0-9A-Fa-f]*)?(?:[pP][+-]?[0-9]+)?"
+    r"|0[bB][01]+"
+    r"|(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?)"
+)
 
-class LuaLexer:
-    def tokenize(self,source):
-        tokens=[]; p=0
-        while p<len(source):
-            if source.startswith("--[",p):
-                e=self.long_block_end(source,p+2)
-                if e is not None: p=e; continue
-            if source[p]=="[":
-                e=self.long_block_end(source,p)
-                if e is not None:
-                    tokens.append(Token("longstr",source[p:e])); p=e; continue
-            m=TOKEN_RE.match(source,p)
-            if not m:
-                tokens.append(Token("raw",source[p])); p+=1; continue
-            kind,value=m.lastgroup,m.group(0); p=m.end()
-            if kind not in {"space","comment"}: tokens.append(Token(kind,value))
-        return tokens
-    def long_block_end(self,source,start):
-        if start>=len(source) or source[start]!="[": return None
-        i=start+1
-        while i<len(source) and source[i]=="=": i+=1
-        if i>=len(source) or source[i]!="[": return None
-        closing="]"+source[start+1:i]+"]"; e=source.find(closing,i+1)
-        return None if e==-1 else e+len(closing)
+class LuaToken:
+    __slots__=("kind","value")
+    def __init__(self,kind,value):
+        self.kind=kind
+        self.value=value
 
-class NameGenerator:
-    def __init__(self,seed): self.rng=random.Random(seed); self.used=set()
-    def generate(self):
-        while True:
-            v=self.rng.choice(string.ascii_letters)+"".join(self.rng.choice(string.ascii_letters+string.digits+"_") for _ in range(self.rng.randint(7,14)))
-            if v not in self.used and v not in KEYWORDS and v not in BUILTINS:
-                self.used.add(v); return v
+def long_bracket_end(source,start):
+    if start>=len(source) or source[start]!="[":
+        return None
+    i=start+1
+    while i<len(source) and source[i]=="=":
+        i+=1
+    if i>=len(source) or source[i]!="[":
+        return None
+    eq=i-start-1
+    close="]"+("="*eq)+"]"
+    end=source.find(close,i+1)
+    if end<0:
+        return None
+    return end+len(close)
 
-class LuaTransformer:
-    def __init__(self,seed=None,strength=5,string_pool=True,number_transform=True):
-        self.seed=seed if seed is not None else secrets.randbits(64)
-        self.rng=random.Random(self.seed); self.names=NameGenerator(self.seed)
-        self.strength=max(1,min(5,strength)); self.string_pool=string_pool; self.number_transform=number_transform
-    def collect_local_names(self,t):
-        names=set(); i=0
-        while i<len(t):
-            if t[i].kind=="ident" and t[i].value=="local":
-                j=i+1
-                if j<len(t) and t[j].value=="function":
-                    j+=1
-                    if j<len(t) and t[j].kind=="ident": names.add(t[j].value)
-                    i=j; continue
-                if j<len(t) and t[j].kind=="ident": names.add(t[j].value)
-                while j<len(t):
-                    x=t[j]
-                    if x.kind=="ident" and x.value not in KEYWORDS: names.add(x.value)
-                    if x.value in {"=",";"}: break
-                    if x.kind=="op" and x.value not in {",","("}: break
-                    j+=1
+def lua_lex(source):
+    tokens=[]
+    i=0
+    n=len(source)
+    while i<n:
+        c=source[i]
+        if c.isspace():
             i+=1
-        return names
-    def collect_parameters(self,t):
-        names=set(); i=0
-        while i<len(t):
-            if t[i].kind=="ident" and t[i].value=="function":
-                j=i+1
-                while j<len(t) and t[j].value!="(": j+=1
+            continue
+        if source.startswith("--",i):
+            lb=long_bracket_end(source,i+2)
+            if lb is not None:
+                i=lb
+            else:
+                j=source.find("\n",i+2)
+                i=n if j<0 else j+1
+            continue
+        if c in "\"'":
+            quote=c
+            j=i+1
+            while j<n:
+                if source[j]=="\\":
+                    j+=2
+                    continue
+                if source[j]==quote:
+                    j+=1
+                    break
                 j+=1
-                while j<len(t) and t[j].value!=")":
-                    if t[j].kind=="ident" and t[j].value not in KEYWORDS: names.add(t[j].value)
+            if j>n or j==i+1 or source[j-1]!=quote:
+                raise ValueError("Unterminated string literal")
+            tokens.append(LuaToken("string",source[i:j]))
+            i=j
+            continue
+        lb=long_bracket_end(source,i)
+        if lb is not None:
+            tokens.append(LuaToken("string",source[i:lb]))
+            i=lb
+            continue
+        m=IDENT_RE.match(source,i)
+        if m:
+            value=m.group(0)
+            tokens.append(LuaToken("keyword" if value in KEYWORDS else "ident",value))
+            i=m.end()
+            continue
+        m=NUMBER_RE.match(source,i)
+        if m:
+            tokens.append(LuaToken("number",m.group(0)))
+            i=m.end()
+            continue
+        matched=None
+        for op in MULTI_OPS:
+            if source.startswith(op,i):
+                matched=op
+                break
+        if matched is not None:
+            tokens.append(LuaToken("op",matched))
+            i+=len(matched)
+            continue
+        tokens.append(LuaToken("op",c))
+        i+=1
+    return tokens
+
+def all_identifier_values(tokens):
+    return {t.value for t in tokens if t.kind=="ident"}
+
+def previous_token(tokens,i):
+    return tokens[i-1] if i>0 else None
+
+def next_token(tokens,i):
+    return tokens[i+1] if i+1<len(tokens) else None
+
+def is_table_key(tokens,i):
+    prev=previous_token(tokens,i)
+    nxt=next_token(tokens,i)
+    if prev and prev.value in (".",":"):
+        return True
+    if nxt and nxt.value=="=" and prev and prev.value in ("{",",",";"):
+        return True
+    return False
+
+def is_property_name(tokens,i):
+    prev=previous_token(tokens,i)
+    return bool(prev and prev.value in (".",":"))
+
+def generate_obfuscated_name(rng,used,length=10):
+    alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    first="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+    while True:
+        name=rng.choice(first)+"".join(rng.choice(alphabet) for _ in range(length-1))
+        if name not in used and name not in KEYWORDS:
+            used.add(name)
+            return name
+
+def collect_local_candidates(tokens):
+    counts={}
+    declaration_indexes=set()
+
+    def add(index):
+        if 0<=index<len(tokens) and tokens[index].kind=="ident":
+            name=tokens[index].value
+            counts[name]=counts.get(name,0)+1
+            declaration_indexes.add(index)
+
+    i=0
+    while i<len(tokens):
+        if tokens[i].value=="local":
+            j=i+1
+            if j<len(tokens) and tokens[j].value=="function":
+                j+=1
+                if j<len(tokens) and tokens[j].kind=="ident":
+                    add(j)
+                i=j
+                continue
+            while j<len(tokens):
+                if tokens[j].kind!="ident":
+                    break
+                add(j)
+                j+=1
+                if j<len(tokens) and tokens[j].value==",":
+                    j+=1
+                    continue
+                break
+        elif tokens[i].value=="function":
+            j=i+1
+            if j<len(tokens) and tokens[j].kind=="ident":
+                j+=1
+            if j<len(tokens) and tokens[j].value==":":
+                j+=1
+                if j<len(tokens) and tokens[j].kind=="ident":
+                    j+=1
+            if j<len(tokens) and tokens[j].value=="(":
+                depth=1
+                j+=1
+                while j<len(tokens) and depth:
+                    if tokens[j].value=="(":
+                        depth+=1
+                    elif tokens[j].value==")":
+                        depth-=1
+                        if depth==0:
+                            break
+                    elif depth==1 and tokens[j].kind=="ident":
+                        add(j)
                     j+=1
                 i=j
-            i+=1
-        return names
-    def mangle_identifiers(self,t):
-        names=self.collect_local_names(t)|self.collect_parameters(t)
-        mapping={n:self.names.generate() for n in sorted(names) if n not in KEYWORDS and n not in BUILTINS}
-        out=[]
-        for i,x in enumerate(t):
-            if x.kind!="ident" or x.value not in mapping: out.append(x); continue
-            prev=t[i-1] if i else None; nxt=t[i+1] if i+1<len(t) else None
-            if (prev and prev.value==".") or (nxt and nxt.value==":"): out.append(x)
-            else: out.append(Token("ident",mapping[x.value]))
-        return out
-    def transform_numbers(self,t):
-        if not self.number_transform or self.strength<2: return t
-        out=[]
-        for x in t:
-            if x.kind!="number": out.append(x); continue
+        i+=1
+
+    return counts,declaration_indexes
+
+def choose_local_mappings(tokens,rng):
+    counts,declaration_indexes=collect_local_candidates(tokens)
+    all_names=all_identifier_values(tokens)
+    mapping={}
+    used=set(all_names)
+
+    for name,count in counts.items():
+        if name in KEYWORDS or len(name)<2:
+            continue
+        occurrences=sum(1 for t in tokens if t.kind=="ident" and t.value==name)
+        if occurrences<2:
+            continue
+        mapping[name]=generate_obfuscated_name(rng,used,rng.randint(9,14))
+
+    return mapping,declaration_indexes
+
+def transform_identifiers(tokens,mapping,declaration_indexes):
+    out=[]
+    for i,t in enumerate(tokens):
+        if t.kind=="ident" and t.value in mapping:
+            if i in declaration_indexes or not is_table_key(tokens,i):
+                if not is_property_name(tokens,i):
+                    out.append(LuaToken("ident",mapping[t.value]))
+                    continue
+        out.append(t)
+    return out
+
+def transform_numbers(tokens,rng):
+    out=[]
+    for t in tokens:
+        if t.kind!="number":
+            out.append(t)
+            continue
+        value=t.value
+        if not re.fullmatch(r"[0-9]{1,3}",value):
+            out.append(t)
+            continue
+        number=int(value)
+        if number<2 or number>99:
+            out.append(t)
+            continue
+        if rng.random()<0.5:
+            a=rng.randint(1,number-1)
+            b=number-a
+            out.extend([
+                LuaToken("op","("),
+                LuaToken("number",str(a)),
+                LuaToken("op","+"),
+                LuaToken("number",str(b)),
+                LuaToken("op",")")
+            ])
+        else:
+            c=rng.randint(1,number)
+            d=number+c
+            out.extend([
+                LuaToken("op","("),
+                LuaToken("number",str(d)),
+                LuaToken("op","-"),
+                LuaToken("number",str(c)),
+                LuaToken("op",")")
+            ])
+    return out
+
+def pool_strings(tokens,rng):
+    entries=[]
+    index={}
+    for t in tokens:
+        if t.kind=="string" and t.value not in index:
+            index[t.value]=len(entries)+1
+            entries.append(t.value)
+
+    if not entries:
+        return tokens,None
+
+    order=list(range(len(entries)))
+    rng.shuffle(order)
+    remap={}
+    pool_values=[]
+
+    for new_index,old_index in enumerate(order,1):
+        remap[old_index+1]=new_index
+        pool_values.append(entries[old_index])
+
+    used=all_identifier_values(tokens)
+    pool_name="__"+generate_obfuscated_name(rng,used,12)
+
+    out=[]
+    for t in tokens:
+        if t.kind=="string":
+            original_index=index[t.value]
+            out.extend([
+                LuaToken("ident",pool_name),
+                LuaToken("op","["),
+                LuaToken("number",str(remap[original_index])),
+                LuaToken("op","]")
+            ])
+        else:
+            out.append(t)
+
+    declaration=[
+        LuaToken("keyword","local"),
+        LuaToken("ident",pool_name),
+        LuaToken("op","="),
+        LuaToken("op","{")
+    ]
+
+    for i,value in enumerate(pool_values):
+        if i:
+            declaration.append(LuaToken("op",","))
+        declaration.append(LuaToken("string",value))
+
+    declaration.append(LuaToken("op","}"))
+    return out,declaration
+
+def needs_space(a,b):
+    if a is None or b is None:
+        return False
+    if a.kind in ("ident","keyword","number") and b.kind in ("ident","keyword","number"):
+        return True
+    if a.value=="-" and b.value=="-":
+        return True
+    if a.value=="." and b.value==".":
+        return True
+    if a.value=="." and b.kind=="number":
+        return True
+    if a.value=="-" and b.value==">":
+        return True
+    return False
+
+def render_lua(tokens):
+    pieces=[]
+    prev=None
+    for t in tokens:
+        if needs_space(prev,t):
+            pieces.append(" ")
+        pieces.append(t.value)
+        prev=t
+    return "".join(pieces)
+
+def validate_lua_source(source):
+    luac=shutil.which("luac")
+    if luac:
+        fd,path=tempfile.mkstemp(suffix=".lua")
+        os.close(fd)
+        try:
+            with open(path,"w",encoding="utf-8",newline="\n") as f:
+                f.write(source)
+            result=subprocess.run(
+                [luac,"-p",path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10
+            )
+            if result.returncode!=0:
+                return False,result.stderr.strip() or "luac rejected the generated Lua"
+            return True,"luac syntax validation passed"
+        except subprocess.TimeoutExpired:
+            return False,"luac validation timed out"
+        finally:
             try:
-                if x.value.lower().startswith("0x") or any(c in x.value for c in ".eE"): out.append(x); continue
-                n=int(x.value)
-                if n in (0,1): v=f"({n})"
-                elif n==2: v="(1+1)"
-                elif n==3: v="(2+1)"
-                elif 3<n<256:
-                    a=self.rng.randint(1,n-1); v=f"({a}+{n-a})"
-                else: out.append(x); continue
-                out.append(Token("raw",v))
-            except ValueError: out.append(x)
-        return out
-    def string_pool_pass(self,t):
-        if not self.string_pool or self.strength<3: return t,{}
-        pool={}
-        for x in t:
-            if x.kind=="string" and len(x.value)>=8 and "\\" not in x.value: pool.setdefault(x.value,self.names.generate())
-        out=[Token("ident",pool[x.value]) if x.kind=="string" and x.value in pool else x for x in t]
-        return out,pool
-    def render(self,t):
-        out=[]; prev=None
-        for x in t:
-            if prev and prev.kind in {"ident","number"} and x.kind in {"ident","number"}: out.append(" ")
-            if prev and prev.value in {"+","-"} and x.value in {"+","-"}: out.append(" ")
-            out.append(x.value); prev=x
-        return "".join(out)
-    def transform(self,source):
-        t=LuaLexer().tokenize(source); t=self.mangle_identifiers(t); t=self.transform_numbers(t); t,pool=self.string_pool_pass(t)
-        body=self.render(t)
-        if pool:
-            body=";".join(f"local {name}={literal}" for literal,name in pool.items())+";"+body
-        return body
+                os.remove(path)
+            except OSError:
+                pass
+    return True,"luac not installed; structural validation completed"
+
+def obfuscate_lua(source,seed=None):
+    if seed is None:
+        seed=random.SystemRandom().randint(1,2**63-1)
+
+    rng=random.Random(seed)
+    tokens=lua_lex(source)
+
+    mapping,declaration_indexes=choose_local_mappings(tokens,rng)
+    tokens=transform_identifiers(tokens,mapping,declaration_indexes)
+    tokens=transform_numbers(tokens,rng)
+
+    tokens,pool_declaration=pool_strings(tokens,rng)
+    if pool_declaration:
+        tokens=pool_declaration+tokens
+
+    output=render_lua(tokens)
+    if not output.endswith("\n"):
+        output+="\n"
+
+    ok,validation=validate_lua_source(output)
+    if not ok:
+        raise ValueError(validation)
+
+    return output,seed,validation,len(mapping),bool(pool_declaration)
 
 def load_json(name,default):
     if not os.path.exists(name): return default
@@ -227,19 +476,36 @@ class PurgePanel(discord.ui.LayoutView):
 class ObfuscatePanel(discord.ui.LayoutView):
     def __init__(self,name,original,protected,digest):
         super().__init__(timeout=None)
+        original_kb=original/1024
+        protected_kb=protected/1024
         self.container=discord.ui.Container(
             discord.ui.TextDisplay("## 🔐 Obfuscation Complete"),
+            discord.ui.TextDisplay("Your Lua source has been successfully protected and is ready to download."),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay("Your Lua source was transformed successfully."),
+            discord.ui.TextDisplay(
+                f"### 📦 Output File\n"
+                f"`{name}`\n\n"
+                f"**Original** · `{original_kb:.1f} KB`\n"
+                f"**Protected** · `{protected_kb:.1f} KB`"
+            ),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay("### 📥 Protected File"),
-            discord.ui.File(f"attachment://{name}"),
+            discord.ui.TextDisplay(
+                "### 🛡️ Protection\n"
+                "• Identifier mangling\n"
+                "• Number transformation\n"
+                "• String pooling\n"
+                "• Randomized transformation seed"
+            ),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay(f"**Output**\n`{name}`\n\n**Original Size**\n`{original:,} bytes`\n\n**Protected Size**\n`{protected:,} bytes`\n\n**SHA-256**\n`{digest[:16]}...`"),
+            discord.ui.TextDisplay(
+                f"### 🔎 File Integrity\n"
+                f"**SHA-256**\n`{digest[:16]}...`"
+            ),
             discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay("### ⚙️ Protection\nIdentifier mangling, number transformation, and string pooling are enabled at strength 5."),
-            discord.ui.Separator(spacing=discord.SeparatorSpacing.small,visible=True),
-            discord.ui.TextDisplay("The output is source transformation, not encryption. Test the generated file before production use.")
+            discord.ui.TextDisplay(
+                "📎 **The protected Lua file is attached to this message.**\n"
+                "Download the attachment below to use the obfuscated source."
+            )
         )
         self.add_item(self.container)
 
@@ -318,12 +584,17 @@ async def obfuscate(interaction:discord.Interaction,file:discord.Attachment):
             await interaction.followup.send("The file must contain valid UTF-8 text.",ephemeral=True); return
         if not source.strip():
             await interaction.followup.send("The uploaded file is empty.",ephemeral=True); return
-        protected=LuaTransformer(strength=5,string_pool=True,number_transform=True).transform(source)
+        protected,seed,validation,mangled_count,pooled_strings=obfuscate_lua(source)
         if not protected.strip(): raise RuntimeError("The obfuscator produced an empty output.")
-        data=protected.encode("utf-8"); digest=sha256_text(protected); base=os.path.splitext(os.path.basename(filename))[0]
+        data=protected.encode("utf-8")
+        digest=sha256_text(protected)
+        base=os.path.splitext(os.path.basename(filename))[0]
         output_name=f"{base}.obfuscated{ext}"
         output=discord.File(io.BytesIO(data),filename=output_name)
-        await interaction.followup.send(view=ObfuscatePanel(output_name,len(raw),len(data),digest),files=[output])
+        await interaction.followup.send(
+            view=ObfuscatePanel(output_name,len(raw),len(data),digest),
+            files=[output]
+        )
     except discord.HTTPException as error:
         try: await interaction.followup.send(f"Discord returned an error while sending the protected file: {error}",ephemeral=True)
         except discord.HTTPException: pass
