@@ -42,11 +42,10 @@ created_channels = {}
 reaction_role_cache = {}
 ready_once = False
 
-ANTI_SCAM_TITLE = "## 🛡️ Anti-Scam Protection"
+ANTI_SCAM_TITLE = "## 🛡️ Anti-Scam Guard"
 ANTI_SCAM_BODY = (
-    "This channel is reserved for suspicious or fake social-media spam.\n"
-    "**Do not send messages here.** Messages are removed automatically and the sender "
-    "may be kicked."
+    "A protected moderation channel for catching suspicious messages.\n"
+    "Messages are removed automatically and eligible offenders can be kicked."
 )
 
 
@@ -277,39 +276,53 @@ class AntiScamView(discord.ui.LayoutView):
             emoji="🛡️",
             disabled=True,
         )
-
         self.violation_button = discord.ui.Button(
             label=f"{self.violations:,} blocked",
             style=discord.ButtonStyle.secondary,
             emoji="🚫",
             disabled=True,
         )
-
-        status = discord.ui.Section(
-            make_text("### 🟢 Protection is active"),
-            make_text(
-                "This channel is monitored continuously. Messages are removed and "
-                "members who can be moderated are kicked automatically."
-            ),
-            accessory=self.kick_button,
+        self.status_button = discord.ui.Button(
+            label="Protection Active",
+            style=discord.ButtonStyle.success,
+            emoji="●",
+            disabled=True,
         )
+
+        stats_row = discord.ui.ActionRow()
+        stats_row.add_item(self.violation_button)
+        stats_row.add_item(self.kick_button)
 
         self.add_item(
             make_container(
-                make_text("## 🛡️ Anti-Scam Protection"),
-                make_text("Automatic enforcement for this protected channel."),
-                make_separator(),
-                status,
-                make_separator(),
+                make_text("## 🛡️ Anti-Scam Guard"),
                 make_text(
-                    "### Channel rules\n"
-                    "• Do not send messages in this channel.\n"
-                    "• Messages are removed automatically.\n"
-                    "• Moderation is applied when the bot has permission.\n"
-                    "• Administrators are not automatically kicked."
+                    "**Automatic protection for this channel**\n"
+                    "Suspicious messages are handled immediately so staff can focus on the rest of the server."
                 ),
                 make_separator(),
-                discord.ui.ActionRow(self.violation_button),
+                discord.ui.Section(
+                    make_text("### 🟢 Protection active"),
+                    make_text(
+                        "Messages are monitored continuously. Eligible users may be removed when moderation permissions allow it."
+                    ),
+                    accessory=self.status_button,
+                ),
+                make_separator(),
+                make_text(
+                    "### 📋 Enforcement rules\n"
+                    "• Messages are deleted automatically.\n"
+                    "• Kick action is attempted when the bot can moderate the member.\n"
+                    "• Administrators are ignored by automatic enforcement.\n"
+                    "• Higher roles cannot be moderated by the bot."
+                ),
+                make_separator(),
+                make_text("### 📊 Protection activity"),
+                stats_row,
+                make_separator(),
+                make_text(
+                    "Keep this channel available for moderation monitoring. You do not need to interact with this panel."
+                ),
                 accent_color=0xED4245,
             )
         )
@@ -330,65 +343,73 @@ class InsightsView(discord.ui.LayoutView):
     def __init__(self, guild_name, current, joins_30, leaves_30, total_joins, total_leaves):
         super().__init__(timeout=None)
 
-        net_30 = joins_30 - leaves_30
-        lifetime_net = total_joins - total_leaves
+        net_30 = int(joins_30) - int(leaves_30)
+        lifetime_net = int(total_joins) - int(total_leaves)
+
         if net_30 > 0:
             status = "Growing"
             status_icon = "📈"
             status_style = discord.ButtonStyle.success
+            status_copy = "More members joined than left during the last 30 days."
         elif net_30 < 0:
             status = "Declining"
             status_icon = "📉"
             status_style = discord.ButtonStyle.danger
+            status_copy = "More members left than joined during the last 30 days."
         else:
             status = "Stable"
             status_icon = "➖"
             status_style = discord.ButtonStyle.secondary
+            status_copy = "Joins and departures were balanced during the last 30 days."
 
         net_label = f"+{net_30:,}" if net_30 > 0 else f"{net_30:,}"
         lifetime_label = f"+{lifetime_net:,}" if lifetime_net > 0 else f"{lifetime_net:,}"
 
         self.trend_button = discord.ui.Button(
-            label=net_label,
+            label=status,
             style=status_style,
             emoji=status_icon,
             disabled=True,
         )
+        self.member_button = discord.ui.Button(
+            label=f"{int(current):,} members",
+            style=discord.ButtonStyle.secondary,
+            emoji="👥",
+            disabled=True,
+        )
+
+        member_row = discord.ui.ActionRow()
+        member_row.add_item(self.member_button)
 
         self.add_item(
             make_container(
                 make_text("## 📊 Server Insights"),
-                make_text(f"**{guild_name}**  ·  Member activity dashboard"),
+                make_text(f"**{guild_name}**\nA clean overview of recent member activity and long-term totals."),
                 make_separator(),
                 discord.ui.Section(
                     make_text(f"### {status_icon} {status}"),
-                    make_text(
-                        f"Last 30 days · net movement `{net_label}` members"
-                    ),
+                    make_text(status_copy + f"\n30-day net movement: **{net_label}** members."),
                     accessory=self.trend_button,
                 ),
                 make_separator(),
+                make_text("### 👥 Community snapshot"),
+                member_row,
                 make_text(
-                    "### 👥 Current community\n"
-                    f"**Members now**  `{current:,}`"
-                ),
-                make_text(
-                    "### 🗓️ Last 30 days\n"
-                    f"🟢 **Joined**  `{joins_30:,}`\n"
-                    f"🔴 **Left**  `{leaves_30:,}`\n"
-                    f"⚖️ **Net**  `{net_label}`"
+                    f"**Joined in 30 days**  `{int(joins_30):,}`\n"
+                    f"**Left in 30 days**  `{int(leaves_30):,}`\n"
+                    f"**Net change**  `{net_label}`"
                 ),
                 make_separator(),
+                make_text("### 📚 Lifetime totals"),
                 make_text(
-                    "### 📚 Lifetime tracking\n"
-                    f"🟢 **Total joins recorded**  `{total_joins:,}`\n"
-                    f"🔴 **Total departures recorded**  `{total_leaves:,}`\n"
+                    f"🟢 **Total joins**  `{int(total_joins):,}`\n"
+                    f"🔴 **Total departures**  `{int(total_leaves):,}`\n"
                     f"⚖️ **Lifetime net**  `{lifetime_label}`"
                 ),
                 make_separator(),
                 make_text(
-                    "Tracking is stored in MongoDB and reconciled against the server member list when the bot starts, "
-                    "so changes that happened while the bot was offline can be detected."
+                    "**Tracking:** MongoDB\n"
+                    "Recent activity is kept for 30 days while lifetime counters remain available for the server."
                 ),
                 accent_color=0x5865F2,
             )
@@ -398,25 +419,47 @@ class InsightsView(discord.ui.LayoutView):
 class PurgeView(discord.ui.LayoutView):
     def __init__(self, requested, deleted, channel):
         super().__init__(timeout=None)
+        requested = int(requested)
+        deleted = int(deleted)
+        difference = requested - deleted
+        if difference > 0:
+            result_text = f"`{difference:,}` message(s) could not be deleted."
+            result_icon = "⚠️"
+        else:
+            result_text = "Every requested message was deleted successfully."
+            result_icon = "✅"
+
         self.add_item(
             make_container(
                 make_text("## 🧹 Purge Complete"),
+                make_text("The channel cleanup has finished."),
                 make_separator(),
-                make_text("The cleanup finished successfully."),
+                discord.ui.Section(
+                    make_text(f"### {result_icon} Cleanup result"),
+                    make_text(result_text),
+                    accessory=discord.ui.Button(
+                        label=f"{deleted:,} deleted",
+                        style=discord.ButtonStyle.success if difference == 0 else discord.ButtonStyle.secondary,
+                        emoji="🗑️",
+                        disabled=True,
+                    ),
+                ),
                 make_separator(),
                 make_text(
-                    f"### 📋 Results\n"
-                    f"**Requested:** `{requested:,}`\n"
-                    f"**Deleted:** `{deleted:,}`\n"
-                    f"**Channel:** {channel.mention}"
+                    f"### 📋 Details\n"
+                    f"**Requested**  `{requested:,}`\n"
+                    f"**Deleted**  `{deleted:,}`\n"
+                    f"**Channel**  {channel.mention}"
                 ),
+                accent_color=0x57F287 if difference == 0 else 0xFEE75C,
             )
         )
 
-class MessageIdModal(discord.ui.Modal, title="Set Target Message"):
+
+class MessageIdModal(discord.ui.Modal, title="Target Message"):
     message_id = discord.ui.TextInput(
         label="Message ID",
-        placeholder="Paste the Discord message ID here",
+        placeholder="Paste the target message ID",
         required=True,
         max_length=30,
     )
@@ -428,14 +471,20 @@ class MessageIdModal(discord.ui.Modal, title="Set Target Message"):
     async def on_submit(self, interaction):
         value = str(self.message_id.value).strip()
         if not value.isdigit():
-            await interaction.response.send_message("❌ That is not a valid Discord message ID.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ **Invalid message ID**\nPlease paste a numeric Discord message ID.",
+                ephemeral=True,
+            )
             return
         self.parent_view.message_id = int(value)
         self.parent_view.refresh()
-        await interaction.response.send_message(f"✅ Target message set to `{value}`.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ **Target message updated**\nMessage `{value}` is ready to use.",
+            ephemeral=True,
+        )
 
 
-class EmojiModal(discord.ui.Modal, title="Set Reaction Emojis"):
+class EmojiModal(discord.ui.Modal, title="Reaction Emojis"):
     emoji_1 = discord.ui.TextInput(label="Emoji 1", placeholder="⭐ or <:custom:123456789>", required=True, max_length=100)
     emoji_2 = discord.ui.TextInput(label="Emoji 2", placeholder="Optional", required=False, max_length=100)
     emoji_3 = discord.ui.TextInput(label="Emoji 3", placeholder="Optional", required=False, max_length=100)
@@ -456,17 +505,24 @@ class EmojiModal(discord.ui.Modal, title="Set Reaction Emojis"):
         ]
         values = [value for value in values if value]
         if not values:
-            await interaction.response.send_message("❌ Add at least one emoji.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ **No emojis added**\nAdd at least one reaction emoji.",
+                ephemeral=True,
+            )
             return
         if len(values) > 5:
-            await interaction.response.send_message("❌ You can use a maximum of 5 emojis.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ **Too many emojis**\nYou can use up to 5 reaction emojis.",
+                ephemeral=True,
+            )
             return
         self.parent_view.emojis = values
         self.parent_view.refresh()
         await interaction.response.send_message(
-            f"✅ {len(values)} reaction emoji{'s' if len(values) != 1 else ''} saved.",
+            f"✅ **Emoji set updated**\nSaved `{len(values)}` reaction emoji{'s' if len(values) != 1 else ''}.",
             ephemeral=True,
         )
+
 
 class RolePickerView(discord.ui.View):
     def __init__(self, parent_view):
@@ -474,7 +530,7 @@ class RolePickerView(discord.ui.View):
         self.parent_view = parent_view
 
         self.select = discord.ui.RoleSelect(
-            placeholder="Select up to 5 roles",
+            placeholder="Choose up to 5 roles",
             min_values=1,
             max_values=5,
         )
@@ -485,7 +541,7 @@ class RolePickerView(discord.ui.View):
         try:
             if interaction.guild is None:
                 await interaction.response.send_message(
-                    "This selector can only be used inside a server.",
+                    "❌ This selector can only be used inside a server.",
                     ephemeral=True,
                 )
                 return
@@ -500,7 +556,7 @@ class RolePickerView(discord.ui.View):
 
             if not resolved:
                 await interaction.response.send_message(
-                    "No valid roles were selected.",
+                    "❌ **No valid roles selected**\nChoose at least one available role.",
                     ephemeral=True,
                 )
                 return
@@ -509,18 +565,18 @@ class RolePickerView(discord.ui.View):
             self.parent_view.refresh()
 
             await interaction.response.send_message(
-                "Selected: " + ", ".join(role.mention for role in resolved),
+                "✅ **Roles updated**\n" + " · ".join(role.mention for role in resolved),
                 ephemeral=True,
             )
         except Exception as error:
             if interaction.response.is_done():
                 await interaction.followup.send(
-                    f"Could not save the selected roles: {error}",
+                    f"❌ **Could not update roles**\n`{error}`",
                     ephemeral=True,
                 )
             else:
                 await interaction.response.send_message(
-                    f"Could not save the selected roles: {error}",
+                    f"❌ **Could not update roles**\n`{error}`",
                     ephemeral=True,
                 )
 
@@ -533,13 +589,29 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
         self.roles = []
         self.emojis = []
 
-        self.message_button = discord.ui.Button(label="Message", style=discord.ButtonStyle.secondary, emoji="🆔")
+        self.message_button = discord.ui.Button(
+            label="Target Message",
+            style=discord.ButtonStyle.secondary,
+            emoji="🆔",
+        )
         self.message_button.callback = self.message_id_callback
-        self.role_button = discord.ui.Button(label="Roles", style=discord.ButtonStyle.secondary, emoji="🎭")
+        self.role_button = discord.ui.Button(
+            label="Choose Roles",
+            style=discord.ButtonStyle.secondary,
+            emoji="🎭",
+        )
         self.role_button.callback = self.role_callback
-        self.emoji_button = discord.ui.Button(label="Emojis", style=discord.ButtonStyle.secondary, emoji="✨")
+        self.emoji_button = discord.ui.Button(
+            label="Set Emojis",
+            style=discord.ButtonStyle.secondary,
+            emoji="✨",
+        )
         self.emoji_button.callback = self.emoji_callback
-        self.save_button = discord.ui.Button(label="Save Setup", style=discord.ButtonStyle.success, emoji="✅")
+        self.save_button = discord.ui.Button(
+            label="Create Reaction Roles",
+            style=discord.ButtonStyle.success,
+            emoji="🚀",
+        )
         self.save_button.callback = self.save_callback
 
         row = discord.ui.ActionRow()
@@ -551,18 +623,23 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
         self.status = make_text(self.status_text())
         self.add_item(
             make_container(
-                make_text("## 🎭 Reaction Role Setup"),
-                make_separator(),
+                make_text("## 🎭 Reaction Role Builder"),
                 make_text(
-                    "Create a reaction-role message in a few simple steps.\n"
-                    "Set the message, choose up to 5 roles, then match each role with an emoji."
+                    "Build a polished reaction-role message without typing configuration by hand.\n"
+                    "Set the target message, choose your roles, add emojis, then create the panel."
                 ),
                 make_separator(),
-                make_text("### ⚙️ Configuration"),
+                make_text("### 🧩 Setup progress"),
                 self.status,
                 make_separator(),
-                make_text("### 🔧 Controls"),
+                make_text("### 🎛️ Builder controls"),
                 row,
+                make_separator(),
+                make_text(
+                    "**Pairing:** role 1 → emoji 1, role 2 → emoji 2, and so on.\n"
+                    "You can configure up to 5 role/emoji pairs."
+                ),
+                accent_color=0x9B59B6,
             )
         )
 
@@ -570,21 +647,25 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
         self.status.content = self.status_text()
 
     def status_text(self):
-        message = f"`{self.message_id}`" if self.message_id else "`Not set`"
-        roles = ", ".join(role.mention for role in self.roles) if self.roles else "`Not set`"
-        emojis = "  ".join(self.emojis) if self.emojis else "`Not set`"
+        message = f"`{self.message_id}`" if self.message_id else "`Not configured`"
+        roles = ", ".join(role.mention for role in self.roles) if self.roles else "`Not configured`"
+        emojis = "  ".join(self.emojis) if self.emojis else "`Not configured`"
         pair_count = min(len(self.roles), len(self.emojis))
+        message_state = "✅" if self.message_id else "⬜"
+        role_state = "✅" if self.roles else "⬜"
+        emoji_state = "✅" if self.emojis else "⬜"
+        ready_state = "Ready" if self.message_id and self.roles and self.emojis and len(self.roles) == len(self.emojis) else "Waiting for setup"
         return (
-            f"**Target Message:** {message}\n"
-            f"**Roles:** {roles}\n"
-            f"**Emojis:** {emojis}\n"
-            f"**Pairs Ready:** `{pair_count}/5`"
+            f"{message_state} **Target message**  {message}\n"
+            f"{role_state} **Roles**  {roles}\n"
+            f"{emoji_state} **Emojis**  {emojis}\n"
+            f"🚦 **Status**  `{ready_state}` · `{pair_count}/5` pairs ready"
         )
 
     async def check_author(self, interaction):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "❌ Only the person who started this setup can use these controls.",
+                "❌ **This setup is private**\nOnly the person who started this builder can use its controls.",
                 ephemeral=True,
             )
             return False
@@ -600,7 +681,7 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
             return
         picker = RolePickerView(self)
         await interaction.response.send_message(
-            "🎭 **Select Roles**\nChoose up to 5 roles. Their order will be matched with the emoji order.",
+            "### 🎭 Choose roles\nSelect up to 5 roles. Their order determines which emoji they receive.",
             view=picker,
             ephemeral=True,
         )
@@ -610,25 +691,184 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
             return
         await interaction.response.send_modal(EmojiModal(self))
 
+    async def save_callback(self, interaction):
+        if not await self.check_author(interaction):
+            return
+
+        if self.message_id is None:
+            await interaction.response.send_message(
+                "⚠️ **Target message missing**\nSet the message ID before creating the reaction-role panel.",
+                ephemeral=True,
+            )
+            return
+
+        if not self.roles:
+            await interaction.response.send_message(
+                "⚠️ **Roles missing**\nChoose at least one role before creating the panel.",
+                ephemeral=True,
+            )
+            return
+
+        if not self.emojis:
+            await interaction.response.send_message(
+                "⚠️ **Emojis missing**\nAdd at least one reaction emoji before creating the panel.",
+                ephemeral=True,
+            )
+            return
+
+        if len(self.roles) != len(self.emojis):
+            await interaction.response.send_message(
+                "⚠️ **Pair count mismatch**\nUse exactly one emoji for each selected role.",
+                ephemeral=True,
+            )
+            return
+
+        if len(self.roles) > 5 or len(self.emojis) > 5:
+            await interaction.response.send_message(
+                "⚠️ **Configuration limit reached**\nYou can create up to 5 role and emoji pairs.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ This setup can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        me = guild.me
+        if me is None:
+            await interaction.response.send_message(
+                "❌ I could not verify my server permissions.",
+                ephemeral=True,
+            )
+            return
+
+        if not me.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "❌ **Missing permission**\nI need Manage Roles to create reaction roles.",
+                ephemeral=True,
+            )
+            return
+
+        for role in self.roles:
+            if role.is_default():
+                await interaction.response.send_message(
+                    "❌ The @everyone role cannot be used.",
+                    ephemeral=True,
+                )
+                return
+
+            if role.managed:
+                await interaction.response.send_message(
+                    f"❌ {role.mention} is managed and cannot be assigned.",
+                    ephemeral=True,
+                )
+                return
+
+            if role >= me.top_role:
+                await interaction.response.send_message(
+                    f"❌ I cannot assign {role.mention} because it is above my highest role.",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True)
+
+        target = await find_message_in_guild(guild, self.message_id)
+        if target is None:
+            await interaction.followup.send(
+                "❌ **Message not found**\nMake sure the message exists in this server and that I can view its channel and read message history.",
+                ephemeral=True,
+            )
+            return
+
+        if len(set(self.emojis)) != len(self.emojis):
+            await interaction.followup.send(
+                "❌ **Duplicate emojis**\nEach reaction emoji must be unique.",
+                ephemeral=True,
+            )
+            return
+
+        pairs = [
+            {
+                "emoji": emoji,
+                "role_id": role.id,
+                "role_name": role.name,
+            }
+            for emoji, role in zip(self.emojis, self.roles)
+        ]
+
+        try:
+            for emoji in self.emojis:
+                await target.add_reaction(emoji)
+
+            record = {
+                "message_id": target.id,
+                "channel_id": target.channel.id,
+                "guild_id": guild.id,
+                "pairs": pairs,
+            }
+
+            await mongo_call(save_reaction_role_sync, record)
+            reaction_role_cache[target.id] = record
+
+            try:
+                await target.edit(view=ReactionRoleMessageView(pairs))
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
+
+            await interaction.followup.send(
+                f"✅ **Reaction roles created**\nConfigured `{len(pairs)}` role pair(s) on message `{target.id}`.",
+                ephemeral=True,
+            )
+            self.stop()
+
+        except discord.HTTPException as error:
+            await interaction.followup.send(
+                f"❌ **Discord could not finish the setup**\n`{error}`",
+                ephemeral=True,
+            )
+        except PyMongoError as error:
+            await interaction.followup.send(
+                f"❌ **MongoDB could not save the setup**\n`{error}`",
+                ephemeral=True,
+            )
+
 
 class ReactionRoleMessageView(discord.ui.LayoutView):
     def __init__(self, pairs):
         super().__init__(timeout=None)
-        lines = [f"`{index}`  {pair['emoji']}  **{pair['role_name']}**" for index, pair in enumerate(pairs, 1)]
+        lines = [
+            f"**{index}.** {pair['emoji']}  **{pair['role_name']}**"
+            for index, pair in enumerate(pairs, 1)
+        ]
         self.add_item(
             make_container(
-                make_text("## 🎭 Reaction Roles"),
-                make_separator(),
+                make_text("## 🎭 Choose Your Roles"),
                 make_text(
-                    "React with the emoji beside a role to receive it.\n"
-                    "Remove your reaction to give the role back."
+                    "React below to choose the roles you want.\n"
+                    "Remove your reaction whenever you want to give a role back."
                 ),
                 make_separator(),
-                make_text("### Available Roles\n" + "\n".join(lines)),
+                make_text("### Available roles\n" + "\n".join(lines)),
                 make_separator(),
-                make_text("✨ **Automatic:** Role changes happen instantly after you react."),
+                discord.ui.Section(
+                    make_text("### ⚡ Automatic"),
+                    make_text("Your role is added or removed automatically after your reaction changes."),
+                    accessory=discord.ui.Button(
+                        label="Self-serve roles",
+                        style=discord.ButtonStyle.secondary,
+                        emoji="✨",
+                        disabled=True,
+                    ),
+                ),
+                accent_color=0x9B59B6,
             )
         )
+
 
 async def find_message_in_guild(guild, message_id):
     message_id = int(message_id)
