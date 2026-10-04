@@ -42,10 +42,11 @@ created_channels = {}
 reaction_role_cache = {}
 ready_once = False
 
-ANTI_SCAM_TITLE = "## 🛡️ Anti-Scam Guard"
+ANTI_SCAM_TITLE = "## 🛡️ Anti-Scam Protection"
 ANTI_SCAM_BODY = (
-    "A protected moderation channel for catching suspicious messages.\n"
-    "Messages are removed automatically and eligible offenders can be kicked."
+    "This channel is reserved for suspicious or fake social-media spam.\n"
+    "**Do not send messages here.** Messages are removed automatically and the sender "
+    "may be kicked."
 )
 
 
@@ -71,16 +72,34 @@ def parse_datetime(value):
 
 def cleanup_events_sync(document):
     cutoff = utc_now() - timedelta(days=30)
-    joins = [
-        x for x in document.get("joins", [])
-        if (dt := parse_datetime(x)) and dt >= cutoff
-    ]
-    leaves = [
-        x for x in document.get("leaves", [])
-        if (dt := parse_datetime(x)) and dt >= cutoff
-    ]
+    joins = []
+    leaves = []
+    for event in document.get("joins", []):
+        if isinstance(event, str):
+            dt = parse_datetime(event)
+            if dt and dt >= cutoff:
+                joins.append({"user_id": 0, "username": "Unknown member", "timestamp": event})
+        elif isinstance(event, dict):
+            dt = parse_datetime(event.get("timestamp"))
+            if dt and dt >= cutoff:
+                joins.append(event)
+    for event in document.get("leaves", []):
+        if isinstance(event, str):
+            dt = parse_datetime(event)
+            if dt and dt >= cutoff:
+                leaves.append({"user_id": 0, "username": "Unknown member", "timestamp": event})
+        elif isinstance(event, dict):
+            dt = parse_datetime(event.get("timestamp"))
+            if dt and dt >= cutoff:
+                leaves.append(event)
     document["joins"] = joins
     document["leaves"] = leaves
+    document.setdefault("total_joins", 0)
+    document.setdefault("total_leaves", 0)
+    if document["total_joins"] == 0 and joins:
+        document["total_joins"] = len(joins)
+    if document["total_leaves"] == 0 and leaves:
+        document["total_leaves"] = len(leaves)
     return document
 
 
@@ -97,17 +116,26 @@ def get_guild_insights_sync(guild_id):
         }
     document.setdefault("joins", [])
     document.setdefault("leaves", [])
-    document.setdefault("total_joins", len(document["joins"]))
-    document.setdefault("total_leaves", len(document["leaves"]))
+    document.setdefault("total_joins", 0)
+    document.setdefault("total_leaves", 0)
+    if document["total_joins"] == 0 and document["joins"]:
+        document["total_joins"] = len(document["joins"])
+    if document["total_leaves"] == 0 and document["leaves"]:
+        document["total_leaves"] = len(document["leaves"])
     cleanup_events_sync(document)
     insights_collection.replace_one({"_id": guild_id}, document, upsert=True)
     return document
 
 
-def add_member_event_sync(guild_id, event_type):
+def add_member_event_sync(guild_id, event_type, member_id=0, username="Unknown member"):
     guild_id = int(guild_id)
     field = "joins" if event_type == "join" else "leaves"
     total_field = "total_joins" if event_type == "join" else "total_leaves"
+    event = {
+        "user_id": int(member_id),
+        "username": str(username)[:100],
+        "timestamp": iso_now(),
+    }
     document = insights_collection.find_one_and_update(
         {"_id": guild_id},
         {
@@ -117,7 +145,7 @@ def add_member_event_sync(guild_id, event_type):
                 "total_joins": 0,
                 "total_leaves": 0,
             },
-            "$push": {field: iso_now()},
+            "$push": {field: event},
             "$inc": {total_field: 1},
         },
         upsert=True,
@@ -176,18 +204,10 @@ def reconcile_member_snapshot_sync(guild_id, current_member_ids):
     if previous is None:
         save_member_snapshot_sync(guild_id, current)
         return 0, 0, True
-
     joined = current - previous
     left = previous - current
-
-    for _ in joined:
-        add_member_event_sync(guild_id, "join")
-    for _ in left:
-        add_member_event_sync(guild_id, "leave")
-
     save_member_snapshot_sync(guild_id, current)
-    return len(joined), len(left), False
-
+    return joined, left, False
 
 def list_anti_scam_sync():
     return list(anti_scam_collection.find({}))
@@ -276,53 +296,39 @@ class AntiScamView(discord.ui.LayoutView):
             emoji="🛡️",
             disabled=True,
         )
+
         self.violation_button = discord.ui.Button(
             label=f"{self.violations:,} blocked",
             style=discord.ButtonStyle.secondary,
             emoji="🚫",
             disabled=True,
         )
-        self.status_button = discord.ui.Button(
-            label="Protection Active",
-            style=discord.ButtonStyle.success,
-            emoji="●",
-            disabled=True,
-        )
 
-        stats_row = discord.ui.ActionRow()
-        stats_row.add_item(self.violation_button)
-        stats_row.add_item(self.kick_button)
+        status = discord.ui.Section(
+            make_text("### 🟢 Protection is active"),
+            make_text(
+                "This channel is monitored continuously. Messages are removed and "
+                "members who can be moderated are kicked automatically."
+            ),
+            accessory=self.kick_button,
+        )
 
         self.add_item(
             make_container(
-                make_text("## 🛡️ Anti-Scam Guard"),
-                make_text(
-                    "**Automatic protection for this channel**\n"
-                    "Suspicious messages are handled immediately so staff can focus on the rest of the server."
-                ),
+                make_text("## 🛡️ Anti-Scam Protection"),
+                make_text("Automatic enforcement for this protected channel."),
                 make_separator(),
-                discord.ui.Section(
-                    make_text("### 🟢 Protection active"),
-                    make_text(
-                        "Messages are monitored continuously. Eligible users may be removed when moderation permissions allow it."
-                    ),
-                    accessory=self.status_button,
-                ),
+                status,
                 make_separator(),
                 make_text(
-                    "### 📋 Enforcement rules\n"
-                    "• Messages are deleted automatically.\n"
-                    "• Kick action is attempted when the bot can moderate the member.\n"
-                    "• Administrators are ignored by automatic enforcement.\n"
-                    "• Higher roles cannot be moderated by the bot."
+                    "### Channel rules\n"
+                    "• Do not send messages in this channel.\n"
+                    "• Messages are removed automatically.\n"
+                    "• Moderation is applied when the bot has permission.\n"
+                    "• Administrators are not automatically kicked."
                 ),
                 make_separator(),
-                make_text("### 📊 Protection activity"),
-                stats_row,
-                make_separator(),
-                make_text(
-                    "Keep this channel available for moderation monitoring. You do not need to interact with this panel."
-                ),
+                discord.ui.ActionRow(self.violation_button),
                 accent_color=0xED4245,
             )
         )
@@ -340,78 +346,65 @@ class AntiScamView(discord.ui.LayoutView):
 
 
 class InsightsView(discord.ui.LayoutView):
-    def __init__(self, guild_name, current, joins_30, leaves_30, total_joins, total_leaves):
+    def __init__(self, guild, document):
         super().__init__(timeout=None)
+        joins = list(document.get("joins", []))
+        leaves = list(document.get("leaves", []))
+        net = len(joins) - len(leaves)
+        lifetime_joins = int(document.get("total_joins", 0))
+        lifetime_leaves = int(document.get("total_leaves", 0))
+        lifetime_net = lifetime_joins - lifetime_leaves
+        status = "📈 Growing" if net > 0 else "📉 Declining" if net < 0 else "➖ Stable"
+        net_text = f"+{net:,}" if net > 0 else f"{net:,}"
+        lifetime_net_text = f"+{lifetime_net:,}" if lifetime_net > 0 else f"{lifetime_net:,}"
 
-        net_30 = int(joins_30) - int(leaves_30)
-        lifetime_net = int(total_joins) - int(total_leaves)
+        recent_joins = sorted(joins, key=lambda item: item.get("timestamp", ""), reverse=True)[:5]
+        recent_leaves = sorted(leaves, key=lambda item: item.get("timestamp", ""), reverse=True)[:5]
 
-        if net_30 > 0:
-            status = "Growing"
-            status_icon = "📈"
-            status_style = discord.ButtonStyle.success
-            status_copy = "More members joined than left during the last 30 days."
-        elif net_30 < 0:
-            status = "Declining"
-            status_icon = "📉"
-            status_style = discord.ButtonStyle.danger
-            status_copy = "More members left than joined during the last 30 days."
-        else:
-            status = "Stable"
-            status_icon = "➖"
-            status_style = discord.ButtonStyle.secondary
-            status_copy = "Joins and departures were balanced during the last 30 days."
-
-        net_label = f"+{net_30:,}" if net_30 > 0 else f"{net_30:,}"
-        lifetime_label = f"+{lifetime_net:,}" if lifetime_net > 0 else f"{lifetime_net:,}"
-
-        self.trend_button = discord.ui.Button(
-            label=status,
-            style=status_style,
-            emoji=status_icon,
-            disabled=True,
-        )
-        self.member_button = discord.ui.Button(
-            label=f"{int(current):,} members",
-            style=discord.ButtonStyle.secondary,
-            emoji="👥",
-            disabled=True,
-        )
-
-        member_row = discord.ui.ActionRow()
-        member_row.add_item(self.member_button)
+        def format_events(events):
+            if not events:
+                return "`None in the last 30 days`"
+            lines = []
+            for event in events:
+                username = str(event.get("username", "Unknown member"))[:32]
+                user_id = int(event.get("user_id", 0) or 0)
+                timestamp = parse_datetime(event.get("timestamp"))
+                when = discord.utils.format_dt(timestamp, "R") if timestamp else "recently"
+                mention = f"<@{user_id}>" if user_id else f"**{username}**"
+                lines.append(f"{mention} — {when}")
+            return "\n".join(lines)
 
         self.add_item(
             make_container(
-                make_text("## 📊 Server Insights"),
-                make_text(f"**{guild_name}**\nA clean overview of recent member activity and long-term totals."),
+                make_text(f"## 📊 Server Insights · {guild.name}"),
                 make_separator(),
-                discord.ui.Section(
-                    make_text(f"### {status_icon} {status}"),
-                    make_text(status_copy + f"\n30-day net movement: **{net_label}** members."),
-                    accessory=self.trend_button,
-                ),
-                make_separator(),
-                make_text("### 👥 Community snapshot"),
-                member_row,
                 make_text(
-                    f"**Joined in 30 days**  `{int(joins_30):,}`\n"
-                    f"**Left in 30 days**  `{int(leaves_30):,}`\n"
-                    f"**Net change**  `{net_label}`"
-                ),
-                make_separator(),
-                make_text("### 📚 Lifetime totals"),
-                make_text(
-                    f"🟢 **Total joins**  `{int(total_joins):,}`\n"
-                    f"🔴 **Total departures**  `{int(total_leaves):,}`\n"
-                    f"⚖️ **Lifetime net**  `{lifetime_label}`"
+                    f"**Current Members:** `{guild.member_count or 0:,}`   **Status:** {status}\n"
+                    f"**30-Day Net:** `{net_text}`   **Lifetime Net:** `{lifetime_net_text}`"
                 ),
                 make_separator(),
                 make_text(
-                    "**Tracking:** MongoDB\n"
-                    "Recent activity is kept for 30 days while lifetime counters remain available for the server."
+                    "### 🗓️ Last 30 Days\n"
+                    f"**Joined:** `{len(joins):,}`   **Left:** `{len(leaves):,}`   **Net:** `{net_text}`\n"
+                    "Activity automatically expires after 30 days."
                 ),
-                accent_color=0x5865F2,
+                make_separator(),
+                make_text(
+                    "### 🟢 Recent Joins\n" + format_events(recent_joins) + "\n\n"
+                    "### 🔴 Recent Departures\n" + format_events(recent_leaves)
+                ),
+                make_separator(),
+                make_text(
+                    "### ♾️ Lifetime Totals\n"
+                    f"**Total Joins:** `{lifetime_joins:,}`\n"
+                    f"**Total Departures:** `{lifetime_leaves:,}`\n"
+                    f"**Lifetime Net:** `{lifetime_net_text}`"
+                ),
+                make_separator(),
+                make_text(
+                    "💾 **MongoDB Persistence**\n"
+                    "Member activity is stored persistently. The activity list uses a rolling 30-day window, while lifetime totals remain available."
+                ),
             )
         )
 
@@ -419,47 +412,25 @@ class InsightsView(discord.ui.LayoutView):
 class PurgeView(discord.ui.LayoutView):
     def __init__(self, requested, deleted, channel):
         super().__init__(timeout=None)
-        requested = int(requested)
-        deleted = int(deleted)
-        difference = requested - deleted
-        if difference > 0:
-            result_text = f"`{difference:,}` message(s) could not be deleted."
-            result_icon = "⚠️"
-        else:
-            result_text = "Every requested message was deleted successfully."
-            result_icon = "✅"
-
         self.add_item(
             make_container(
                 make_text("## 🧹 Purge Complete"),
-                make_text("The channel cleanup has finished."),
                 make_separator(),
-                discord.ui.Section(
-                    make_text(f"### {result_icon} Cleanup result"),
-                    make_text(result_text),
-                    accessory=discord.ui.Button(
-                        label=f"{deleted:,} deleted",
-                        style=discord.ButtonStyle.success if difference == 0 else discord.ButtonStyle.secondary,
-                        emoji="🗑️",
-                        disabled=True,
-                    ),
-                ),
+                make_text("The cleanup finished successfully."),
                 make_separator(),
                 make_text(
-                    f"### 📋 Details\n"
-                    f"**Requested**  `{requested:,}`\n"
-                    f"**Deleted**  `{deleted:,}`\n"
-                    f"**Channel**  {channel.mention}"
+                    f"### 📋 Results\n"
+                    f"**Requested:** `{requested:,}`\n"
+                    f"**Deleted:** `{deleted:,}`\n"
+                    f"**Channel:** {channel.mention}"
                 ),
-                accent_color=0x57F287 if difference == 0 else 0xFEE75C,
             )
         )
 
-
-class MessageIdModal(discord.ui.Modal, title="Target Message"):
+class MessageIdModal(discord.ui.Modal, title="Set Target Message"):
     message_id = discord.ui.TextInput(
         label="Message ID",
-        placeholder="Paste the target message ID",
+        placeholder="Paste the Discord message ID here",
         required=True,
         max_length=30,
     )
@@ -471,20 +442,14 @@ class MessageIdModal(discord.ui.Modal, title="Target Message"):
     async def on_submit(self, interaction):
         value = str(self.message_id.value).strip()
         if not value.isdigit():
-            await interaction.response.send_message(
-                "❌ **Invalid message ID**\nPlease paste a numeric Discord message ID.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ That is not a valid Discord message ID.", ephemeral=True)
             return
         self.parent_view.message_id = int(value)
         self.parent_view.refresh()
-        await interaction.response.send_message(
-            f"✅ **Target message updated**\nMessage `{value}` is ready to use.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"✅ Target message set to `{value}`.", ephemeral=True)
 
 
-class EmojiModal(discord.ui.Modal, title="Reaction Emojis"):
+class EmojiModal(discord.ui.Modal, title="Set Reaction Emojis"):
     emoji_1 = discord.ui.TextInput(label="Emoji 1", placeholder="⭐ or <:custom:123456789>", required=True, max_length=100)
     emoji_2 = discord.ui.TextInput(label="Emoji 2", placeholder="Optional", required=False, max_length=100)
     emoji_3 = discord.ui.TextInput(label="Emoji 3", placeholder="Optional", required=False, max_length=100)
@@ -505,24 +470,17 @@ class EmojiModal(discord.ui.Modal, title="Reaction Emojis"):
         ]
         values = [value for value in values if value]
         if not values:
-            await interaction.response.send_message(
-                "❌ **No emojis added**\nAdd at least one reaction emoji.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ Add at least one emoji.", ephemeral=True)
             return
         if len(values) > 5:
-            await interaction.response.send_message(
-                "❌ **Too many emojis**\nYou can use up to 5 reaction emojis.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ You can use a maximum of 5 emojis.", ephemeral=True)
             return
         self.parent_view.emojis = values
         self.parent_view.refresh()
         await interaction.response.send_message(
-            f"✅ **Emoji set updated**\nSaved `{len(values)}` reaction emoji{'s' if len(values) != 1 else ''}.",
+            f"✅ {len(values)} reaction emoji{'s' if len(values) != 1 else ''} saved.",
             ephemeral=True,
         )
-
 
 class RolePickerView(discord.ui.View):
     def __init__(self, parent_view):
@@ -530,7 +488,7 @@ class RolePickerView(discord.ui.View):
         self.parent_view = parent_view
 
         self.select = discord.ui.RoleSelect(
-            placeholder="Choose up to 5 roles",
+            placeholder="Select up to 5 roles",
             min_values=1,
             max_values=5,
         )
@@ -541,7 +499,7 @@ class RolePickerView(discord.ui.View):
         try:
             if interaction.guild is None:
                 await interaction.response.send_message(
-                    "❌ This selector can only be used inside a server.",
+                    "This selector can only be used inside a server.",
                     ephemeral=True,
                 )
                 return
@@ -556,7 +514,7 @@ class RolePickerView(discord.ui.View):
 
             if not resolved:
                 await interaction.response.send_message(
-                    "❌ **No valid roles selected**\nChoose at least one available role.",
+                    "No valid roles were selected.",
                     ephemeral=True,
                 )
                 return
@@ -565,18 +523,18 @@ class RolePickerView(discord.ui.View):
             self.parent_view.refresh()
 
             await interaction.response.send_message(
-                "✅ **Roles updated**\n" + " · ".join(role.mention for role in resolved),
+                "Selected: " + ", ".join(role.mention for role in resolved),
                 ephemeral=True,
             )
         except Exception as error:
             if interaction.response.is_done():
                 await interaction.followup.send(
-                    f"❌ **Could not update roles**\n`{error}`",
+                    f"Could not save the selected roles: {error}",
                     ephemeral=True,
                 )
             else:
                 await interaction.response.send_message(
-                    f"❌ **Could not update roles**\n`{error}`",
+                    f"Could not save the selected roles: {error}",
                     ephemeral=True,
                 )
 
@@ -589,29 +547,13 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
         self.roles = []
         self.emojis = []
 
-        self.message_button = discord.ui.Button(
-            label="Target Message",
-            style=discord.ButtonStyle.secondary,
-            emoji="🆔",
-        )
+        self.message_button = discord.ui.Button(label="Message", style=discord.ButtonStyle.secondary, emoji="🆔")
         self.message_button.callback = self.message_id_callback
-        self.role_button = discord.ui.Button(
-            label="Choose Roles",
-            style=discord.ButtonStyle.secondary,
-            emoji="🎭",
-        )
+        self.role_button = discord.ui.Button(label="Roles", style=discord.ButtonStyle.secondary, emoji="🎭")
         self.role_button.callback = self.role_callback
-        self.emoji_button = discord.ui.Button(
-            label="Set Emojis",
-            style=discord.ButtonStyle.secondary,
-            emoji="✨",
-        )
+        self.emoji_button = discord.ui.Button(label="Emojis", style=discord.ButtonStyle.secondary, emoji="✨")
         self.emoji_button.callback = self.emoji_callback
-        self.save_button = discord.ui.Button(
-            label="Create Reaction Roles",
-            style=discord.ButtonStyle.success,
-            emoji="🚀",
-        )
+        self.save_button = discord.ui.Button(label="Save Setup", style=discord.ButtonStyle.success, emoji="✅")
         self.save_button.callback = self.save_callback
 
         row = discord.ui.ActionRow()
@@ -623,23 +565,18 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
         self.status = make_text(self.status_text())
         self.add_item(
             make_container(
-                make_text("## 🎭 Reaction Role Builder"),
+                make_text("## 🎭 Reaction Role Setup"),
+                make_separator(),
                 make_text(
-                    "Build a polished reaction-role message without typing configuration by hand.\n"
-                    "Set the target message, choose your roles, add emojis, then create the panel."
+                    "Create a reaction-role message in a few simple steps.\n"
+                    "Set the message, choose up to 5 roles, then match each role with an emoji."
                 ),
                 make_separator(),
-                make_text("### 🧩 Setup progress"),
+                make_text("### ⚙️ Configuration"),
                 self.status,
                 make_separator(),
-                make_text("### 🎛️ Builder controls"),
+                make_text("### 🔧 Controls"),
                 row,
-                make_separator(),
-                make_text(
-                    "**Pairing:** role 1 → emoji 1, role 2 → emoji 2, and so on.\n"
-                    "You can configure up to 5 role/emoji pairs."
-                ),
-                accent_color=0x9B59B6,
             )
         )
 
@@ -647,25 +584,21 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
         self.status.content = self.status_text()
 
     def status_text(self):
-        message = f"`{self.message_id}`" if self.message_id else "`Not configured`"
-        roles = ", ".join(role.mention for role in self.roles) if self.roles else "`Not configured`"
-        emojis = "  ".join(self.emojis) if self.emojis else "`Not configured`"
+        message = f"`{self.message_id}`" if self.message_id else "`Not set`"
+        roles = ", ".join(role.mention for role in self.roles) if self.roles else "`Not set`"
+        emojis = "  ".join(self.emojis) if self.emojis else "`Not set`"
         pair_count = min(len(self.roles), len(self.emojis))
-        message_state = "✅" if self.message_id else "⬜"
-        role_state = "✅" if self.roles else "⬜"
-        emoji_state = "✅" if self.emojis else "⬜"
-        ready_state = "Ready" if self.message_id and self.roles and self.emojis and len(self.roles) == len(self.emojis) else "Waiting for setup"
         return (
-            f"{message_state} **Target message**  {message}\n"
-            f"{role_state} **Roles**  {roles}\n"
-            f"{emoji_state} **Emojis**  {emojis}\n"
-            f"🚦 **Status**  `{ready_state}` · `{pair_count}/5` pairs ready"
+            f"**Target Message:** {message}\n"
+            f"**Roles:** {roles}\n"
+            f"**Emojis:** {emojis}\n"
+            f"**Pairs Ready:** `{pair_count}/5`"
         )
 
     async def check_author(self, interaction):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "❌ **This setup is private**\nOnly the person who started this builder can use its controls.",
+                "❌ Only the person who started this setup can use these controls.",
                 ephemeral=True,
             )
             return False
@@ -681,7 +614,7 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
             return
         picker = RolePickerView(self)
         await interaction.response.send_message(
-            "### 🎭 Choose roles\nSelect up to 5 roles. Their order determines which emoji they receive.",
+            "🎭 **Select Roles**\nChoose up to 5 roles. Their order will be matched with the emoji order.",
             view=picker,
             ephemeral=True,
         )
@@ -691,184 +624,25 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
             return
         await interaction.response.send_modal(EmojiModal(self))
 
-    async def save_callback(self, interaction):
-        if not await self.check_author(interaction):
-            return
-
-        if self.message_id is None:
-            await interaction.response.send_message(
-                "⚠️ **Target message missing**\nSet the message ID before creating the reaction-role panel.",
-                ephemeral=True,
-            )
-            return
-
-        if not self.roles:
-            await interaction.response.send_message(
-                "⚠️ **Roles missing**\nChoose at least one role before creating the panel.",
-                ephemeral=True,
-            )
-            return
-
-        if not self.emojis:
-            await interaction.response.send_message(
-                "⚠️ **Emojis missing**\nAdd at least one reaction emoji before creating the panel.",
-                ephemeral=True,
-            )
-            return
-
-        if len(self.roles) != len(self.emojis):
-            await interaction.response.send_message(
-                "⚠️ **Pair count mismatch**\nUse exactly one emoji for each selected role.",
-                ephemeral=True,
-            )
-            return
-
-        if len(self.roles) > 5 or len(self.emojis) > 5:
-            await interaction.response.send_message(
-                "⚠️ **Configuration limit reached**\nYou can create up to 5 role and emoji pairs.",
-                ephemeral=True,
-            )
-            return
-
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message(
-                "❌ This setup can only be used inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        me = guild.me
-        if me is None:
-            await interaction.response.send_message(
-                "❌ I could not verify my server permissions.",
-                ephemeral=True,
-            )
-            return
-
-        if not me.guild_permissions.manage_roles:
-            await interaction.response.send_message(
-                "❌ **Missing permission**\nI need Manage Roles to create reaction roles.",
-                ephemeral=True,
-            )
-            return
-
-        for role in self.roles:
-            if role.is_default():
-                await interaction.response.send_message(
-                    "❌ The @everyone role cannot be used.",
-                    ephemeral=True,
-                )
-                return
-
-            if role.managed:
-                await interaction.response.send_message(
-                    f"❌ {role.mention} is managed and cannot be assigned.",
-                    ephemeral=True,
-                )
-                return
-
-            if role >= me.top_role:
-                await interaction.response.send_message(
-                    f"❌ I cannot assign {role.mention} because it is above my highest role.",
-                    ephemeral=True,
-                )
-                return
-
-        await interaction.response.defer(ephemeral=True)
-
-        target = await find_message_in_guild(guild, self.message_id)
-        if target is None:
-            await interaction.followup.send(
-                "❌ **Message not found**\nMake sure the message exists in this server and that I can view its channel and read message history.",
-                ephemeral=True,
-            )
-            return
-
-        if len(set(self.emojis)) != len(self.emojis):
-            await interaction.followup.send(
-                "❌ **Duplicate emojis**\nEach reaction emoji must be unique.",
-                ephemeral=True,
-            )
-            return
-
-        pairs = [
-            {
-                "emoji": emoji,
-                "role_id": role.id,
-                "role_name": role.name,
-            }
-            for emoji, role in zip(self.emojis, self.roles)
-        ]
-
-        try:
-            for emoji in self.emojis:
-                await target.add_reaction(emoji)
-
-            record = {
-                "message_id": target.id,
-                "channel_id": target.channel.id,
-                "guild_id": guild.id,
-                "pairs": pairs,
-            }
-
-            await mongo_call(save_reaction_role_sync, record)
-            reaction_role_cache[target.id] = record
-
-            try:
-                await target.edit(view=ReactionRoleMessageView(pairs))
-            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-                pass
-
-            await interaction.followup.send(
-                f"✅ **Reaction roles created**\nConfigured `{len(pairs)}` role pair(s) on message `{target.id}`.",
-                ephemeral=True,
-            )
-            self.stop()
-
-        except discord.HTTPException as error:
-            await interaction.followup.send(
-                f"❌ **Discord could not finish the setup**\n`{error}`",
-                ephemeral=True,
-            )
-        except PyMongoError as error:
-            await interaction.followup.send(
-                f"❌ **MongoDB could not save the setup**\n`{error}`",
-                ephemeral=True,
-            )
-
 
 class ReactionRoleMessageView(discord.ui.LayoutView):
     def __init__(self, pairs):
         super().__init__(timeout=None)
-        lines = [
-            f"**{index}.** {pair['emoji']}  **{pair['role_name']}**"
-            for index, pair in enumerate(pairs, 1)
-        ]
+        lines = [f"`{index}`  {pair['emoji']}  **{pair['role_name']}**" for index, pair in enumerate(pairs, 1)]
         self.add_item(
             make_container(
-                make_text("## 🎭 Choose Your Roles"),
+                make_text("## 🎭 Reaction Roles"),
+                make_separator(),
                 make_text(
-                    "React below to choose the roles you want.\n"
-                    "Remove your reaction whenever you want to give a role back."
+                    "React with the emoji beside a role to receive it.\n"
+                    "Remove your reaction to give the role back."
                 ),
                 make_separator(),
-                make_text("### Available roles\n" + "\n".join(lines)),
+                make_text("### Available Roles\n" + "\n".join(lines)),
                 make_separator(),
-                discord.ui.Section(
-                    make_text("### ⚡ Automatic"),
-                    make_text("Your role is added or removed automatically after your reaction changes."),
-                    accessory=discord.ui.Button(
-                        label="Self-serve roles",
-                        style=discord.ButtonStyle.secondary,
-                        emoji="✨",
-                        disabled=True,
-                    ),
-                ),
-                accent_color=0x9B59B6,
+                make_text("✨ **Automatic:** Role changes happen instantly after you react."),
             )
         )
-
 
 async def find_message_in_guild(guild, message_id):
     message_id = int(message_id)
@@ -1213,17 +987,9 @@ async def server_insights(interaction: discord.Interaction):
             interaction.guild.id,
         )
 
-        joins = len(document.get("joins", []))
-        leaves = len(document.get("leaves", []))
-        current = interaction.guild.member_count or 0
-
         view = InsightsView(
-            guild_name=interaction.guild.name,
-            current=current,
-            joins_30=joins,
-            leaves_30=leaves,
-            total_joins=int(document.get("total_joins", joins)),
-            total_leaves=int(document.get("total_leaves", leaves)),
+            guild=interaction.guild,
+            document=document,
         )
 
         await interaction.followup.send(view=view)
@@ -1360,7 +1126,13 @@ async def purge(
 @bot.event
 async def on_member_join(member: discord.Member):
     try:
-        await mongo_call(add_member_event_sync, member.guild.id, "join")
+        await mongo_call(
+            add_member_event_sync,
+            member.guild.id,
+            "join",
+            member.id,
+            str(member),
+        )
         await mongo_call(add_member_to_snapshot_sync, member.guild.id, member.id)
     except PyMongoError as error:
         print(f"MongoDB join tracking error for guild {member.guild.id}: {error}")
@@ -1369,7 +1141,13 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_member_remove(member: discord.Member):
     try:
-        await mongo_call(add_member_event_sync, member.guild.id, "leave")
+        await mongo_call(
+            add_member_event_sync,
+            member.guild.id,
+            "leave",
+            member.id,
+            str(member),
+        )
         await mongo_call(remove_member_from_snapshot_sync, member.guild.id, member.id)
     except PyMongoError as error:
         print(f"MongoDB leave tracking error for guild {member.guild.id}: {error}")
@@ -1519,10 +1297,29 @@ async def on_ready():
                     guild.id,
                     member_ids,
                 )
-                if not initialized and (joined or left):
-                    print(
-                        f"Reconciled {guild.name}: {joined} missed joins, {left} missed departures"
-                    )
+                if not initialized:
+                    for member_id in joined:
+                        member = guild.get_member(member_id)
+                        await mongo_call(
+                            add_member_event_sync,
+                            guild.id,
+                            "join",
+                            member_id,
+                            str(member) if member else "Unknown member",
+                        )
+                    for member_id in left:
+                        await mongo_call(
+                            add_member_event_sync,
+                            guild.id,
+                            "leave",
+                            member_id,
+                            "Unknown member",
+                        )
+                    if joined or left:
+                        print(
+                            f"Reconciled {guild.name}: {len(joined)} missed joins, {len(left)} missed departures"
+                        )
+                await mongo_call(get_guild_insights_sync, guild.id)
             except PyMongoError as error:
                 print(f"MongoDB member reconciliation error for guild {guild.id}: {error}")
 
