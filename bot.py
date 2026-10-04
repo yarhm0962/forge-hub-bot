@@ -1,730 +1,491 @@
-import os,asyncio
-from datetime import datetime,timedelta,timezone
+import os
+import asyncio
+from datetime import datetime, timedelta, timezone
+
 import discord
 from discord import app_commands
 from discord.ext import commands
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import PyMongoError
 
-TOKEN=os.getenv("DISCORD_TOKEN")
-if not TOKEN: raise RuntimeError("DISCORD_TOKEN environment variable is missing")
+TOKEN = os.getenv("DISCORD_TOKEN")
+MONGODB_URI = os.getenv("MONGODB_URI")
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "PanelBot")
 
-intents=discord.Intents.default()
-intents.guilds=True
-intents.members=True
-intents.message_content=True
-bot=commands.Bot(command_prefix="!",intents=intents)
-created_channels={}
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN environment variable is missing")
 
-ANTI_SCAM_MESSAGE=("This channel is protected by the server moderation system.\n\n"
-"Please do not send messages here. Messages sent in this channel may result in an immediate kick from the server.\n\n"
-"If you have read and understood this notice, react with 👍 below.")
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI environment variable is missing")
 
-MONGODB_URI="mongodb+srv://xyrielzen16_db_user:saisai1324@panelbot.aubckg7.mongodb.net/?appName=PanelBot"
-MONGODB_DB_NAME="PanelBot"
+mongo_client = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=10000,
+    connectTimeoutMS=10000,
+    socketTimeoutMS=10000,
+)
+mongo_db = mongo_client[MONGODB_DATABASE]
+insights_collection = mongo_db["server_insights"]
+anti_scam_collection = mongo_db["anti_scam_channels"]
 
-try:
-    from pymongo import MongoClient
-except ImportError as error:
-    raise RuntimeError("pymongo is required. Install it with: pip install pymongo") from error
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
 
-mongo_client=MongoClient(MONGODB_URI,serverSelectionTimeoutMS=10000)
-mongo_db=mongo_client[MONGODB_DB_NAME]
-insights_collection=mongo_db["server_insights"]
-anti_scam_collection=mongo_db["anti_scam_channels"]
+bot = commands.Bot(command_prefix="!", intents=intents)
+created_channels = {}
+ready_once = False
 
-def cleanup_events(data):
-    cutoff=datetime.now(timezone.utc)-timedelta(days=30)
-    for kind in ("joins","leaves"):
-        data[kind]=[x for x in data.get(kind,[]) if _valid_recent(x,cutoff)]
+ANTI_SCAM_MESSAGE = (
+    "This channel is protected by the server moderation system.\n\n"
+    "Please do not send messages here. Messages sent in this channel may result in an immediate kick from the server.\n\n"
+    "If you have read and understood this notice, react with 👍 below."
+)
 
-def _valid_recent(value,cutoff):
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def iso_now():
+    return utc_now().isoformat()
+
+
+def parse_datetime(value):
+    if not isinstance(value, str):
+        return None
     try:
-        return datetime.fromisoformat(value)>=cutoff
-    except (TypeError,ValueError):
-        return False
+        result = datetime.fromisoformat(value)
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=timezone.utc)
+        return result.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
-async def get_guild_insights(gid):
-    def operation():
-        data=insights_collection.find_one({"_id":str(gid)})
-        if not data:
-            data={"_id":str(gid),"joins":[],"leaves":[]}
-        cleanup_events(data)
-        insights_collection.replace_one({"_id":str(gid)},data,upsert=True)
-        return data
-    return await asyncio.to_thread(operation)
 
-async def save_guild_insights(gid,data):
-    data={
-        "_id":str(gid),
-        "joins":data.get("joins",[]),
-        "leaves":data.get("leaves",[])
-    }
-    cleanup_events(data)
-    await asyncio.to_thread(
-        insights_collection.replace_one,
-        {"_id":str(gid)},
-        data,
-        upsert=True
+def cleanup_events_sync(document):
+    cutoff = utc_now() - timedelta(days=30)
+    joins = [x for x in document.get("joins", []) if (dt := parse_datetime(x)) and dt >= cutoff]
+    leaves = [x for x in document.get("leaves", []) if (dt := parse_datetime(x)) and dt >= cutoff]
+    document["joins"] = joins
+    document["leaves"] = leaves
+    return document
+
+
+def get_guild_insights_sync(guild_id):
+    document = insights_collection.find_one({"_id": int(guild_id)})
+    if not document:
+        document = {"_id": int(guild_id), "joins": [], "leaves": []}
+    cleanup_events_sync(document)
+    insights_collection.replace_one({"_id": int(guild_id)}, document, upsert=True)
+    return document
+
+
+def add_member_event_sync(guild_id, event_type):
+    guild_id = int(guild_id)
+    field = "joins" if event_type == "join" else "leaves"
+    document = insights_collection.find_one_and_update(
+        {"_id": guild_id},
+        {"$setOnInsert": {"joins": [], "leaves": []}, "$push": {field: iso_now()}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    cleanup_events_sync(document)
+    insights_collection.replace_one({"_id": guild_id}, document, upsert=True)
+
+
+def get_anti_scam_sync(channel_id):
+    return anti_scam_collection.find_one({"_id": int(channel_id)})
+
+
+def save_anti_scam_sync(record):
+    channel_id = int(record["channel_id"])
+    data = dict(record)
+    data["_id"] = channel_id
+    anti_scam_collection.replace_one({"_id": channel_id}, data, upsert=True)
+
+
+def delete_anti_scam_sync(channel_id):
+    anti_scam_collection.delete_one({"_id": int(channel_id)})
+
+
+def list_anti_scam_sync():
+    return list(anti_scam_collection.find({}))
+
+
+def increment_kicks_sync(channel_id):
+    return anti_scam_collection.find_one_and_update(
+        {"_id": int(channel_id)},
+        {"$inc": {"kicks": 1}},
+        return_document=ReturnDocument.AFTER,
     )
 
-async def get_anti_scam_record(channel_id):
-    return await asyncio.to_thread(
-        anti_scam_collection.find_one,
-        {"_id":str(channel_id)}
-    )
 
-async def save_anti_scam_record(record):
-    record=dict(record)
-    record["_id"]=str(record.get("channel_id"))
-    await asyncio.to_thread(
-        anti_scam_collection.replace_one,
-        {"_id":record["_id"]},
-        record,
-        upsert=True
-    )
+async def mongo_call(function, *args):
+    return await asyncio.to_thread(function, *args)
 
-async def load_anti_scam_records():
-    return await asyncio.to_thread(
-        lambda:list(anti_scam_collection.find({}))
-    )
 
-async def delete_anti_scam_record(channel_id):
-    await asyncio.to_thread(
-        anti_scam_collection.delete_one,
-        {"_id":str(channel_id)}
-    )
-
-class AntiScamPanel(discord.ui.LayoutView):
-    def __init__(self,kicks=0):
+class AntiScamView(discord.ui.View):
+    def __init__(self, kicks=0):
         super().__init__(timeout=None)
-        self.kicks=kicks
-        self.container=discord.ui.Container(
-            discord.ui.TextDisplay("## 🛡️ Anti-Scam Protection"),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(ANTI_SCAM_MESSAGE),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(
-                "### ⚠️ Automatic Moderation\n"
-                "This channel is monitored automatically. Messages sent here "
-                "are removed and the sender may be kicked from the server."
-            ),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.ActionRow(
-                discord.ui.Button(
-                    label=f"kicks: {kicks}",
-                    style=discord.ButtonStyle.secondary,
-                    disabled=True
-                )
-            )
+        self.kicks = int(kicks)
+        self.kick_button = discord.ui.Button(
+            label=f"Kicks: {self.kicks}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
         )
-        self.add_item(self.container)
+        self.add_item(self.kick_button)
 
-    def update_kicks(self):
-        for item in self.container.children:
-            if isinstance(item,discord.ui.ActionRow):
-                for button in item.children:
-                    if isinstance(button,discord.ui.Button):
-                        button.label=f"kicks: {self.kicks}"
+    def update_kicks(self, kicks=None):
+        if kicks is not None:
+            self.kicks = int(kicks)
+        self.kick_button.label = f"Kicks: {self.kicks}"
 
-class InsightsPanel(discord.ui.LayoutView):
-    def __init__(self,guild,data):
+
+class InsightsView(discord.ui.View):
+    def __init__(self, current, joins, leaves):
         super().__init__(timeout=None)
-        cleanup_events(data)
+        self.current = current
+        self.joins = joins
+        self.leaves = leaves
 
-        joins=len(data["joins"])
-        leaves=len(data["leaves"])
-        current=guild.member_count or 0
-        net=joins-leaves
 
-        growth=f"+{net:,}" if net>0 else f"{net:,}"
-        status=(
-            "📈 Growing"
-            if net>0
-            else "📉 Declining"
-            if net<0
-            else "➖ Stable"
-        )
-
-        self.container=discord.ui.Container(
-            discord.ui.TextDisplay("## 📊 Server Insights"),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(
-                f"### {guild.name}\n"
-                "A clean overview of member activity across the last 30 days."
-            ),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(
-                f"👥 **Current Members**\n`{current:,}`"
-            ),
-            discord.ui.TextDisplay(
-                f"🟢 **New Members**\n`{joins:,}` joined during the last 30 days."
-            ),
-            discord.ui.TextDisplay(
-                f"🔴 **Departures**\n`{leaves:,}` left during the last 30 days."
-            ),
-            discord.ui.TextDisplay(
-                f"📈 **Net Change**\n`{growth}` members"
-            ),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(
-                f"**{status}**\n"
-                "Join and leave activity is automatically tracked over "
-                "a rolling 30-day period."
-            )
-        )
-        self.add_item(self.container)
-
-class PurgePanel(discord.ui.LayoutView):
-    def __init__(self,count,deleted):
+class PurgeView(discord.ui.View):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.container=discord.ui.Container(
-            discord.ui.TextDisplay("## 🧹 Messages Cleared"),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(
-                f"Successfully cleared **{deleted:,}** "
-                f"message{'s' if deleted!=1 else ''}."
-            ),
-            discord.ui.Separator(
-                spacing=discord.SeparatorSpacing.small,
-                visible=True
-            ),
-            discord.ui.TextDisplay(
-                f"**Requested:** `{count:,}`\n"
-                f"**Deleted:** `{deleted:,}`\n"
-                "**Channel:** Current channel"
-            )
-        )
-        self.add_item(self.container)
 
-create_group=app_commands.Group(
-    name="create",
-    description="Create server tools"
-)
 
-anti_group=app_commands.Group(
-    name="anti",
-    description="Anti moderation tools",
-    parent=create_group
-)
+create_group = app_commands.Group(name="create", description="Create server tools")
+anti_group = app_commands.Group(name="anti", description="Anti moderation tools", parent=create_group)
+server_group = app_commands.Group(name="server", description="Server information and tools")
 
-server_group=app_commands.Group(
-    name="server",
-    description="Server information and tools"
-)
 
-@anti_group.command(
-    name="scam",
-    description="Create an anti-scam protection channel"
-)
-@app_commands.describe(
-    name="The exact name of the channel to create"
-)
-@app_commands.checks.has_permissions(
-    manage_channels=True
-)
-async def anti_scam(interaction:discord.Interaction,name:str):
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True
-        )
+@anti_group.command(name="scam", description="Create an anti-scam protection channel")
+@app_commands.describe(name="The exact name of the channel to create")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def anti_scam(interaction: discord.Interaction, name: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-
-    me=interaction.guild.me
+    me = interaction.guild.me
 
     if me is None:
-        await interaction.followup.send(
-            "I could not verify my server permissions.",
-            ephemeral=True
-        )
+        await interaction.followup.send("I could not verify my server permissions.", ephemeral=True)
         return
 
     if not me.guild_permissions.manage_channels:
-        await interaction.followup.send(
-            "I need the Manage Channels permission.",
-            ephemeral=True
-        )
+        await interaction.followup.send("I need the Manage Channels permission.", ephemeral=True)
         return
 
     if not me.guild_permissions.kick_members:
-        await interaction.followup.send(
-            "I need the Kick Members permission.",
-            ephemeral=True
-        )
+        await interaction.followup.send("I need the Kick Members permission.", ephemeral=True)
+        return
+
+    clean_name = name.strip()
+    if not clean_name:
+        await interaction.followup.send("The channel name cannot be empty.", ephemeral=True)
         return
 
     try:
-        channel=await interaction.guild.create_text_channel(name)
-        panel=AntiScamPanel()
-        msg=await channel.send(view=panel)
+        channel = await interaction.guild.create_text_channel(clean_name, reason=f"Anti-scam channel created by {interaction.user}")
+        view = AntiScamView()
+        message = await channel.send(
+            embed=discord.Embed(
+                title="🛡️ Anti-Scam Protection",
+                description=ANTI_SCAM_MESSAGE,
+                color=discord.Color.red(),
+            ),
+            view=view,
+        )
 
         try:
-            await msg.add_reaction("👍")
+            await message.add_reaction("👍")
         except discord.HTTPException:
             pass
 
-        await save_anti_scam_record({
-            "guild_id":interaction.guild.id,
-            "channel_id":channel.id,
-            "message_id":msg.id,
-            "kicks":0
-        })
-
-        created_channels[channel.id]={
-            "panel":panel,
-            "message":msg,
-            "guild_id":interaction.guild.id
+        record = {
+            "channel_id": channel.id,
+            "guild_id": interaction.guild.id,
+            "message_id": message.id,
+            "kicks": 0,
         }
-
-        await interaction.followup.send(
-            f"Created {channel.mention}.",
-            ephemeral=True
-        )
-
+        await mongo_call(save_anti_scam_sync, record)
+        created_channels[channel.id] = {"view": view, "message": message, "guild_id": interaction.guild.id}
+        await interaction.followup.send(f"Created {channel.mention}.", ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send(
-            "I don't have permission to create or manage that channel.",
-            ephemeral=True
-        )
-
+        await interaction.followup.send("I don't have permission to create or manage that channel.", ephemeral=True)
     except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"Discord returned an error: {error}",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"Discord returned an error: {error}", ephemeral=True)
+    except PyMongoError as error:
+        try:
+            await channel.delete(reason="MongoDB persistence failed")
+        except Exception:
+            pass
+        await interaction.followup.send(f"MongoDB error while saving the channel: {error}", ephemeral=True)
+    except Exception as error:
+        await interaction.followup.send(f"Unexpected error: {error}", ephemeral=True)
 
-@server_group.command(
-    name="insights",
-    description="View member activity from the last 30 days"
-)
-@app_commands.checks.has_permissions(
-    manage_guild=True
-)
-async def server_insights(interaction:discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True
-        )
+
+@server_group.command(name="insights", description="View member activity from the last 30 days")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def server_insights(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
         return
 
-    data=await get_guild_insights(interaction.guild.id)
-    cleanup_events(data)
-    await save_guild_insights(
-        interaction.guild.id,
-        data
-    )
+    await interaction.response.defer()
 
-    await interaction.response.send_message(
-        view=InsightsPanel(
-            interaction.guild,
-            data
-        )
-    )
+    try:
+        document = await mongo_call(get_guild_insights_sync, interaction.guild.id)
+        joins = len(document.get("joins", []))
+        leaves = len(document.get("leaves", []))
+        current = interaction.guild.member_count or 0
+        net = joins - leaves
+        growth = f"+{net:,}" if net > 0 else f"{net:,}"
+        status = "📈 Growing" if net > 0 else "📉 Declining" if net < 0 else "➖ Stable"
 
-@bot.tree.command(
-    name="purge",
-    description="Delete recent messages from the current channel"
-)
-@app_commands.describe(
-    count="Number of messages to delete (1-1000)"
-)
-@app_commands.checks.has_permissions(
-    manage_messages=True
-)
-async def purge(
-    interaction:discord.Interaction,
-    count:app_commands.Range[int,1,1000]
-):
-    if not isinstance(
-        interaction.channel,
-        discord.TextChannel
-    ):
-        await interaction.response.send_message(
-            "This command can only be used in a text channel.",
-            ephemeral=True
-        )
+        embed = discord.Embed(title="📊 Server Insights", color=discord.Color.blurple())
+        embed.description = f"**{interaction.guild.name}**\nMember activity across the last 30 days."
+        embed.add_field(name="👥 Current Members", value=f"`{current:,}`", inline=False)
+        embed.add_field(name="🟢 New Members", value=f"`{joins:,}` joined during the last 30 days.", inline=False)
+        embed.add_field(name="🔴 Departures", value=f"`{leaves:,}` left during the last 30 days.", inline=False)
+        embed.add_field(name="📈 Net Change", value=f"`{growth}` members", inline=False)
+        embed.add_field(name="Status", value=status, inline=False)
+        await interaction.followup.send(embed=embed)
+    except PyMongoError as error:
+        await interaction.followup.send(f"MongoDB error: {error}", ephemeral=True)
+    except Exception as error:
+        await interaction.followup.send(f"Unexpected error: {error}", ephemeral=True)
+
+
+@bot.tree.command(name="purge", description="Delete recent messages from the current channel")
+@app_commands.describe(count="Number of messages to delete (1-1000)")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def purge(interaction: discord.Interaction, count: app_commands.Range[int, 1, 1000]):
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("This command can only be used in a text channel.", ephemeral=True)
         return
 
-    me=interaction.guild.me
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
+        return
 
+    me = interaction.guild.me
     if me is None:
-        await interaction.response.send_message(
-            "I could not verify my permissions.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("I could not verify my permissions.", ephemeral=True)
         return
 
-    permissions=interaction.channel.permissions_for(me)
-
+    permissions = interaction.channel.permissions_for(me)
     if not permissions.manage_messages:
-        await interaction.response.send_message(
-            "I need the Manage Messages permission in this channel.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("I need the Manage Messages permission in this channel.", ephemeral=True)
         return
 
     if not permissions.read_message_history:
-        await interaction.response.send_message(
-            "I need the Read Message History permission in this channel.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("I need the Read Message History permission in this channel.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
 
     try:
-        deleted=await interaction.channel.purge(
-            limit=count,
-            bulk=True,
-            reason=f"Purge requested by {interaction.user}"
+        deleted = await interaction.channel.purge(limit=int(count), bulk=True, reason=f"Purge requested by {interaction.user}")
+        embed = discord.Embed(
+            title="🧹 Messages Cleared",
+            description=f"Successfully cleared **{len(deleted):,}** message{'s' if len(deleted) != 1 else ''}.",
+            color=discord.Color.green(),
         )
-
-        await interaction.followup.send(
-            view=PurgePanel(
-                count,
-                len(deleted)
-            ),
-            ephemeral=True
-        )
-
+        embed.add_field(name="Requested", value=f"`{int(count):,}`")
+        embed.add_field(name="Deleted", value=f"`{len(deleted):,}`")
+        embed.add_field(name="Channel", value=interaction.channel.mention)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send(
-            "I don't have permission to delete messages in this channel.",
-            ephemeral=True
-        )
-
+        await interaction.followup.send("I don't have permission to delete messages in this channel.", ephemeral=True)
     except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"Discord returned an error while purging messages: {error}",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"Discord returned an error while purging messages: {error}", ephemeral=True)
+
 
 @bot.event
-async def on_member_join(member):
-    data=await get_guild_insights(member.guild.id)
-    data["joins"].append(
-        datetime.now(timezone.utc).isoformat()
-    )
-    cleanup_events(data)
-    await save_guild_insights(
-        member.guild.id,
-        data
-    )
+async def on_member_join(member: discord.Member):
+    try:
+        await mongo_call(add_member_event_sync, member.guild.id, "join")
+    except PyMongoError as error:
+        print(f"MongoDB join tracking error for guild {member.guild.id}: {error}")
+
 
 @bot.event
-async def on_member_remove(member):
-    data=await get_guild_insights(member.guild.id)
-    data["leaves"].append(
-        datetime.now(timezone.utc).isoformat()
-    )
-    cleanup_events(data)
-    await save_guild_insights(
-        member.guild.id,
-        data
-    )
+async def on_member_remove(member: discord.Member):
+    try:
+        await mongo_call(add_member_event_sync, member.guild.id, "leave")
+    except PyMongoError as error:
+        print(f"MongoDB leave tracking error for guild {member.guild.id}: {error}")
+
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    data=created_channels.get(message.channel.id)
-
+    data = created_channels.get(message.channel.id)
     if data is None:
         return
 
-    member=message.author
-
-    if (
-        not isinstance(member,discord.Member)
-        or member.guild_permissions.administrator
-    ):
+    member = message.author
+    if not isinstance(member, discord.Member):
         return
 
-    me=message.guild.me
+    if member.guild_permissions.administrator:
+        return
 
-    if (
-        me is None
-        or not me.guild_permissions.kick_members
-        or member.top_role>=me.top_role
-    ):
+    me = message.guild.me
+    if me is None or not me.guild_permissions.kick_members:
+        return
+
+    if member.top_role >= me.top_role:
         return
 
     try:
         await message.delete()
-    except (
-        discord.Forbidden,
-        discord.NotFound,
-        discord.HTTPException
-    ):
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
         pass
 
     try:
-        await member.kick(
-            reason="Message sent in anti-scam channel"
-        )
+        await member.kick(reason="Message sent in anti-scam channel")
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        return
 
-        data["panel"].kicks+=1
-        data["panel"].update_kicks()
-
-        record=await get_anti_scam_record(
-            message.channel.id
-        )
-
-        if record:
-            record["kicks"]=data["panel"].kicks
-            await save_anti_scam_record(record)
-
-        if data["message"]:
+    try:
+        record = await mongo_call(increment_kicks_sync, message.channel.id)
+        kicks = int(record.get("kicks", data["view"].kicks)) if record else data["view"].kicks + 1
+        data["view"].update_kicks(kicks)
+        if data["message"] is not None:
             try:
-                await data["message"].edit(
-                    view=data["panel"]
-                )
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException
-            ):
+                await data["message"].edit(view=data["view"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
+    except PyMongoError as error:
+        print(f"MongoDB anti-scam update error for channel {message.channel.id}: {error}")
 
-    except (
-        discord.Forbidden,
-        discord.NotFound,
-        discord.HTTPException
-    ):
-        pass
 
 async def restore_anti_scam_channels():
-    stale=[]
-    records=await load_anti_scam_records()
+    records = await mongo_call(list_anti_scam_sync)
+    stale = []
 
     for record in records:
         try:
-            cid=int(record["channel_id"])
-            mid=int(record["message_id"])
-            gid=int(record["guild_id"])
-            kicks=int(record.get("kicks",0))
-        except (
-            KeyError,
-            TypeError,
-            ValueError
-        ):
+            channel_id = int(record["channel_id"])
+            message_id = int(record["message_id"])
+            guild_id = int(record["guild_id"])
+            kicks = int(record.get("kicks", 0))
+        except (KeyError, TypeError, ValueError):
             stale.append(record.get("_id"))
             continue
 
-        guild=bot.get_guild(gid)
-
+        guild = bot.get_guild(guild_id)
         if guild is None:
             continue
 
-        channel=guild.get_channel(cid)
-
-        if not isinstance(
-            channel,
-            discord.TextChannel
-        ):
-            stale.append(record.get("_id"))
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            stale.append(channel_id)
             continue
 
-        panel=AntiScamPanel(kicks)
+        view = AntiScamView(kicks)
 
         try:
-            msg=await channel.fetch_message(mid)
+            message = await channel.fetch_message(message_id)
         except discord.NotFound:
-            stale.append(record.get("_id"))
+            stale.append(channel_id)
             continue
         except discord.Forbidden:
-            created_channels[cid]={
-                "panel":panel,
-                "message":None,
-                "guild_id":gid
-            }
+            created_channels[channel_id] = {"view": view, "message": None, "guild_id": guild_id}
             continue
         except discord.HTTPException:
             continue
 
         try:
-            await msg.edit(view=panel)
-        except (
-            discord.Forbidden,
-            discord.NotFound,
-            discord.HTTPException
-        ):
+            await message.edit(view=view)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             pass
 
-        created_channels[cid]={
-            "panel":panel,
-            "message":msg,
-            "guild_id":gid
-        }
+        created_channels[channel_id] = {"view": view, "message": message, "guild_id": guild_id}
 
-    for key in stale:
-        if key:
-            await delete_anti_scam_record(key)
+    for channel_id in stale:
+        if channel_id is not None:
+            await mongo_call(delete_anti_scam_sync, channel_id)
+
 
 @bot.event
 async def on_ready():
+    global ready_once
+    if ready_once:
+        return
+
     try:
-        synced=await bot.tree.sync()
+        await mongo_call(mongo_client.admin.command, "ping")
+        synced = await bot.tree.sync()
         await restore_anti_scam_channels()
-
-        print(
-            f"Logged in as {bot.user} ({bot.user.id})"
-        )
-        print(
-            f"Synced {len(synced)} command(s)"
-        )
-        print(
-            f"Restored {len(created_channels)} anti-scam channel(s)"
-        )
-
+        ready_once = True
+        print(f"Logged in as {bot.user} ({bot.user.id})")
+        print(f"Connected to MongoDB database: {MONGODB_DATABASE}")
+        print(f"Synced {len(synced)} command(s)")
+        print(f"Restored {len(created_channels)} anti-scam channel(s)")
+    except PyMongoError as error:
+        print(f"MongoDB startup error: {error}")
     except Exception as error:
-        print(
-            f"Startup error: {error}"
-        )
+        print(f"Startup error: {error}")
+
 
 @anti_scam.error
-async def anti_scam_error(
-    interaction,
-    error
-):
-    message=(
-        "You need the Manage Channels permission to use this command."
-        if isinstance(
-            error,
-            app_commands.MissingPermissions
-        )
-        else f"Command error: {error}"
-    )
-
+async def anti_scam_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    message = "You need the Manage Channels permission to use this command." if isinstance(error, app_commands.MissingPermissions) else f"Command error: {error}"
     if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True
-        )
+        await interaction.followup.send(message, ephemeral=True)
     else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True
-        )
+        await interaction.response.send_message(message, ephemeral=True)
+
 
 @server_insights.error
-async def server_insights_error(
-    interaction,
-    error
-):
-    message=(
-        "You need the Manage Server permission to use this command."
-        if isinstance(
-            error,
-            app_commands.MissingPermissions
-        )
-        else f"Command error: {error}"
-    )
-
+async def server_insights_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    message = "You need the Manage Server permission to use this command." if isinstance(error, app_commands.MissingPermissions) else f"Command error: {error}"
     if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True
-        )
+        await interaction.followup.send(message, ephemeral=True)
     else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True
-        )
+        await interaction.response.send_message(message, ephemeral=True)
+
 
 @purge.error
-async def purge_error(
-    interaction,
-    error
-):
-    message=(
-        "You need the Manage Messages permission to use this command."
-        if isinstance(
-            error,
-            app_commands.MissingPermissions
-        )
-        else f"Command error: {error}"
-    )
-
+async def purge_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    message = "You need the Manage Messages permission to use this command." if isinstance(error, app_commands.MissingPermissions) else f"Command error: {error}"
     if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True
-        )
+        await interaction.followup.send(message, ephemeral=True)
     else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True
-        )
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+bot.tree.add_command(create_group)
+bot.tree.add_command(server_group)
+
 
 async def start_bot():
-    await asyncio.to_thread(
-        mongo_client.admin.command,
-        "ping"
-    )
-
-    print("MongoDB connection established.")
-
     while True:
         try:
             await bot.start(TOKEN)
             break
-
-        except discord.HTTPException as error:
-            retry_after=getattr(
-                error,
-                "retry_after",
-                30
-            )
-
-            print(
-                f"Discord connection error: {error}"
-            )
-            print(
-                f"Retrying in {retry_after:.1f} seconds..."
-            )
-
-            await asyncio.sleep(
-                retry_after
-            )
-
         except discord.LoginFailure:
-            print(
-                "Invalid Discord bot token."
-            )
+            print("Invalid Discord bot token.")
             break
-
+        except discord.HTTPException as error:
+            retry_after = getattr(error, "retry_after", 30)
+            print(f"Discord connection error: {error}")
+            print(f"Retrying in {retry_after:.1f} seconds...")
+            await asyncio.sleep(retry_after)
         except Exception as error:
-            print(
-                f"Bot error: {error}"
-            )
+            print(f"Bot error: {error}")
             await asyncio.sleep(30)
+        finally:
+            ready_once = False
 
-bot.tree.add_command(create_group)
-bot.tree.add_command(server_group)
 
 asyncio.run(start_bot())
