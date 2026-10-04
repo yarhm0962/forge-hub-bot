@@ -1,1 +1,2 @@
-discord.py==2.7.1
+discord.py>=2.6.0,<3.0
+pymongo[srv]>=4.10,<5.0
