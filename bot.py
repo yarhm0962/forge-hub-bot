@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -996,6 +997,186 @@ async def server_insights(interaction: discord.Interaction):
     except Exception as error:
         await interaction.followup.send(
             f"Unexpected error: {error}",
+            ephemeral=True,
+        )
+
+
+async def find_guild_message(guild, message_id):
+    message_id = int(message_id)
+    channels = []
+    try:
+        channels = await guild.fetch_channels()
+    except (discord.Forbidden, discord.HTTPException):
+        channels = list(guild.channels)
+
+    checked = set()
+    for channel in channels:
+        channel_id = getattr(channel, "id", None)
+        if channel_id in checked:
+            continue
+        checked.add(channel_id)
+
+        if isinstance(channel, discord.TextChannel):
+            try:
+                return await channel.fetch_message(message_id)
+            except discord.NotFound:
+                continue
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        if isinstance(channel, discord.ForumChannel):
+            for thread in channel.threads:
+                try:
+                    return await thread.fetch_message(message_id)
+                except discord.NotFound:
+                    continue
+                except (discord.Forbidden, discord.HTTPException):
+                    continue
+
+    for channel in guild.text_channels:
+        if channel.id in checked:
+            continue
+        try:
+            return await channel.fetch_message(message_id)
+        except discord.NotFound:
+            continue
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    return None
+
+@bot.tree.command(
+    name="update",
+    description="Post an update log",
+)
+@app_commands.describe(
+    title="Update log section title",
+    version="Numeric version such as 2.6.0",
+    change_logs="Message ID containing the change logs",
+    channel="Channel where the update will be posted",
+    small_update="Optional small update message",
+)
+async def update_log(
+    interaction: discord.Interaction,
+    title: str,
+    version: str,
+    change_logs: str,
+    channel: discord.TextChannel,
+    small_update: str | None = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "You need the Manage Server permission to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.guild.me or not interaction.guild.me.guild_permissions.mention_everyone:
+        await interaction.response.send_message(
+            "I need the Mention @everyone permission to post this update.",
+            ephemeral=True,
+        )
+        return
+
+    clean_title = title.strip()
+    clean_version = version.strip()
+    clean_message_id = change_logs.strip()
+    clean_small_update = small_update.strip() if small_update else None
+
+    if not clean_title:
+        await interaction.response.send_message(
+            "The title cannot be empty.",
+            ephemeral=True,
+        )
+        return
+
+    if not re.fullmatch(r"\d+(?:\.\d+){1,2}", clean_version):
+        await interaction.response.send_message(
+            "The version must contain numbers in a format such as 2.6.0.",
+            ephemeral=True,
+        )
+        return
+
+    if not re.fullmatch(r"\d{15,22}", clean_message_id):
+        await interaction.response.send_message(
+            "The change logs value must be a Discord message ID.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        source_message = await find_guild_message(
+            interaction.guild,
+            int(clean_message_id),
+        )
+
+        if source_message is None:
+            await interaction.followup.send(
+                "I could not find that message in a channel I can access.",
+                ephemeral=True,
+            )
+            return
+
+        change_content = source_message.content.strip()
+        if not change_content:
+            await interaction.followup.send(
+                "The selected message does not contain any text to use as the change logs.",
+                ephemeral=True,
+            )
+            return
+
+        change_content = change_content.replace("```", "`\u200b``")
+        update_container_items = [
+            make_text("@everyone"),
+            make_text(f"## UPDATE RIDE A PET\n-# version {clean_version}"),
+            make_separator(),
+            make_text(
+                f"## {clean_title}\n```diff\n{change_content}```"
+            ),
+        ]
+
+        if clean_small_update:
+            update_container_items.append(make_text(clean_small_update))
+
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(
+            make_container(
+                *update_container_items,
+            )
+        )
+
+        sent_message = await channel.send(
+            view=view,
+            allowed_mentions=discord.AllowedMentions(everyone=True),
+        )
+
+        await interaction.followup.send(
+            f"Update log posted in {channel.mention}. Message ID: `{sent_message.id}`",
+            ephemeral=True,
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to send messages in that channel or use the required mention permission.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"Discord returned an error while posting the update: {error}",
+            ephemeral=True,
+        )
+    except ValueError:
+        await interaction.followup.send(
+            "The change logs message ID is invalid.",
             ephemeral=True,
         )
 
