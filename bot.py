@@ -29,6 +29,7 @@ mongo_db = mongo_client[MONGODB_DATABASE]
 insights_collection = mongo_db["server_insights"]
 anti_scam_collection = mongo_db["anti_scam_channels"]
 reaction_roles_collection = mongo_db["reaction_roles"]
+member_snapshots_collection = mongo_db["member_snapshots"]
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -88,7 +89,17 @@ def get_guild_insights_sync(guild_id):
     guild_id = int(guild_id)
     document = insights_collection.find_one({"_id": guild_id})
     if not document:
-        document = {"_id": guild_id, "joins": [], "leaves": []}
+        document = {
+            "_id": guild_id,
+            "joins": [],
+            "leaves": [],
+            "total_joins": 0,
+            "total_leaves": 0,
+        }
+    document.setdefault("joins", [])
+    document.setdefault("leaves", [])
+    document.setdefault("total_joins", len(document["joins"]))
+    document.setdefault("total_leaves", len(document["leaves"]))
     cleanup_events_sync(document)
     insights_collection.replace_one({"_id": guild_id}, document, upsert=True)
     return document
@@ -97,17 +108,86 @@ def get_guild_insights_sync(guild_id):
 def add_member_event_sync(guild_id, event_type):
     guild_id = int(guild_id)
     field = "joins" if event_type == "join" else "leaves"
+    total_field = "total_joins" if event_type == "join" else "total_leaves"
     document = insights_collection.find_one_and_update(
         {"_id": guild_id},
         {
-            "$setOnInsert": {"joins": [], "leaves": []},
+            "$setOnInsert": {
+                "joins": [],
+                "leaves": [],
+                "total_joins": 0,
+                "total_leaves": 0,
+            },
             "$push": {field: iso_now()},
+            "$inc": {total_field: 1},
         },
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
     cleanup_events_sync(document)
     insights_collection.replace_one({"_id": guild_id}, document, upsert=True)
+    return document
+
+
+def get_member_snapshot_sync(guild_id):
+    document = member_snapshots_collection.find_one({"_id": int(guild_id)})
+    if not document:
+        return None
+    return {int(member_id) for member_id in document.get("member_ids", [])}
+
+
+def save_member_snapshot_sync(guild_id, member_ids):
+    member_snapshots_collection.replace_one(
+        {"_id": int(guild_id)},
+        {
+            "_id": int(guild_id),
+            "member_ids": [int(member_id) for member_id in member_ids],
+            "updated_at": iso_now(),
+        },
+        upsert=True,
+    )
+
+
+def add_member_to_snapshot_sync(guild_id, member_id):
+    member_snapshots_collection.update_one(
+        {"_id": int(guild_id)},
+        {
+            "$setOnInsert": {"member_ids": []},
+            "$addToSet": {"member_ids": int(member_id)},
+            "$set": {"updated_at": iso_now()},
+        },
+        upsert=True,
+    )
+
+
+def remove_member_from_snapshot_sync(guild_id, member_id):
+    member_snapshots_collection.update_one(
+        {"_id": int(guild_id)},
+        {
+            "$pull": {"member_ids": int(member_id)},
+            "$set": {"updated_at": iso_now()},
+        },
+    )
+
+
+def reconcile_member_snapshot_sync(guild_id, current_member_ids):
+    guild_id = int(guild_id)
+    current = {int(member_id) for member_id in current_member_ids}
+    previous = get_member_snapshot_sync(guild_id)
+    if previous is None:
+        save_member_snapshot_sync(guild_id, current)
+        return 0, 0, True
+
+    joined = current - previous
+    left = previous - current
+
+    for _ in joined:
+        add_member_event_sync(guild_id, "join")
+    for _ in left:
+        add_member_event_sync(guild_id, "leave")
+
+    save_member_snapshot_sync(guild_id, current)
+    return len(joined), len(left), False
 
 
 def list_anti_scam_sync():
@@ -129,10 +209,13 @@ def delete_anti_scam_sync(channel_id):
     anti_scam_collection.delete_one({"_id": int(channel_id)})
 
 
-def increment_kicks_sync(channel_id):
+def increment_anti_scam_sync(channel_id, kicked):
+    increments = {"violations": 1}
+    if kicked:
+        increments["kicks"] = 1
     return anti_scam_collection.find_one_and_update(
         {"_id": int(channel_id)},
-        {"$inc": {"kicks": 1}},
+        {"$inc": increments},
         return_document=ReturnDocument.AFTER,
     )
 
@@ -183,9 +266,10 @@ def make_separator():
 
 
 class AntiScamView(discord.ui.LayoutView):
-    def __init__(self, kicks=0):
+    def __init__(self, kicks=0, violations=0):
         super().__init__(timeout=None)
         self.kicks = int(kicks)
+        self.violations = int(violations)
 
         self.kick_button = discord.ui.Button(
             label=f"{self.kicks:,} kicks",
@@ -194,11 +278,18 @@ class AntiScamView(discord.ui.LayoutView):
             disabled=True,
         )
 
-        protection_section = discord.ui.Section(
-            make_text("### Protection active"),
+        self.violation_button = discord.ui.Button(
+            label=f"{self.violations:,} blocked",
+            style=discord.ButtonStyle.secondary,
+            emoji="🚫",
+            disabled=True,
+        )
+
+        status = discord.ui.Section(
+            make_text("### 🟢 Protection is active"),
             make_text(
-                "This channel is monitored automatically. Messages sent here "
-                "are removed and the sender may be kicked."
+                "This channel is monitored continuously. Messages are removed and "
+                "members who can be moderated are kicked automatically."
             ),
             accessory=self.kick_button,
         )
@@ -206,80 +297,98 @@ class AntiScamView(discord.ui.LayoutView):
         self.add_item(
             make_container(
                 make_text("## 🛡️ Anti-Scam Protection"),
-                make_text("Automated protection for this channel."),
+                make_text("Automatic enforcement for this protected channel."),
                 make_separator(),
-                protection_section,
-                make_separator(),
-                make_text(
-                    "### Channel policy\n"
-                    "This channel is reserved for fake social media spam messages. "
-                    "Please do not type or chat here."
-                ),
+                status,
                 make_separator(),
                 make_text(
-                    f"**Enforcement history**\n"
-                    f"`{self.kicks:,}` member{'s' if self.kicks != 1 else ''} kicked "
-                    "by this protection rule."
+                    "### Channel rules\n"
+                    "• Do not send messages in this channel.\n"
+                    "• Messages are removed automatically.\n"
+                    "• Moderation is applied when the bot has permission.\n"
+                    "• Administrators are not automatically kicked."
                 ),
+                make_separator(),
+                discord.ui.ActionRow(self.violation_button),
                 accent_color=0xED4245,
             )
         )
 
-    def update_kicks(self, kicks=None):
+    def update_stats(self, kicks=None, violations=None):
         if kicks is not None:
             self.kicks = int(kicks)
+        if violations is not None:
+            self.violations = int(violations)
         self.kick_button.label = f"{self.kicks:,} kicks"
+        self.violation_button.label = f"{self.violations:,} blocked"
+
+    def update_kicks(self, kicks=None):
+        self.update_stats(kicks=kicks)
 
 
 class InsightsView(discord.ui.LayoutView):
-    def __init__(self, current, joins, leaves):
+    def __init__(self, guild_name, current, joins_30, leaves_30, total_joins, total_leaves):
         super().__init__(timeout=None)
 
-        net = joins - leaves
-        status = "Growing" if net > 0 else "Declining" if net < 0 else "Stable"
-        status_icon = "📈" if net > 0 else "📉" if net < 0 else "➖"
-        growth = f"+{net:,}" if net > 0 else f"{net:,}"
-        status_style = (
-            discord.ButtonStyle.success
-            if net > 0
-            else discord.ButtonStyle.danger
-            if net < 0
-            else discord.ButtonStyle.secondary
-        )
+        net_30 = joins_30 - leaves_30
+        lifetime_net = total_joins - total_leaves
+        if net_30 > 0:
+            status = "Growing"
+            status_icon = "📈"
+            status_style = discord.ButtonStyle.success
+        elif net_30 < 0:
+            status = "Declining"
+            status_icon = "📉"
+            status_style = discord.ButtonStyle.danger
+        else:
+            status = "Stable"
+            status_icon = "➖"
+            status_style = discord.ButtonStyle.secondary
 
-        self.net_button = discord.ui.Button(
-            label=growth,
+        net_label = f"+{net_30:,}" if net_30 > 0 else f"{net_30:,}"
+        lifetime_label = f"+{lifetime_net:,}" if lifetime_net > 0 else f"{lifetime_net:,}"
+
+        self.trend_button = discord.ui.Button(
+            label=net_label,
             style=status_style,
             emoji=status_icon,
             disabled=True,
         )
 
-        trend_section = discord.ui.Section(
-            make_text(f"### {status_icon} {status}"),
-            make_text(
-                "Member activity over the rolling 30-day window."
-            ),
-            accessory=self.net_button,
-        )
-
         self.add_item(
             make_container(
                 make_text("## 📊 Server Insights"),
-                make_text("A clean snapshot of recent member activity."),
+                make_text(f"**{guild_name}**  ·  Member activity dashboard"),
                 make_separator(),
-                trend_section,
-                make_separator(),
-                make_text(
-                    "### Member overview\n"
-                    f"👥 **Current members**  `{current:,}`\n"
-                    f"🟢 **New members**  `+{joins:,}`\n"
-                    f"🔴 **Departures**  `-{leaves:,}`"
+                discord.ui.Section(
+                    make_text(f"### {status_icon} {status}"),
+                    make_text(
+                        f"Last 30 days · net movement `{net_label}` members"
+                    ),
+                    accessory=self.trend_button,
                 ),
                 make_separator(),
                 make_text(
-                    "### 30-day movement\n"
-                    f"**Net change:** `{growth}` members\n"
-                    f"**Activity:** `{joins + leaves:,}` total join/leave events"
+                    "### 👥 Current community\n"
+                    f"**Members now**  `{current:,}`"
+                ),
+                make_text(
+                    "### 🗓️ Last 30 days\n"
+                    f"🟢 **Joined**  `{joins_30:,}`\n"
+                    f"🔴 **Left**  `{leaves_30:,}`\n"
+                    f"⚖️ **Net**  `{net_label}`"
+                ),
+                make_separator(),
+                make_text(
+                    "### 📚 Lifetime tracking\n"
+                    f"🟢 **Total joins recorded**  `{total_joins:,}`\n"
+                    f"🔴 **Total departures recorded**  `{total_leaves:,}`\n"
+                    f"⚖️ **Lifetime net**  `{lifetime_label}`"
+                ),
+                make_separator(),
+                make_text(
+                    "Tracking is stored in MongoDB and reconciled against the server member list when the bot starts, "
+                    "so changes that happened while the bot was offline can be detected."
                 ),
                 accent_color=0x5865F2,
             )
@@ -800,6 +909,7 @@ async def anti_scam(interaction: discord.Interaction, name: str):
             "guild_id": interaction.guild.id,
             "message_id": message.id,
             "kicks": 0,
+            "violations": 0,
         }
 
         await mongo_call(save_anti_scam_sync, record)
@@ -868,9 +978,12 @@ async def server_insights(interaction: discord.Interaction):
         current = interaction.guild.member_count or 0
 
         view = InsightsView(
+            guild_name=interaction.guild.name,
             current=current,
-            joins=joins,
-            leaves=leaves,
+            joins_30=joins,
+            leaves_30=leaves,
+            total_joins=int(document.get("total_joins", joins)),
+            total_leaves=int(document.get("total_leaves", leaves)),
         )
 
         await interaction.followup.send(view=view)
@@ -1007,31 +1120,19 @@ async def purge(
 @bot.event
 async def on_member_join(member: discord.Member):
     try:
-        await mongo_call(
-            add_member_event_sync,
-            member.guild.id,
-            "join",
-        )
+        await mongo_call(add_member_event_sync, member.guild.id, "join")
+        await mongo_call(add_member_to_snapshot_sync, member.guild.id, member.id)
     except PyMongoError as error:
-        print(
-            f"MongoDB join tracking error for guild "
-            f"{member.guild.id}: {error}"
-        )
+        print(f"MongoDB join tracking error for guild {member.guild.id}: {error}")
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     try:
-        await mongo_call(
-            add_member_event_sync,
-            member.guild.id,
-            "leave",
-        )
+        await mongo_call(add_member_event_sync, member.guild.id, "leave")
+        await mongo_call(remove_member_from_snapshot_sync, member.guild.id, member.id)
     except PyMongoError as error:
-        print(
-            f"MongoDB leave tracking error for guild "
-            f"{member.guild.id}: {error}"
-        )
+        print(f"MongoDB leave tracking error for guild {member.guild.id}: {error}")
 
 
 @bot.event
@@ -1040,70 +1141,50 @@ async def on_message(message: discord.Message):
         return
 
     data = created_channels.get(message.channel.id)
-
     if data is None:
         return
 
     member = message.author
-
     if not isinstance(member, discord.Member):
         return
 
     if member.guild_permissions.administrator:
         return
 
-    me = message.guild.me
-
-    if me is None or not me.guild_permissions.kick_members:
-        return
-
-    if member.top_role >= me.top_role:
-        return
-
     try:
         await message.delete()
-    except (
-        discord.Forbidden,
-        discord.NotFound,
-        discord.HTTPException,
-    ):
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
         pass
 
-    try:
-        await member.kick(
-            reason="Message sent in anti-scam channel",
-        )
-    except (
-        discord.Forbidden,
-        discord.NotFound,
-        discord.HTTPException,
-    ):
-        return
+    me = message.guild.me
+    kicked = False
+
+    if me is not None and me.guild_permissions.kick_members:
+        if member.top_role < me.top_role:
+            try:
+                await member.kick(reason="Message sent in anti-scam channel")
+                kicked = True
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
 
     try:
         record = await mongo_call(
-            increment_kicks_sync,
+            increment_anti_scam_sync,
             message.channel.id,
+            kicked,
         )
 
-        kicks = (
-            int(record.get("kicks", data["view"].kicks))
-            if record
-            else data["view"].kicks + 1
-        )
+        if record:
+            data["view"].update_stats(
+                kicks=int(record.get("kicks", 0)),
+                violations=int(record.get("violations", 0)),
+            )
 
-        data["view"].update_kicks(kicks)
-
-        if data["message"] is not None:
-            try:
-                await data["message"].edit(view=data["view"])
-            except (
-                discord.NotFound,
-                discord.Forbidden,
-                discord.HTTPException,
-            ):
-                pass
-
+            if data.get("message") is not None:
+                try:
+                    await data["message"].edit(view=data["view"])
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
     except PyMongoError as error:
         print(
             f"MongoDB anti-scam update error for channel "
@@ -1121,6 +1202,7 @@ async def restore_anti_scam_channels():
             message_id = int(record["message_id"])
             guild_id = int(record["guild_id"])
             kicks = int(record.get("kicks", 0))
+            violations = int(record.get("violations", kicks))
         except (KeyError, TypeError, ValueError):
             stale.append(record.get("_id"))
             continue
@@ -1136,7 +1218,7 @@ async def restore_anti_scam_channels():
             stale.append(channel_id)
             continue
 
-        view = AntiScamView(kicks)
+        view = AntiScamView(kicks, violations)
 
         try:
             message = await channel.fetch_message(message_id)
@@ -1188,6 +1270,21 @@ async def on_ready():
             mongo_client.admin.command,
             "ping",
         )
+
+        for guild in bot.guilds:
+            try:
+                member_ids = [member.id for member in guild.members]
+                joined, left, initialized = await mongo_call(
+                    reconcile_member_snapshot_sync,
+                    guild.id,
+                    member_ids,
+                )
+                if not initialized and (joined or left):
+                    print(
+                        f"Reconciled {guild.name}: {joined} missed joins, {left} missed departures"
+                    )
+            except PyMongoError as error:
+                print(f"MongoDB member reconciliation error for guild {guild.id}: {error}")
 
         synced = await bot.tree.sync()
 
