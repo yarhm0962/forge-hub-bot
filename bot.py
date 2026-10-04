@@ -982,6 +982,35 @@ async def server_insights(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
+        current_member_ids = []
+        async for member in interaction.guild.fetch_members(limit=None):
+            current_member_ids.append(member.id)
+
+        joined, left, initialized = await mongo_call(
+            reconcile_member_snapshot_sync,
+            interaction.guild.id,
+            current_member_ids,
+        )
+
+        if not initialized:
+            for member_id in joined:
+                member = interaction.guild.get_member(member_id)
+                await mongo_call(
+                    add_member_event_sync,
+                    interaction.guild.id,
+                    "join",
+                    member_id,
+                    str(member) if member else "Unknown member",
+                )
+            for member_id in left:
+                await mongo_call(
+                    add_member_event_sync,
+                    interaction.guild.id,
+                    "leave",
+                    member_id,
+                    "Unknown member",
+                )
+
         document = await mongo_call(
             get_guild_insights_sync,
             interaction.guild.id,
