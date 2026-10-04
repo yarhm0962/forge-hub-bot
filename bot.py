@@ -819,6 +819,11 @@ add_group = app_commands.Group(
     description="Add server tools",
 )
 
+update_group = app_commands.Group(
+    name="update",
+    description="Post update logs",
+)
+
 reaction_group = app_commands.Group(
     name="reaction",
     description="Reaction role tools",
@@ -1045,24 +1050,24 @@ async def find_guild_message(guild, message_id):
 
     return None
 
-@bot.tree.command(
-    name="update",
+@update_group.command(
+    name="logs",
     description="Post an update log",
 )
 @app_commands.describe(
-    title="Update log section title",
-    version="Numeric version such as 2.6.0",
+    title="Update title",
+    version="Update version, such as 2.6",
     change_logs="Message ID containing the change logs",
+    message="Optional small update message",
     channel="Channel where the update will be posted",
-    small_update="Optional small update message",
 )
-async def update_log(
+async def update_logs(
     interaction: discord.Interaction,
     title: str,
     version: str,
     change_logs: str,
     channel: discord.TextChannel,
-    small_update: str | None = None,
+    message: str | None = None,
 ):
     if interaction.guild is None:
         await interaction.response.send_message(
@@ -1078,9 +1083,25 @@ async def update_log(
         )
         return
 
-    if not interaction.guild.me or not interaction.guild.me.guild_permissions.mention_everyone:
+    me = interaction.guild.me
+    if me is None:
         await interaction.response.send_message(
-            "I need the Mention @everyone permission to post this update.",
+            "I could not verify my server permissions.",
+            ephemeral=True,
+        )
+        return
+
+    permissions = channel.permissions_for(me)
+    if not permissions.view_channel or not permissions.send_messages:
+        await interaction.response.send_message(
+            "I need View Channel and Send Messages permissions in the selected channel.",
+            ephemeral=True,
+        )
+        return
+
+    if not permissions.mention_everyone:
+        await interaction.response.send_message(
+            "I need the Mention @everyone permission in the selected channel.",
             ephemeral=True,
         )
         return
@@ -1088,7 +1109,7 @@ async def update_log(
     clean_title = title.strip()
     clean_version = version.strip()
     clean_message_id = change_logs.strip()
-    clean_small_update = small_update.strip() if small_update else None
+    clean_message = message.strip() if message else None
 
     if not clean_title:
         await interaction.response.send_message(
@@ -1097,12 +1118,18 @@ async def update_log(
         )
         return
 
-    if not re.fullmatch(r"\d+(?:\.\d+){1,2}", clean_version):
+    version_match = re.fullmatch(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", clean_version)
+    if not version_match:
         await interaction.response.send_message(
-            "The version must contain numbers in a format such as 2.6.0.",
+            "The version must contain numbers such as 2, 2.6, or 2.6.0.",
             ephemeral=True,
         )
         return
+
+    major = version_match.group(1)
+    minor = version_match.group(2) or "0"
+    patch = version_match.group(3) or "0"
+    normalized_version = f"{major}.{minor}.{patch}"
 
     if not re.fullmatch(r"\d{15,22}", clean_message_id):
         await interaction.response.send_message(
@@ -1135,24 +1162,24 @@ async def update_log(
             return
 
         change_content = change_content.replace("```", "`\u200b``")
-        update_container_items = [
-            make_text("@everyone"),
-            make_text(f"## UPDATE RIDE A PET\n-# version {clean_version}"),
+
+        container = make_container(
+            make_text(f"## {clean_title}"),
+            make_text(f"-# {normalized_version}"),
             make_separator(),
             make_text(
-                f"## {clean_title}\n```diff\n{change_content}```"
+                f"### CHANGE LOGS\n```diff\n{change_content}```"
             ),
-        ]
-
-        if clean_small_update:
-            update_container_items.append(make_text(clean_small_update))
+            *(
+                [make_text(clean_message)]
+                if clean_message
+                else []
+            ),
+        )
 
         view = discord.ui.LayoutView(timeout=None)
-        view.add_item(
-            make_container(
-                *update_container_items,
-            )
-        )
+        view.add_item(make_text("@everyone"))
+        view.add_item(container)
 
         sent_message = await channel.send(
             view=view,
@@ -1166,7 +1193,7 @@ async def update_log(
 
     except discord.Forbidden:
         await interaction.followup.send(
-            "I do not have permission to send messages in that channel or use the required mention permission.",
+            "I do not have permission to access the selected message or post the update in that channel.",
             ephemeral=True,
         )
     except discord.HTTPException as error:
@@ -1177,6 +1204,11 @@ async def update_log(
     except ValueError:
         await interaction.followup.send(
             "The change logs message ID is invalid.",
+            ephemeral=True,
+        )
+    except Exception as error:
+        await interaction.followup.send(
+            f"Unexpected error while posting the update: {error}",
             ephemeral=True,
         )
 
@@ -1609,6 +1641,7 @@ async def purge_error(
 bot.tree.add_command(create_group)
 bot.tree.add_command(server_group)
 bot.tree.add_command(add_group)
+bot.tree.add_command(update_group)
 
 
 async def start_bot():
