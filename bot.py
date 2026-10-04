@@ -186,49 +186,102 @@ class AntiScamView(discord.ui.LayoutView):
     def __init__(self, kicks=0):
         super().__init__(timeout=None)
         self.kicks = int(kicks)
-        self.stats = make_text(
-            f"### 📊 Enforcement Stats\n**Messages removed / users kicked:** `{self.kicks:,}`"
+
+        self.kick_button = discord.ui.Button(
+            label=f"{self.kicks:,} kicks",
+            style=discord.ButtonStyle.danger,
+            emoji="🛡️",
+            disabled=True,
         )
+
+        protection_section = discord.ui.Section(
+            make_text("### Protection active"),
+            make_text(
+                "This channel is monitored automatically. Messages sent here "
+                "are removed and the sender may be kicked."
+            ),
+            accessory=self.kick_button,
+        )
+
         self.add_item(
             make_container(
-                make_text(ANTI_SCAM_TITLE),
+                make_text("## 🛡️ Anti-Scam Protection"),
+                make_text("Automated protection for this channel."),
+                make_separator(),
+                protection_section,
                 make_separator(),
                 make_text(
-                    f"{ANTI_SCAM_BODY}\n\n"
-                    "### ⚠️ Automatic Enforcement\n"
-                    "Messages sent in this channel are monitored automatically."
+                    "### Channel policy\n"
+                    "This channel is reserved for fake social media spam messages. "
+                    "Please do not type or chat here."
                 ),
                 make_separator(),
-                self.stats,
+                make_text(
+                    f"**Enforcement history**\n"
+                    f"`{self.kicks:,}` member{'s' if self.kicks != 1 else ''} kicked "
+                    "by this protection rule."
+                ),
+                accent_color=0xED4245,
             )
         )
 
     def update_kicks(self, kicks=None):
         if kicks is not None:
             self.kicks = int(kicks)
-        self.stats.content = (
-            f"### 📊 Enforcement Stats\n**Messages removed / users kicked:** `{self.kicks:,}`"
-        )
+        self.kick_button.label = f"{self.kicks:,} kicks"
+
 
 class InsightsView(discord.ui.LayoutView):
     def __init__(self, current, joins, leaves):
         super().__init__(timeout=None)
 
         net = joins - leaves
-        status = "📈 Growing" if net > 0 else "📉 Declining" if net < 0 else "➖ Stable"
+        status = "Growing" if net > 0 else "Declining" if net < 0 else "Stable"
+        status_icon = "📈" if net > 0 else "📉" if net < 0 else "➖"
         growth = f"+{net:,}" if net > 0 else f"{net:,}"
+        status_style = (
+            discord.ButtonStyle.success
+            if net > 0
+            else discord.ButtonStyle.danger
+            if net < 0
+            else discord.ButtonStyle.secondary
+        )
+
+        self.net_button = discord.ui.Button(
+            label=growth,
+            style=status_style,
+            emoji=status_icon,
+            disabled=True,
+        )
+
+        trend_section = discord.ui.Section(
+            make_text(f"### {status_icon} {status}"),
+            make_text(
+                "Member activity over the rolling 30-day window."
+            ),
+            accessory=self.net_button,
+        )
 
         self.add_item(
             make_container(
                 make_text("## 📊 Server Insights"),
+                make_text("A clean snapshot of recent member activity."),
+                make_separator(),
+                trend_section,
                 make_separator(),
                 make_text(
-                    f"**Current Members:** `{current:,}`\n"
-                    f"**New Members:** `{joins:,}`\n"
-                    f"**Departures:** `{leaves:,}`\n"
-                    f"**Net Change:** `{growth}`\n"
-                    f"**Status:** {status}"
+                    "### Member overview\n"
+                    f"👥 **Current members**  `{current:,}`\n"
+                    f"🟢 **New members**  `+{joins:,}`\n"
+                    f"🔴 **Departures**  `-{leaves:,}`"
                 ),
+                make_separator(),
+                make_text(
+                    "### 30-day movement\n"
+                    f"**Net change:** `{growth}` members\n"
+                    f"**Activity:** `{joins + leaves:,}` total join/leave events"
+                ),
+                accent_color=0x5865F2,
             )
         )
 
