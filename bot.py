@@ -632,35 +632,41 @@ class ReactionRoleSetupView(discord.ui.LayoutView):
             for emoji, role in zip(self.emojis, self.roles)
         ]
 
+        await interaction.response.defer(ephemeral=True)
+
+        record = {
+            "message_id": target.id,
+            "channel_id": target.channel.id,
+            "guild_id": guild.id,
+            "pairs": pairs,
+        }
+
         try:
             for emoji in self.emojis:
                 await target.add_reaction(emoji)
 
-            record = {
-                "message_id": target.id,
-                "channel_id": target.channel.id,
-                "guild_id": guild.id,
-                "pairs": pairs,
-            }
-
             await mongo_call(save_reaction_role_sync, record)
-
             reaction_role_cache[target.id] = record
 
-            await interaction.response.send_message(
-                f"Reaction roles saved on message `{target.id}`.",
+            await interaction.followup.send(
+                f"Reaction roles saved on message `{target.id}` and stored in MongoDB.",
                 ephemeral=True,
             )
             self.stop()
 
         except discord.HTTPException as error:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Discord returned an error while adding the reactions: {error}",
                 ephemeral=True,
             )
         except PyMongoError as error:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"MongoDB error while saving reaction roles: {error}",
+                ephemeral=True,
+            )
+        except Exception as error:
+            await interaction.followup.send(
+                f"Unexpected error while saving reaction roles: {error}",
                 ephemeral=True,
             )
 
