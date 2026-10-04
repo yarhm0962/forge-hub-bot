@@ -437,6 +437,7 @@ def pool_strings(tokens,rng,used):
         pool_values.append(entries[old_index])
 
     pool_name=generate_obfuscated_name(rng,used,14)
+    fn_dec=generate_obfuscated_name(rng,used,14)
 
     out=[]
     for t in tokens:
@@ -450,7 +451,10 @@ def pool_strings(tokens,rng,used):
             out.append(t)
 
     CHUNK=200
-    lines=[f"local {pool_name}={{}}"]
+    lines=[
+        f"local {fn_dec}=function(k,s) return (s):gsub(\".\",function(c) return string.char((c:byte()-k+256)%256) end) end",
+        f"local {pool_name}={{}}"
+    ]
     for idx,raw in enumerate(pool_values):
         try:
             data=decode_lua_string_token(raw)
@@ -458,16 +462,18 @@ def pool_strings(tokens,rng,used):
             data=None
         pos=idx+1
         if data is not None and len(data)>0:
-            if len(data)<=CHUNK:
-                char_args=",".join(str(b) for b in data)
-                lines.append(f"{pool_name}[{pos}]=string.char({char_args})")
+            key=rng.randint(1,127)
+            encoded=bytes((b+key)%256 for b in data)
+            if len(encoded)<=CHUNK:
+                char_args=",".join(str(b) for b in encoded)
+                lines.append(f"{pool_name}[{pos}]={fn_dec}({key},string.char({char_args}))")
             else:
                 parts=[]
-                for ci in range(0,len(data),CHUNK):
-                    chunk=data[ci:ci+CHUNK]
+                for ci in range(0,len(encoded),CHUNK):
+                    chunk=encoded[ci:ci+CHUNK]
                     char_args=",".join(str(b) for b in chunk)
                     parts.append(f"string.char({char_args})")
-                lines.append(f"{pool_name}[{pos}]={'..'.join(parts)}")
+                lines.append(f"{pool_name}[{pos}]={fn_dec}({key},{'..'.join(parts)})")
         elif data is not None:
             lines.append(f'{pool_name}[{pos}]=""')
         else:
@@ -485,8 +491,12 @@ def make_junk_statement(rng,used):
         val=str(rng.randint(1,99999))
         return [LuaToken("keyword","local",True),LuaToken("ident",name),LuaToken("op","="),LuaToken("number",val)]
     elif kind==1:
-        junk_str='"'+''.join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(4,10)))+'"'
-        return [LuaToken("keyword","local",True),LuaToken("ident",name),LuaToken("op","="),LuaToken("string",junk_str)]
+        a=rng.randint(1,999)
+        b=rng.randint(2,99)
+        c=rng.randint(0,999)
+        return [LuaToken("keyword","local",True),LuaToken("ident",name),LuaToken("op","="),
+                LuaToken("op","("),LuaToken("number",str(a)),LuaToken("op","*"),LuaToken("number",str(b)),LuaToken("op",")"),
+                LuaToken("op","+"),LuaToken("number",str(c))]
     else:
         inner=generate_obfuscated_name(rng,used,10)
         return [LuaToken("keyword","if",True),LuaToken("keyword","false"),LuaToken("keyword","then"),
@@ -498,11 +508,16 @@ BLOCK_CLOSERS={"end","else","elseif","until"}
 def insert_junk(tokens,rng,used,rate=0.12,cap=40):
     out=[]
     inserted=0
+    depth=0
     for t in tokens:
-        if t.nl and inserted<cap and t.value not in BLOCK_CLOSERS and rng.random()<rate:
+        if depth==0 and t.nl and inserted<cap and t.value not in BLOCK_CLOSERS and rng.random()<rate:
             out.extend(make_junk_statement(rng,used))
             inserted+=1
         out.append(t)
+        if t.value in ("(","[","{"):
+            depth+=1
+        elif t.value in (")","]","}"):
+            depth=max(0,depth-1)
     return out
 
 # ---- anti-environment and anti-tamper injection ----
@@ -744,16 +759,20 @@ def render_lua(tokens):
 
 def validate_lua_source(source):
     luac=shutil.which("luac") or shutil.which("lua")
-    depth=0
-    for ch in source:
-        if ch in "([{":
-            depth+=1
-        elif ch in ")]}":
-            depth-=1
-            if depth<0:
-                return False,"Unbalanced brackets in generated output"
-    if depth!=0:
-        return False,"Unbalanced brackets in generated output"
+    try:
+        toks=lua_lex(source)
+        depth=0
+        for t in toks:
+            if t.kind=="op" and t.value in ("(","[","{"):
+                depth+=1
+            elif t.kind=="op" and t.value in (")","]","}"):
+                depth-=1
+                if depth<0:
+                    return False,"Unbalanced brackets in generated output"
+        if depth!=0:
+            return False,"Unbalanced brackets in generated output"
+    except ValueError as e:
+        return False,str(e)
     if luac:
         fd,path=tempfile.mkstemp(suffix=".lua")
         os.close(fd)
