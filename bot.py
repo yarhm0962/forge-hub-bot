@@ -136,7 +136,7 @@ def add_member_event_sync(guild_id, event_type, member_id=0, username="Unknown m
         "username": str(username)[:100],
         "timestamp": iso_now(),
     }
-    document = insights_collection.find_one_and_update(
+    insights_collection.update_one(
         {"_id": guild_id},
         {
             "$setOnInsert": {
@@ -144,11 +144,16 @@ def add_member_event_sync(guild_id, event_type, member_id=0, username="Unknown m
                 "leaves": [],
                 "total_joins": 0,
                 "total_leaves": 0,
-            },
+            }
+        },
+        upsert=True,
+    )
+    document = insights_collection.find_one_and_update(
+        {"_id": guild_id},
+        {
             "$push": {field: event},
             "$inc": {total_field: 1},
         },
-        upsert=True,
         return_document=ReturnDocument.AFTER,
     )
     cleanup_events_sync(document)
@@ -179,7 +184,6 @@ def add_member_to_snapshot_sync(guild_id, member_id):
     member_snapshots_collection.update_one(
         {"_id": int(guild_id)},
         {
-            "$setOnInsert": {"member_ids": []},
             "$addToSet": {"member_ids": int(member_id)},
             "$set": {"updated_at": iso_now()},
         },
