@@ -75,23 +75,15 @@ def cleanup_events_sync(document):
     joins = []
     leaves = []
     for event in document.get("joins", []):
-        if isinstance(event, str):
-            dt = parse_datetime(event)
-            if dt and dt >= cutoff:
-                joins.append({"user_id": 0, "username": "Unknown member", "timestamp": event})
-        elif isinstance(event, dict):
-            dt = parse_datetime(event.get("timestamp"))
-            if dt and dt >= cutoff:
-                joins.append(event)
+        value = event.get("timestamp") if isinstance(event, dict) else event
+        dt = parse_datetime(value)
+        if dt and dt >= cutoff:
+            joins.append(value)
     for event in document.get("leaves", []):
-        if isinstance(event, str):
-            dt = parse_datetime(event)
-            if dt and dt >= cutoff:
-                leaves.append({"user_id": 0, "username": "Unknown member", "timestamp": event})
-        elif isinstance(event, dict):
-            dt = parse_datetime(event.get("timestamp"))
-            if dt and dt >= cutoff:
-                leaves.append(event)
+        value = event.get("timestamp") if isinstance(event, dict) else event
+        dt = parse_datetime(value)
+        if dt and dt >= cutoff:
+            leaves.append(value)
     document["joins"] = joins
     document["leaves"] = leaves
     document.setdefault("total_joins", 0)
@@ -127,15 +119,10 @@ def get_guild_insights_sync(guild_id):
     return document
 
 
-def add_member_event_sync(guild_id, event_type, member_id=0, username="Unknown member"):
+def add_member_event_sync(guild_id, event_type):
     guild_id = int(guild_id)
     field = "joins" if event_type == "join" else "leaves"
     total_field = "total_joins" if event_type == "join" else "total_leaves"
-    event = {
-        "user_id": int(member_id),
-        "username": str(username)[:100],
-        "timestamp": iso_now(),
-    }
     insights_collection.update_one(
         {"_id": guild_id},
         {
@@ -151,7 +138,7 @@ def add_member_event_sync(guild_id, event_type, member_id=0, username="Unknown m
     document = insights_collection.find_one_and_update(
         {"_id": guild_id},
         {
-            "$push": {field: event},
+            "$push": {field: iso_now()},
             "$inc": {total_field: 1},
         },
         return_document=ReturnDocument.AFTER,
@@ -362,22 +349,6 @@ class InsightsView(discord.ui.LayoutView):
         net_text = f"+{net:,}" if net > 0 else f"{net:,}"
         lifetime_net_text = f"+{lifetime_net:,}" if lifetime_net > 0 else f"{lifetime_net:,}"
 
-        recent_joins = sorted(joins, key=lambda item: item.get("timestamp", ""), reverse=True)[:5]
-        recent_leaves = sorted(leaves, key=lambda item: item.get("timestamp", ""), reverse=True)[:5]
-
-        def format_events(events):
-            if not events:
-                return "`None in the last 30 days`"
-            lines = []
-            for event in events:
-                username = str(event.get("username", "Unknown member"))[:32]
-                user_id = int(event.get("user_id", 0) or 0)
-                timestamp = parse_datetime(event.get("timestamp"))
-                when = discord.utils.format_dt(timestamp, "R") if timestamp else "recently"
-                mention = f"<@{user_id}>" if user_id else f"**{username}**"
-                lines.append(f"{mention} — {when}")
-            return "\n".join(lines)
-
         self.add_item(
             make_container(
                 make_text(f"## 📊 Server Insights · {guild.name}"),
@@ -391,11 +362,6 @@ class InsightsView(discord.ui.LayoutView):
                     "### 🗓️ Last 30 Days\n"
                     f"**Joined:** `{len(joins):,}`   **Left:** `{len(leaves):,}`   **Net:** `{net_text}`\n"
                     "Activity automatically expires after 30 days."
-                ),
-                make_separator(),
-                make_text(
-                    "### 🟢 Recent Joins\n" + format_events(recent_joins) + "\n\n"
-                    "### 🔴 Recent Departures\n" + format_events(recent_leaves)
                 ),
                 make_separator(),
                 make_text(
@@ -997,22 +963,17 @@ async def server_insights(interaction: discord.Interaction):
         )
 
         if not initialized:
-            for member_id in joined:
-                member = interaction.guild.get_member(member_id)
+            for _ in joined:
                 await mongo_call(
                     add_member_event_sync,
                     interaction.guild.id,
                     "join",
-                    member_id,
-                    str(member) if member else "Unknown member",
                 )
-            for member_id in left:
+            for _ in left:
                 await mongo_call(
                     add_member_event_sync,
                     interaction.guild.id,
                     "leave",
-                    member_id,
-                    "Unknown member",
                 )
 
         document = await mongo_call(
@@ -1163,8 +1124,6 @@ async def on_member_join(member: discord.Member):
             add_member_event_sync,
             member.guild.id,
             "join",
-            member.id,
-            str(member),
         )
         await mongo_call(add_member_to_snapshot_sync, member.guild.id, member.id)
     except PyMongoError as error:
@@ -1178,8 +1137,6 @@ async def on_member_remove(member: discord.Member):
             add_member_event_sync,
             member.guild.id,
             "leave",
-            member.id,
-            str(member),
         )
         await mongo_call(remove_member_from_snapshot_sync, member.guild.id, member.id)
     except PyMongoError as error:
@@ -1331,22 +1288,17 @@ async def on_ready():
                     member_ids,
                 )
                 if not initialized:
-                    for member_id in joined:
-                        member = guild.get_member(member_id)
+                    for _ in joined:
                         await mongo_call(
                             add_member_event_sync,
                             guild.id,
                             "join",
-                            member_id,
-                            str(member) if member else "Unknown member",
                         )
-                    for member_id in left:
+                    for _ in left:
                         await mongo_call(
                             add_member_event_sync,
                             guild.id,
                             "leave",
-                            member_id,
-                            "Unknown member",
                         )
                     if joined or left:
                         print(
