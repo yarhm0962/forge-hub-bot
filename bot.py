@@ -274,320 +274,182 @@ def _find_moon_binary():
     return None
 
 
-DOTNET_INSTALL_DIR = BASE_DIR / ".dotnet"
-DOTNET_INSTALL_SCRIPT = BASE_DIR / ".dotnet-install.sh"
-DOTNET_BOOTSTRAP_ERROR = None
 MOON_SETUP_STATUS = "Checking for the MoonSec engine..."
+DEOBF_MAX_BYTES = int(os.getenv("DEOBF_MAX_BYTES", str(8 * 1024 * 1024)))
+DEOBF_TIMEOUT = int(os.getenv("DEOBF_TIMEOUT", "120"))
+_DEOBF_LOCK = asyncio.Semaphore(1)
 
 
-def _check_dotnet(path):
-    try:
-        result = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and result.stdout.strip():
-            return str(path)
-    except Exception:
-        pass
-    return None
+def _looks_like_placeholder(value):
+    if not value:
+        return True
+    normalized = value.strip().lower()
+    return normalized in {
+        "/path/to/moonsecdeobfuscator",
+        "/path/to/moonsecdeobfuscator.exe",
+        "/path/to/your/moonsec-deobfuscator-executable",
+        "/full/path/to/your/moonsec-deobfuscator-executable",
+        "c:\\path\\to\\moonsecdeobfuscator.exe",
+        "c:\\path\\to\\your\\moonsecdeobfuscator.exe",
+        "your_moonsec_executable",
+        "moonsecdeobfuscator.exe",
+    }
 
 
-def _install_dotnet_sdk():
-    global DOTNET_BOOTSTRAP_ERROR, MOON_SETUP_STATUS
-    MOON_SETUP_STATUS = "Installing the .NET 9 SDK required by MoonSec..."
-    print(f"[DEOBF] {MOON_SETUP_STATUS}")
-    DOTNET_BOOTSTRAP_ERROR = None
-    DOTNET_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-    local_dotnet = DOTNET_INSTALL_DIR / ("dotnet.exe" if platform.system() == "Windows" else "dotnet")
-    existing = _check_dotnet(local_dotnet)
-    if existing:
-        return existing
-    script_url = "https://dot.net/v1/dotnet-install.sh" if platform.system() != "Windows" else "https://dot.net/v1/dotnet-install.ps1"
-    try:
-        request = urllib.request.Request(script_url, headers={"User-Agent": "DiscordBot/1.0"})
-        with urllib.request.urlopen(request, timeout=180) as response:
-            DOTNET_INSTALL_SCRIPT.write_bytes(response.read())
-        if platform.system() == "Windows":
-            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(DOTNET_INSTALL_SCRIPT), "-Channel", "9.0", "-InstallDir", str(DOTNET_INSTALL_DIR), "-NoPath"]
-        else:
-            DOTNET_INSTALL_SCRIPT.chmod(DOTNET_INSTALL_SCRIPT.stat().st_mode | 0o111)
-            bash = shutil.which("bash") or "/bin/bash"
-            command = [bash, str(DOTNET_INSTALL_SCRIPT), "--channel", "9.0", "--install-dir", str(DOTNET_INSTALL_DIR), "--no-path"]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=900, cwd=str(BASE_DIR))
-        if result.returncode != 0:
-            detail = (result.stderr.strip() or result.stdout.strip())
-            DOTNET_BOOTSTRAP_ERROR = f"Automatic .NET 9 SDK installation failed: {detail[-1400:] if detail else 'unknown installer error'}"
-            return None
-        installed = _check_dotnet(local_dotnet)
-        if installed:
-            return installed
-        DOTNET_BOOTSTRAP_ERROR = "The .NET 9 SDK installer completed, but the dotnet executable could not be found."
-        return None
-    except urllib.error.URLError as error:
-        DOTNET_BOOTSTRAP_ERROR = f"The .NET installer could not be downloaded: {error.reason}"
-        return None
-    except subprocess.TimeoutExpired:
-        DOTNET_BOOTSTRAP_ERROR = "The .NET 9 SDK installation timed out."
-        return None
-    except Exception as error:
-        DOTNET_BOOTSTRAP_ERROR = f"Automatic .NET setup failed: {error}"
-        return None
+def _candidate_paths(value, names):
+    candidates=[]
+    if value and not _looks_like_placeholder(value):
+        configured=Path(value).expanduser()
+        candidates.append(configured)
+        if not configured.is_absolute():
+            candidates.extend([
+                BASE_DIR / configured,
+                BASE_DIR / "bin" / configured,
+                BASE_DIR / "scripts" / configured,
+                Path.cwd() / configured,
+            ])
+    roots=[
+        BASE_DIR,
+        BASE_DIR / "bin",
+        BASE_DIR / "scripts",
+        Path.cwd(),
+        Path("/home/container"),
+        Path("/home/container/bin"),
+    ]
+    for root in roots:
+        for name in names:
+            candidates.append(root / name)
+    seen=set()
+    result=[]
+    for candidate in candidates:
+        key=str(candidate)
+        if key not in seen:
+            seen.add(key)
+            result.append(candidate)
+    return result
 
 
-def _is_dotnet_available():
-    configured = os.getenv("DOTNET_EXECUTABLE")
+def _moon_names():
+    return [
+        "MoonsecDeobfuscator",
+        "MoonsecDeobfuscator.exe",
+        "MoonsecDeobfuscator.dll",
+        "moonsec",
+        "moonsec.exe",
+        "MoonSec",
+        "MoonSec.exe",
+        "MoonSecCLI",
+        "MoonSecCLI.exe",
+        "moonsec-cli",
+        "moonsec-cli.exe",
+    ]
+
+
+def get_moon_executable():
+    configured=MOON_EXECUTABLE.strip() if isinstance(MOON_EXECUTABLE,str) else MOON_EXECUTABLE
+    names=_moon_names()
+    for candidate in _candidate_paths(configured,names):
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            pass
     if configured and not _looks_like_placeholder(configured):
-        found = _check_dotnet(Path(configured).expanduser())
+        found=shutil.which(configured)
         if found:
             return found
-    local = DOTNET_INSTALL_DIR / ("dotnet.exe" if platform.system() == "Windows" else "dotnet")
-    found = _check_dotnet(local)
-    if found:
-        return found
-    found = shutil.which("dotnet")
-    if found:
-        checked = _check_dotnet(found)
-        if checked:
-            return checked
-    return _install_dotnet_sdk()
-
-
-def _find_project_root(directory):
-    directory = Path(directory)
-    if (directory / "MoonsecDeobfuscator.csproj").is_file():
-        return directory
-    try:
-        for root, dirs, files in os.walk(directory):
-            dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".cache", "bin", "obj"}]
-            if "MoonsecDeobfuscator.csproj" in files:
-                return Path(root)
-    except OSError:
-        pass
-    return None
-
-
-def _extract_source_zip(zip_path, target_dir):
-    import zipfile
-    target_dir = Path(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(target_dir)
-    project_root = _find_project_root(target_dir)
-    if project_root:
-        return project_root
-    return target_dir
-
-
-def _search_build_output(source_root):
-    names = _moon_names()
-    found = _find_moon_from_directory(source_root)
-    if found:
-        return found
-    return None
-
-
-def bootstrap_moonsec():
-    global MOON_BOOTSTRAP_ERROR, MOON_SETUP_STATUS
-    MOON_BOOTSTRAP_ERROR = None
-    MOON_SETUP_STATUS = "Checking for the MoonSec engine..."
-    print(f"[DEOBF] {MOON_SETUP_STATUS}")
-    existing = _find_moon_binary()
-    if existing:
-        return existing
-    dotnet = _is_dotnet_available()
-    if not dotnet:
-        MOON_BOOTSTRAP_ERROR = "The MoonSec engine is not installed. No MoonsecDeobfuscator executable was found, and the host does not have the .NET runtime required to build the official deobfuscator automatically."
-        return None
-    try:
-        MOONSEC_BOOTSTRAP_DIR.mkdir(parents=True, exist_ok=True)
-        MOON_SETUP_STATUS = "Downloading the MoonSec deobfuscator source..."
-        print(f"[DEOBF] {MOON_SETUP_STATUS}")
-        source_root = _find_project_root(MOONSEC_BOOTSTRAP_DIR)
-        if source_root is None:
-            clone_dir = MOONSEC_BOOTSTRAP_DIR / "source"
-            git = shutil.which("git")
-            if git and not clone_dir.exists():
-                clone = subprocess.run(
-                    [git, "clone", "--depth", "1", MOONSEC_REPOSITORY_URL, str(clone_dir)],
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    cwd=str(BASE_DIR),
-                )
-                if clone.returncode != 0:
-                    clone_dir = None
-            if clone_dir is not None and Path(clone_dir).exists():
-                source_root = _find_project_root(clone_dir)
-        if source_root is None:
-            archive_path = MOONSEC_BOOTSTRAP_DIR / "source.zip"
-            extract_dir = MOONSEC_BOOTSTRAP_DIR / "source_extract"
-            request = urllib.request.Request(
-                MOONSEC_SOURCE_ZIP_URL,
-                headers={"User-Agent": "DiscordBot/1.0"},
-            )
-            with urllib.request.urlopen(request, timeout=180) as response:
-                archive_path.write_bytes(response.read())
-            source_root = _extract_source_zip(archive_path, extract_dir)
-        if source_root is None or not (Path(source_root) / "MoonsecDeobfuscator.csproj").is_file():
-            MOON_BOOTSTRAP_ERROR = "The MoonSec source was downloaded, but MoonsecDeobfuscator.csproj could not be found."
-            return None
-        source_root = Path(source_root)
-        project_file = source_root / "MoonsecDeobfuscator.csproj"
-        MOON_SETUP_STATUS = "Restoring MoonSec build dependencies..."
-        print(f"[DEOBF] {MOON_SETUP_STATUS}")
-        restore = subprocess.run(
-            [dotnet, "restore", str(project_file)],
-            capture_output=True,
-            text=True,
-            timeout=600,
-            cwd=str(source_root),
-        )
-        if restore.returncode != 0:
-            detail = (restore.stderr.strip() or restore.stdout.strip())
-            MOON_BOOTSTRAP_ERROR = f".NET restore failed: {detail[-1200:] if detail else 'unknown restore error'}"
-            return None
-        MOON_SETUP_STATUS = "Building the MoonSec engine. This can take several minutes on shared hosting..."
-        print(f"[DEOBF] {MOON_SETUP_STATUS}")
-        build = subprocess.run(
-            [dotnet, "build", str(project_file), "-c", "Release", "--no-restore"],
-            capture_output=True,
-            text=True,
-            timeout=900,
-            cwd=str(source_root),
-        )
-        if build.returncode != 0:
-            detail = (build.stderr.strip() or build.stdout.strip())
-            MOON_BOOTSTRAP_ERROR = f"MoonSec build failed: {detail[-1600:] if detail else 'unknown build error'}"
-            return None
-        MOON_SETUP_STATUS = "Locating the completed MoonSec engine..."
-        print(f"[DEOBF] {MOON_SETUP_STATUS}")
-        found = _search_build_output(source_root)
+    for name in names:
+        found=shutil.which(name)
         if found:
             return found
-        MOON_BOOTSTRAP_ERROR = "MoonSec built successfully, but the resulting MoonsecDeobfuscator executable or DLL could not be located."
-        return None
-    except urllib.error.URLError as error:
-        MOON_BOOTSTRAP_ERROR = f"The MoonSec source could not be downloaded: {error.reason}"
-        return None
-    except subprocess.TimeoutExpired:
-        MOON_BOOTSTRAP_ERROR = "The MoonSec installation or build timed out."
-        return None
-    except Exception as error:
-        MOON_BOOTSTRAP_ERROR = f"MoonSec automatic setup failed: {error}"
-        return None
-
-
-def get_moon_executable(auto_bootstrap=False):
-    found = _find_moon_binary()
-    if found:
-        return found
-    if auto_bootstrap:
-        return bootstrap_moonsec()
     return None
 
 
 def get_decompiler_script():
-    runtime_dir = ensure_embedded_deobf_runtime()
-    configured = DECOM_SCRIPT.strip() if isinstance(DECOM_SCRIPT, str) else DECOM_SCRIPT
-    names = [Path(configured).name if configured else "decom.lua", "decom.lua", "decompiler.lua"]
-    names = list(dict.fromkeys(name for name in names if name))
-    for candidate in _existing_path_candidates(configured, names):
-        if candidate.is_file():
-            return str(candidate)
-    embedded = runtime_dir / "decom.lua"
-    if embedded.is_file():
-        return str(embedded)
-    return None
+    configured=DECOM_SCRIPT.strip() if isinstance(DECOM_SCRIPT,str) else DECOM_SCRIPT
+    names=[]
+    if configured:
+        names.append(Path(configured).name)
+    names.extend(["decom.lua","decompiler.lua"])
+    names=list(dict.fromkeys(name for name in names if name))
+    for candidate in _candidate_paths(configured,names):
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            pass
+    embedded=BASE_DIR / ".deobf_runtime" / "decom.lua"
+    if not embedded.exists():
+        embedded.parent.mkdir(parents=True,exist_ok=True)
+        embedded.write_bytes(__import__("base64").b64decode(EMBEDDED_DECOM_LUA_B64))
+    return str(embedded) if embedded.is_file() else None
 
 
 def _is_lua_51(path):
     try:
-        result = subprocess.run(
-            [str(path), "-v"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        version = (result.stdout + " " + result.stderr).lower()
-        return "lua 5.1" in version
+        result=subprocess.run([str(path),"-v"],capture_output=True,text=True,timeout=5)
+        return "lua 5.1" in (result.stdout+" "+result.stderr).lower()
     except Exception:
         return False
 
 
 def get_lua_binary():
-    runtime_dir = ensure_embedded_deobf_runtime()
-    system = platform.system()
-    configured = LUA5_1_EXECUTABLE.strip() if isinstance(LUA5_1_EXECUTABLE, str) else LUA5_1_EXECUTABLE
-    if system == "Windows":
-        names = ["lua5.1.exe", "lua51.exe", "lua.exe"]
-    else:
-        names = ["lua5.1", "lua51"]
-    for candidate in _existing_path_candidates(configured, names):
-        if candidate.is_file() and _is_lua_51(candidate):
-            try:
-                candidate.chmod(candidate.stat().st_mode | 0o111)
-            except OSError:
-                pass
-            return str(candidate)
-    if configured and not _looks_like_placeholder(configured):
-        found = shutil.which(configured)
+    configured=LUA5_1_EXECUTABLE.strip() if isinstance(LUA5_1_EXECUTABLE,str) else LUA5_1_EXECUTABLE
+    system=platform.system()
+    names=["lua5.1.exe","lua51.exe","lua.exe"] if system=="Windows" else ["lua5.1","lua51"]
+    for candidate in _candidate_paths(configured,names):
+        try:
+            if candidate.is_file() and _is_lua_51(candidate):
+                if system!="Windows":
+                    candidate.chmod(candidate.stat().st_mode|0o111)
+                return str(candidate)
+        except OSError:
+            pass
+    for name in names+["lua","lua.exe"]:
+        found=shutil.which(name)
         if found and _is_lua_51(found):
             return found
-    for name in names:
-        found = shutil.which(name)
-        if found and _is_lua_51(found):
-            return found
-    for name in ("lua", "lua.exe"):
-        found = shutil.which(name)
-        if found and _is_lua_51(found):
-            return found
-    embedded = runtime_dir / "bin" / ("lua5.1.exe" if system == "Windows" else "lua5.1")
-    if embedded.is_file() and _is_lua_51(embedded):
-        return str(embedded)
     return None
 
 
 def validate_deobf_configuration():
-    ensure_embedded_deobf_runtime()
-    errors = []
+    errors=[]
+    moon=get_moon_executable()
+    if not moon:
+        errors.append("MoonSec engine is not installed on this server. MOON_EXECUTABLE must point to a built MoonsecDeobfuscator executable or .dll.")
     if not get_decompiler_script():
-        errors.append("Decompiler script was not found and could not be initialized.")
+        errors.append("Decompiler script was not found.")
     if not get_lua_binary():
-        errors.append("Lua 5.1 runtime was not found and could not be initialized.")
+        errors.append("Lua 5.1 executable was not found.")
     return errors
 
 
-def download_url_sync(url, destination):
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    with urllib.request.urlopen(request, timeout=180) as response:
-        content_type = response.headers.get("Content-Type", "").lower()
+def download_url_sync(url,destination):
+    request=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+    with urllib.request.urlopen(request,timeout=60) as response:
+        content_type=response.headers.get("Content-Type","").lower()
         if "text/html" in content_type:
             raise ValueError("The supplied URL returned an HTML page instead of a Lua file.")
-        content_length = response.headers.get("Content-Length")
+        content_length=response.headers.get("Content-Length")
         if content_length:
             try:
-                length = int(content_length)
-            except (TypeError, ValueError):
-                length = None
-            if length is not None and length > 20 * 1024 * 1024:
-                raise ValueError("The supplied file is larger than 20 MB.")
-        data = response.read(20 * 1024 * 1024 + 1)
+                length=int(content_length)
+            except (TypeError,ValueError):
+                length=None
+            if length is not None and length>DEOBF_MAX_BYTES:
+                raise ValueError(f"The supplied file is larger than {DEOBF_MAX_BYTES//(1024*1024)} MB.")
+        data=response.read(DEOBF_MAX_BYTES+1)
         if not data:
             raise ValueError("The supplied URL returned an empty file.")
-        if len(data) > 20 * 1024 * 1024:
-            raise ValueError("The supplied file is larger than 20 MB.")
+        if len(data)>DEOBF_MAX_BYTES:
+            raise ValueError(f"The supplied file is larger than {DEOBF_MAX_BYTES//(1024*1024)} MB.")
         destination.write_bytes(data)
 
 
-def run_deobf_process(command, timeout=180, cwd=None):
-    environment = os.environ.copy()
-    if platform.system() == "Linux":
-        existing = environment.get("LD_LIBRARY_PATH", "")
-        library_paths = "/usr/lib:/usr/local/lib"
-        environment["LD_LIBRARY_PATH"] = f"{library_paths}:{existing}" if existing else library_paths
+def run_deobf_process(command,timeout=DEOBF_TIMEOUT,cwd=None):
+    environment=os.environ.copy()
     try:
-        result = subprocess.run(
+        result=subprocess.run(
             command,
             capture_output=True,
             text=True,
@@ -595,83 +457,74 @@ def run_deobf_process(command, timeout=180, cwd=None):
             cwd=str(cwd or BASE_DIR),
             env=environment,
         )
-        return result.returncode, result.stdout, result.stderr
+        return result.returncode,result.stdout,result.stderr
     except subprocess.TimeoutExpired:
-        return -1, "", "Process timed out."
+        return -1,"","Process timed out."
     except Exception as error:
-        return -1, "", str(error)
+        return -1,"",str(error)
 
 
 async def process_deobf_file(input_path):
     global MOON_SETUP_STATUS
-    MOON_SETUP_STATUS = "Preparing your Lua file..."
-    print(f"[DEOBF] {MOON_SETUP_STATUS}")
-    work_dir = Path(tempfile.mkdtemp(prefix="moonsec_"))
-    try:
-        moon_executable = await asyncio.to_thread(get_moon_executable, False)
-        decompiler_script = get_decompiler_script()
-        lua_binary = get_lua_binary()
-        if not moon_executable:
-            expected = "/home/container/.moonsec_runtime/source/bin/Release/net9.0/MoonsecDeobfuscator.dll"
-            return None, f"MoonSec engine was not found. Build it before using `.deobf`, or set MOON_EXECUTABLE to the built file. Expected path: {expected}"
-        MOON_SETUP_STATUS = "MoonSec engine is ready. Running deobfuscation..."
-        print(f"[DEOBF] {MOON_SETUP_STATUS}")
-        if not decompiler_script:
-            return None, "Decompiler script was not found."
-        if not lua_binary:
-            return None, "Lua 5.1 executable was not found."
-        source_path = work_dir / input_path.name
-        luac_path = work_dir / f"{random_name()}.luac"
-        output_path = work_dir / "decompiled.lua"
-        shutil.copy2(input_path, source_path)
-        if str(moon_executable).lower().endswith(".dll"):
-            dotnet = _is_dotnet_available()
-            if not dotnet:
-                return None, "The MoonSec deobfuscator is a .NET assembly, but the dotnet runtime is not installed."
-            moon_command = [dotnet, str(moon_executable), "-dev", "-i", str(source_path), "-o", str(luac_path)]
-        else:
+    work_dir=Path(tempfile.mkdtemp(prefix="moonsec_"))
+    async with _DEOBF_LOCK:
+        try:
+            MOON_SETUP_STATUS="Checking the MoonSec engine..."
+            moon_executable=await asyncio.to_thread(get_moon_executable)
+            if not moon_executable:
+                return None,"MoonSec engine is not installed. This host does not have a usable MoonsecDeobfuscator executable. Do not build it during startup on this server because the build can exceed the available RAM."
+            MOON_SETUP_STATUS="Preparing the MoonSec deobfuscation process..."
+            decompiler_script=get_decompiler_script()
+            lua_binary=get_lua_binary()
+            if not decompiler_script:
+                return None,"Decompiler script was not found."
+            if not lua_binary:
+                return None,"Lua 5.1 executable was not found."
+            source_path=work_dir / input_path.name
+            luac_path=work_dir / f"{random_name()}.luac"
+            output_path=work_dir / "decompiled.lua"
+            shutil.copy2(input_path,source_path)
             try:
-                if platform.system() != "Windows":
-                    Path(moon_executable).chmod(Path(moon_executable).stat().st_mode | 0o111)
+                file_size=source_path.stat().st_size
             except OSError:
-                pass
-            moon_command = [str(moon_executable), "-dev", "-i", str(source_path), "-o", str(luac_path)]
-        MOON_SETUP_STATUS = "Running MoonSec bytecode extraction..."
-        print(f"[DEOBF] {MOON_SETUP_STATUS}")
-        moon_code, moon_stdout, moon_stderr = await asyncio.to_thread(
-            run_deobf_process,
-            moon_command,
-            240,
-            Path(moon_executable).parent,
-        )
-        if moon_code != 0:
-            error = moon_stderr.strip() or moon_stdout.strip() or "MoonSec processing failed."
-            return None, f"MoonSec error:\n{error}"
-        if not luac_path.exists():
-            return None, "MoonSec finished without producing a .luac file."
-        decom_command = [str(lua_binary), str(decompiler_script), str(luac_path), str(output_path)]
-        MOON_SETUP_STATUS = "Decompiling the extracted Lua 5.1 bytecode..."
-        print(f"[DEOBF] {MOON_SETUP_STATUS}")
-        decom_code, decom_stdout, decom_stderr = await asyncio.to_thread(
-            run_deobf_process,
-            decom_command,
-            240,
-            Path(decompiler_script).parent,
-        )
-        if decom_code != 0 and not output_path.exists():
-            error = decom_stderr.strip() or decom_stdout.strip() or "Decompiler failed."
-            return None, f"Decompiler error:\n{error}"
-        if not output_path.exists():
-            return None, "Decompiler did not produce an output file."
-        output_content = output_path.read_text(encoding="utf-8", errors="replace")
-        if not output_content.strip():
-            return None, "The decompiler produced an empty result."
-        return output_content, None
-    except Exception as error:
-        return None, str(error)
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
+                file_size=0
+            if file_size>DEOBF_MAX_BYTES:
+                return None,f"The Lua file is larger than {DEOBF_MAX_BYTES//(1024*1024)} MB."
+            if str(moon_executable).lower().endswith(".dll"):
+                dotnet=shutil.which("dotnet")
+                if not dotnet:
+                    return None,"The configured MoonSec engine is a .NET DLL, but this host does not provide the dotnet runtime."
+                moon_command=[dotnet,str(moon_executable),"-dev","-i",str(source_path),"-o",str(luac_path)]
+            else:
+                try:
+                    if platform.system()!="Windows":
+                        Path(moon_executable).chmod(Path(moon_executable).stat().st_mode|0o111)
+                except OSError:
+                    pass
+                moon_command=[str(moon_executable),"-dev","-i",str(source_path),"-o",str(luac_path)]
+            MOON_SETUP_STATUS="Running MoonSec..."
+            moon_code,moon_stdout,moon_stderr=await asyncio.to_thread(run_deobf_process,moon_command,DEOBF_TIMEOUT,Path(moon_executable).parent)
+            if moon_code!=0:
+                error=moon_stderr.strip() or moon_stdout.strip() or "MoonSec processing failed."
+                return None,f"MoonSec error:\n{error}"
+            if not luac_path.exists():
+                return None,"MoonSec finished without producing a .luac file."
+            MOON_SETUP_STATUS="Decompiling the extracted Lua 5.1 bytecode..."
+            decom_command=[str(lua_binary),str(decompiler_script),str(luac_path),str(output_path)]
+            decom_code,decom_stdout,decom_stderr=await asyncio.to_thread(run_deobf_process,decom_command,DEOBF_TIMEOUT,Path(decompiler_script).parent)
+            if decom_code!=0 and not output_path.exists():
+                error=decom_stderr.strip() or decom_stdout.strip() or "Decompiler failed."
+                return None,f"Decompiler error:\n{error}"
+            if not output_path.exists():
+                return None,"Decompiler did not produce an output file."
+            output_content=output_path.read_text(encoding="utf-8",errors="replace")
+            if not output_content.strip():
+                return None,"The decompiler produced an empty result."
+            return output_content,None
+        except Exception as error:
+            return None,str(error)
+        finally:
+            shutil.rmtree(work_dir,ignore_errors=True)
 
 def create_pastefy_sync(title, content):
     if not PASTEFY_API_TOKEN:
@@ -1549,8 +1402,8 @@ async def deobf(ctx, url=None):
             if extension not in {".lua", ".txt"}:
                 await ctx.send("Only `.lua` and `.txt` files are supported.")
                 return
-            if attachment.size > 20 * 1024 * 1024:
-                await ctx.send("The attached file is larger than 20 MB.")
+            if attachment.size > DEOBF_MAX_BYTES:
+                await ctx.send(f"The attached file is larger than {DEOBF_MAX_BYTES // (1024 * 1024)} MB.")
                 return
             input_path = work_dir / source_name
         else:
@@ -1563,7 +1416,7 @@ async def deobf(ctx, url=None):
                 source_name = "input.lua"
             input_path = work_dir / source_name
 
-        status = await ctx.send("⏳ Processing your Lua file...")
+        status = await ctx.send("⏳ Checking the deobfuscation engine...")
 
         if attachment:
             await attachment.save(str(input_path))
