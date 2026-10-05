@@ -12,6 +12,7 @@ import tempfile
 import secrets 
 import socket 
 import string 
+import time 
 import urllib .error 
 import urllib .request 
 from urllib .parse import urlparse 
@@ -19,6 +20,7 @@ from datetime import datetime ,timedelta ,timezone
 from pathlib import Path 
 
 import discord 
+from aiohttp import web 
 from discord import app_commands 
 from discord .ext import commands 
 from pymongo import MongoClient ,ReturnDocument 
@@ -30,12 +32,27 @@ MONGODB_DATABASE =os .getenv ("MONGODB_DATABASE","PanelBot")
 PASTEFY_API_TOKEN =os .getenv ("PASTEFY_API_TOKEN")
 PASTEFY_MAX_BYTES =5 *1024 *1024 
 SAE_SNAPSHOT_FILE =os .getenv ("SAE_SNAPSHOT_FILE","workspace_snapshot.json")
+SAE_INGEST_TOKEN =os .getenv ("SAE_INGEST_TOKEN","").strip ()
+SAE_UNIVERSE_ID =os .getenv ("SAE_UNIVERSE_ID","").strip ()
+SAE_HTTP_HOST =os .getenv ("SAE_HTTP_HOST","0.0.0.0")
 try :
-    SAE_SCAN_INTERVAL =float (os .getenv ("SAE_SCAN_INTERVAL","1.0"))
+    SAE_HTTP_PORT =int (os .getenv ("SAE_HTTP_PORT",os .getenv ("PORT","8080")))
 except (TypeError ,ValueError ):
-    SAE_SCAN_INTERVAL =1.0 
+    SAE_HTTP_PORT =8080
+SAE_PUBLIC_URL =os .getenv ("SAE_PUBLIC_URL","").strip ().rstrip ("/")
+try :
+    SAE_SERVER_TTL =float (os .getenv ("SAE_SERVER_TTL","10"))
+except (TypeError ,ValueError ):
+    SAE_SERVER_TTL =10.0
+if SAE_SERVER_TTL <5.0 :
+    SAE_SERVER_TTL =5.0
+try :
+    SAE_SCAN_INTERVAL =float (os .getenv ("SAE_SCAN_INTERVAL","2.0"))
+except (TypeError ,ValueError ):
+    SAE_SCAN_INTERVAL =2.0
 if SAE_SCAN_INTERVAL <0.25 :
-    SAE_SCAN_INTERVAL =0.25 
+    SAE_SCAN_INTERVAL =0.25
+
 
 if not TOKEN :
     raise RuntimeError ("DISCORD_TOKEN environment variable is missing")
@@ -57,6 +74,7 @@ reaction_roles_collection =mongo_db ["reaction_roles"]
 member_snapshots_collection =mongo_db ["member_snapshots"]
 sae_notifiers_collection =mongo_db ["sae_notifiers"]
 sae_snapshots_collection =mongo_db ["sae_snapshots"]
+sae_bridge_collection =mongo_db ["sae_bridge"]
 
 intents =discord .Intents .default ()
 intents .guilds =True 
@@ -70,7 +88,15 @@ reaction_role_cache ={}
 sae_notifier_tasks ={}
 sae_notifier_views ={}
 sae_notifier_baselines ={}
+sae_notifier_configs ={}
+sae_live_servers ={}
+sae_seen_live_events ={}
+sae_image_cache ={}
+sae_http_app =None
+sae_http_runner =None
+sae_http_site =None
 ready_once =False 
+
 
 ANTI_SCAM_TITLE ="## 🛡️ Anti-Scam Protection"
 ANTI_SCAM_BODY =(
@@ -325,6 +351,20 @@ def save_sae_snapshot_sync (guild_id ,filename ,data_text ):
 
 def get_sae_snapshot_sync (guild_id ):
     return sae_snapshots_collection .find_one ({"_id":int (guild_id )})
+
+
+def get_sae_bridge_token_sync ():
+    document =sae_bridge_collection .find_one ({"_id":"global"})
+    token =document .get ("token")if document else ""
+    if token :
+        return str (token )
+    token =secrets .token_urlsafe (36)
+    sae_bridge_collection .replace_one (
+    {"_id":"global"},
+    {"_id":"global","token":token,"updated_at":iso_now ()},
+    upsert =True ,
+    )
+    return token
 
 
 def delete_sae_snapshot_sync (guild_id ):
@@ -1313,7 +1353,8 @@ SAE_RARITY_COLORS ={
 
 SAE_IMAGE_KEYS =(
     "Image","ImageId","ImageID","Icon","IconId","Texture","TextureId",
-    "Thumbnail","ThumbnailUrl","ImageUrl",
+    "Thumbnail","ThumbnailUrl","ImageUrl","EggImage","ImageAssetId","AssetId",
+    "AssetID","ImageAsset","IconImage",
 )
 
 SAE_RARITY_KEYS =("Rarity","RarityName","rarity","rarityName")
@@ -1358,44 +1399,72 @@ def sae_normalize_image(value ):
     if not value :
         return ""
     if value .startswith (("http://","https://")):
-        return value 
+        return value
+    match =re.search (r"(?:id|assetId)=(\d+)",value ,re.IGNORECASE)
+    if match :
+        return match .group (1)
+    if value .lower ().startswith (("rbxassetid://","rbxthumb://")):
+        numeric ="".join (character for character in value if character .isdigit ())
+        return numeric
     numeric ="".join (character for character in value if character .isdigit ())
-    if numeric :
-        return f"https://www.roblox.com/asset-thumbnail/image?assetId={numeric}&width=420&height=420&format=png"
+    return numeric or ""
+
+
+def sae_find_image(data ):
+    if isinstance (data ,dict ):
+        for key in SAE_IMAGE_KEYS :
+            if key in data :
+                value =sae_normalize_image (data [key])
+                if value :
+                    return value
+        for value in data .values ():
+            found =sae_find_image (value )
+            if found :
+                return found
+    elif isinstance (data ,list ):
+        for value in data :
+            found =sae_find_image (value )
+            if found :
+                return found
     return ""
 
 
-def sae_looks_like_egg(data ):
+def sae_friendly_location(location ):
+    value =sae_clean_text (location )
+    match =re.search (r"(?:^|[.\[\]_/ -])Zone[_ -]?(\d+)(?=$|[.\[\]_/ -])",value ,re.IGNORECASE)
+    if match :
+        return f"Zone {int(match.group(1))}"
+    value =re.sub (r"(?i)workspace(?:\.|$)","",value ).strip(" .")
+    return value or "Workspace"
+
+
+def sae_looks_like_egg(data ,parent_key ="" ):
     if not isinstance (data ,dict ):
         return False
-    name =sae_get_value (data ,SAE_NAME_KEYS )
+    name =sae_get_value (data ,SAE_NAME_KEYS ) or sae_clean_text(parent_key)
     rarity =sae_get_value (data ,SAE_RARITY_KEYS )
     if not name or not rarity :
         return False
     keys =" ".join (str (key ).lower ()for key in data .keys ())
-    return "egg"in name .lower ()or "egg"in keys 
+    return "egg"in name .lower ()or "egg"in keys or "egg"in sae_clean_text(parent_key).lower ()
 
 
-def sae_extract_eggs(data ,location ="workspace",output =None ):
+def sae_extract_eggs(data ,location ="workspace",output =None,parent_key ="" ):
     if output is None :
         output =[]
     if isinstance (data ,dict ):
-        if sae_looks_like_egg (data ):
-            name =sae_get_value (data ,SAE_NAME_KEYS )
+        if sae_looks_like_egg (data ,parent_key):
+            name =sae_get_value (data ,SAE_NAME_KEYS ) or sae_clean_text(parent_key)
             rarity =sae_normalize_rarity (sae_get_value (data ,SAE_RARITY_KEYS ))
-            image =""
-            for key in SAE_IMAGE_KEYS :
-                if key in data :
-                    image =sae_normalize_image (data [key ])
-                    if image :
-                        break 
-            output .append ({"name":name ,"rarity":rarity ,"image":image ,"location":location })
+            image =sae_find_image (data )
+            if name and rarity :
+                output .append ({"name":name ,"rarity":rarity ,"image":image ,"location":sae_friendly_location(location)})
         for key ,value in data .items ():
-            sae_extract_eggs (value ,f"{location }.{key }",output )
+            sae_extract_eggs (value ,f"{location }.{key }",output ,str(key))
     elif isinstance (data ,list ):
         for index ,value in enumerate (data ):
-            sae_extract_eggs (value ,f"{location }[{index }]",output )
-    return output 
+            sae_extract_eggs (value ,f"{location }[{index }]",output ,parent_key)
+    return output
 
 
 def sae_rarity_rank(rarity ):
@@ -1474,54 +1543,262 @@ def sae_escape(value ,limit =160 ):
     return discord .utils .escape_markdown (sae_clean_text (value ))[:limit]
 
 
-def sae_notification_view(egg ,test =False ):
-    rarity =egg ["rarity"]
-    color =SAE_RARITY_COLORS .get (rarity ,0x5865F2 )
-    name =sae_escape (egg ["name"],200 )
-    location =sae_escape (egg .get ("location","workspace"),220 )
-    title ="### 🧪 Test — Best Rarity Detected"if test else "### 🚨 Best Rarity Egg Spawned"
-    subtitle ="Notifier test result from the current workspace snapshot."if test else "A new best-rarity egg was detected by the BREAK & SAE Notifier."
-    children =[
-        make_text (title ),
-        make_text (subtitle ),
-        make_separator (),
-    ]
-    text_block =make_text (
-        f"### ✨ {name}\n"
-        f"**Rarity:** `{sae_escape (rarity,80 )}`\n"
-        f"**Location:** `{location}`"
+def sae_rarity_emoji(rarity ):
+    return {
+        "Common":"⚪",
+        "Uncommon":"🟢",
+        "Rare":"🔵",
+        "Epic":"🟣",
+        "Legendary":"🟠",
+        "Mythic":"🔴",
+        "Divine":"💠",
+        "Secret":"💗",
+        "Exotic":"🟡",
+        "Rainbow":"🌈",
+    }.get(rarity,"✨")
+
+
+def sae_image_asset_id(value ):
+    value =sae_clean_text (value )
+    if not value :
+        return ""
+    if value .isdigit ():
+        return value
+    match =re.search (r"(?:id|assetId)=(\d+)",value ,re.IGNORECASE)
+    if match :
+        return match .group (1)
+    if value .lower ().startswith (("rbxassetid://","rbxthumb://")):
+        numeric ="".join (character for character in value if character .isdigit ())
+        return numeric
+    return ""
+
+
+def sae_resolve_image_url_sync(value ):
+    value =sae_clean_text (value )
+    if not value :
+        return ""
+    asset_id =sae_image_asset_id(value)
+    if value .startswith (("http://","https://")) and not asset_id:
+        return value
+    if not asset_id :
+        return ""
+    cached =sae_image_cache.get(asset_id)
+    if cached :
+        return cached
+    endpoint =f"https://thumbnails.roblox.com/v1/assets?assetIds={asset_id}&size=420x420&format=Png&isCircular=false"
+    try :
+        request =urllib .request .Request (endpoint ,headers ={"User-Agent":"Mozilla/5.0"})
+        with urllib .request .urlopen (request ,timeout =8 )as response :
+            payload =json .loads (response .read ().decode ("utf-8"))
+        data =payload .get ("data",[])
+        if data and isinstance (data [0],dict ):
+            image_url =sae_clean_text (data [0].get ("imageUrl"))
+            if image_url .startswith (("http://","https://")):
+                sae_image_cache[asset_id]=image_url
+                return image_url
+    except Exception :
+        pass
+    fallback =f"https://www.roblox.com/asset-thumbnail/image?assetId={asset_id}&width=420&height=420&format=png"
+    sae_image_cache[asset_id]=fallback
+    return fallback
+
+
+async def sae_prepare_egg_image(egg ):
+    image =sae_clean_text (egg .get ("image"))
+    if not image :
+        return egg
+    resolved =await asyncio .to_thread (sae_resolve_image_url_sync,image)
+    if resolved :
+        egg["image"]=resolved
+    return egg
+
+
+def sae_short_server_id(job_id):
+    value=sae_clean_text(job_id)
+    return value[:8].upper() if value else "UNKNOWN"
+
+
+def sae_prune_live_servers():
+    cutoff=time.time()-SAE_SERVER_TTL
+    stale=[key for key,state in sae_live_servers.items() if float(state.get("last_seen",0.0))<cutoff]
+    for key in stale:
+        sae_live_servers.pop(key,None)
+    event_cutoff=time.time()-900
+    stale_events=[key for key,value in sae_seen_live_events.items() if value<event_cutoff]
+    for key in stale_events:
+        sae_seen_live_events.pop(key,None)
+
+
+def sae_global_live_stats(universe_id=None):
+    sae_prune_live_servers()
+    target=sae_clean_text(universe_id) or SAE_UNIVERSE_ID
+    states=[state for state in sae_live_servers.values() if not target or state.get("universe_id")==target]
+    last_seen=max((float(state.get("last_seen",0.0)) for state in states),default=0.0)
+    return {"servers":len(states),"last_seen":last_seen}
+
+
+def sae_normalize_live_egg(item):
+    if not isinstance(item,dict):
+        return None
+    name=sae_clean_text(item.get("name") or item.get("Name") or item.get("EggName") or item.get("eggName"))
+    rarity=sae_normalize_rarity(item.get("rarity") or item.get("Rarity") or item.get("RarityName") or item.get("rarityName"))
+    image=sae_clean_text(item.get("image") or item.get("Image") or item.get("ImageId") or item.get("ImageID") or item.get("Icon") or item.get("IconId") or item.get("Texture") or item.get("TextureId") or item.get("Thumbnail") or item.get("ThumbnailUrl") or item.get("ImageUrl"))
+    location=sae_friendly_location(item.get("location") or item.get("Location") or "Workspace")
+    egg_id=sae_clean_text(item.get("id") or item.get("Id") or item.get("instanceId") or item.get("path") or f"{location}|{name}|{rarity}")
+    if not name or not rarity or not egg_id:
+        return None
+    return {"id":egg_id,"name":name,"rarity":rarity,"image":image,"location":location}
+
+
+def sae_update_live_state(payload):
+    universe_id=sae_clean_text(payload.get("universeId") or payload.get("gameId") or "")
+    place_id=sae_clean_text(payload.get("placeId") or "")
+    job_id=sae_clean_text(payload.get("jobId") or payload.get("serverId") or "")
+    if not job_id:
+        return [],"Missing jobId."
+    if SAE_UNIVERSE_ID and universe_id!=SAE_UNIVERSE_ID:
+        return [],"Universe rejected."
+    players_raw=payload.get("players",payload.get("playerCount",0))
+    try:
+        players=int(players_raw)
+    except (TypeError,ValueError):
+        players=0
+    state_key=f"{universe_id}:{job_id}"
+    previous=sae_live_servers.get(state_key)
+    previous_eggs=previous.get("eggs",{}) if previous else {}
+    active=payload.get("activeEggs",[])
+    current={}
+    if isinstance(active,list):
+        for raw in active:
+            egg=sae_normalize_live_egg(raw)
+            if egg:
+                current[egg["id"]]=egg
+    sae_live_servers[state_key]={"universe_id":universe_id,"place_id":place_id,"job_id":job_id,"players":players,"last_seen":time.time(),"eggs":current}
+    candidates=[]
+    if previous is not None:
+        for egg_id,egg in current.items():
+            if egg_id not in previous_eggs:
+                candidates.append(dict(egg))
+    spawned=payload.get("spawned",[])
+    if isinstance(spawned,dict):
+        spawned=[spawned]
+    if isinstance(spawned,list):
+        for raw in spawned:
+            egg=sae_normalize_live_egg(raw)
+            if egg:
+                candidates.append(dict(egg))
+    unique={}
+    for egg in candidates:
+        unique[f"{state_key}|{egg['id']}|{egg['rarity']}|{egg['name']}"]=egg
+    output=[]
+    event_id=sae_clean_text(payload.get("eventId") or "")
+    for egg in unique.values():
+        if event_id:
+            dedupe=f"{state_key}|{event_id}|{egg['id']}"
+            if dedupe in sae_seen_live_events:
+                continue
+            sae_seen_live_events[dedupe]=time.time()
+        egg["server_job_id"]=job_id
+        egg["place_id"]=place_id
+        egg["players"]=players
+        egg["universe_id"]=universe_id
+        output.append(egg)
+    sae_prune_live_servers()
+    return output,None
+
+
+def sae_best_live_egg(universe_id=None):
+    sae_prune_live_servers()
+    target=sae_clean_text(universe_id) or SAE_UNIVERSE_ID
+    best=None
+    rank=-1
+    for state in sae_live_servers.values():
+        if target and state.get("universe_id")!=target:
+            continue
+        for egg in state.get("eggs",{}).values():
+            current=sae_rarity_rank(egg.get("rarity"))
+            if current>rank:
+                rank=current
+                best=dict(egg)
+                best["server_job_id"]=state.get("job_id","")
+                best["place_id"]=state.get("place_id","")
+                best["players"]=state.get("players",0)
+                best["universe_id"]=state.get("universe_id","")
+    return best
+
+
+async def sae_send_live_alerts(candidates):
+    total=0
+    for record in list(sae_notifier_configs.values()):
+        if not record.get("enabled",False):
+            continue
+        channel=bot.get_channel(int(record.get("channel_id",0)))
+        if not isinstance(channel,discord.TextChannel):
+            continue
+        target_universe=sae_clean_text(record.get("universe_id") or SAE_UNIVERSE_ID)
+        target_rank=sae_rarity_rank(record.get("best_rarity"))
+        for candidate in candidates:
+            if target_universe and candidate.get("universe_id")!=target_universe:
+                continue
+            if target_rank>=0 and sae_rarity_rank(candidate.get("rarity"))!=target_rank:
+                continue
+            try:
+                await sae_prepare_egg_image(candidate)
+                await channel.send(view=sae_notification_view(candidate,False))
+                total+=1
+            except (discord.Forbidden,discord.HTTPException):
+                break
+    return total
+
+
+def sae_notification_view(egg ,test=False):
+    rarity=egg.get("rarity","")
+    color=SAE_RARITY_COLORS.get(rarity,0x5865F2)
+    emoji=sae_rarity_emoji(rarity)
+    name=sae_escape(egg.get("name","Unknown Egg"),200)
+    location=sae_escape(egg.get("location","Workspace"),120)
+    server=sae_escape(sae_short_server_id(egg.get("server_job_id","")),24)
+    players=int(egg.get("players",0) or 0)
+    place=sae_escape(egg.get("place_id","") or "Unknown",40)
+    image=sae_clean_text(egg.get("image"))
+    title="## 🧪 BREAK & SAE LIVE TEST" if test else "## 🚨 BEST RARITY EGG SPAWNED"
+    subtitle="Live multi-server bridge verification." if test else "A highest-rarity egg was detected in a live Roblox server."
+    details=(
+        f"### {emoji} {name}\n"
+        f"**RARITY**  ·  `{sae_escape(rarity,80)}`\n"
+        f"**LOCATION**  ·  `{location}`\n"
+        f"**SERVER**  ·  `{server}`\n"
+        f"**PLAYERS**  ·  `{players}`\n"
+        f"**PLACE**  ·  `{place}`"
     )
-    image =egg .get ("image")
-    if image :
-        section =discord .ui .Section (
-            text_block ,
-            accessory =discord .ui .Thumbnail (image ,description =f"{name} · {rarity}"),
-        )
-        children .append (section )
-    else :
-        children .append (text_block )
-        children .append (make_text ("🖼️ **Image:** `Not available in snapshot`"))
-    children .extend ([
-        make_separator (),
-        make_text ("🔔 **Best rarity only** · Lower-rarity eggs are ignored."),
-    ])
-    view =discord .ui .LayoutView (timeout =None )
-    view .add_item (make_container (*children ,accent_color =color ))
+    children=[make_text(title),make_text(subtitle),make_separator()]
+    if image:
+        children.append(discord.ui.Section(details,accessory=discord.ui.Thumbnail(image,description=f"{name} · {rarity}")))
+    else:
+        children.append(details)
+        children.append(make_text("🖼️ **Egg Image**  ·  `Not supplied by the Roblox bridge`"))
+    children.extend([make_separator(),make_text("🌟 **BEST RARITY ONLY**  ·  Lower-rarity spawns are ignored.")])
+    view=discord.ui.LayoutView(timeout=None)
+    view.add_item(make_container(*children,accent_color=color))
     return view
 
 
-def sae_panel_status(record ):
-    enabled =bool (record .get ("enabled",False ))
-    status ="🟢 Active"if enabled else "🔴 Paused"
-    path_value =sae_escape (record .get ("snapshot_file",SAE_SNAPSHOT_FILE),160 )
-    channel_id =record .get ("channel_id")
-    channel_text =f"<#{int (channel_id )}>"if channel_id else "`Not configured`"
+def sae_panel_status(record):
+    enabled=bool(record.get("enabled",False))
+    status="🟢 ACTIVE" if enabled else "🔴 PAUSED"
+    target=sae_clean_text(record.get("best_rarity")) or "Catalog highest"
+    stats=sae_global_live_stats(record.get("universe_id") or SAE_UNIVERSE_ID)
+    live=f"🟢 {stats['servers']} connected" if stats["servers"] else "🟠 Waiting for Roblox servers"
+    last=f"<t:{int(stats['last_seen'])}:R>" if stats["last_seen"] else "never"
+    channel_id=record.get("channel_id")
+    channel_text=f"<#{int(channel_id)}>" if channel_id else "`Not configured`"
     return (
-        f"**Status:** {status}\n"
-        f"**Notify Channel:** {channel_text}\n"
-        f"**Snapshot:** `{path_value}`\n"
-        f"**Scan Interval:** `{SAE_SCAN_INTERVAL:.2f}s`\n"
-        "**Filter:** `Best rarity only`"
+        f"**Status**  ·  {status}\n"
+        f"**Notify Channel**  ·  {channel_text}\n"
+        f"**Target Rarity**  ·  `{sae_escape(target,80)}`\n"
+        f"**Live Servers**  ·  {live}\n"
+        f"**Last Heartbeat**  ·  {last}\n"
+        f"**Mode**  ·  `All authenticated Roblox servers`"
     )
 
 
@@ -1545,17 +1822,20 @@ class BreakSAENotifierView(discord.ui.LayoutView):
         enabled=bool(self.record.get("enabled",False))
         self.start_button.disabled=enabled
         self.stop_button.disabled=not enabled
+        bridge=f"{SAE_PUBLIC_URL}/sae/ingest" if SAE_PUBLIC_URL else "Set SAE_PUBLIC_URL"
         self.add_item(make_container(
-            make_text("## 🚨 BREAK & SAE Notifier"),
-            make_text("Live workspace watcher for the highest rarity egg. The scanner follows the snapshot structure you provided and ignores lower rarities."),
+            make_text("## 🚨 BREAK & SAE — LIVE MULTI-SERVER"),
+            make_text("Real-time egg spawn monitoring across every Roblox server running the SAE bridge."),
             make_separator(),
-            make_text("### 📡 Notifier Status"),
+            make_text("### 📡 MONITOR"),
             make_text(sae_panel_status(self.record)),
             make_separator(),
-            make_text("### 🧪 Controls"),
+            make_text("### 🌐 BRIDGE"),
+            make_text(f"**Endpoint**  ·  `{sae_escape(bridge,180)}`\n**Heartbeat**  ·  `{SAE_SCAN_INTERVAL:.2f}s`\n**Timeout**  ·  `{SAE_SERVER_TTL:.0f}s`"),
+            make_separator(),
             discord.ui.ActionRow(self.refresh_button,self.test_button,self.start_button,self.stop_button),
             make_separator(),
-            make_text("**Test Best** reads the current snapshot and posts the highest-rarity egg with its name, rarity, location, and image when available."),
+            make_text("**Best Rarity Only** filters alerts to the highest rarity from your uploaded egg catalog. Lower-rarity spawns never trigger an alert."),
             accent_color=0x5865F2,
         ))
 
@@ -1591,32 +1871,23 @@ class BreakSAENotifierView(discord.ui.LayoutView):
         if not isinstance(channel,discord.TextChannel):
             await interaction.followup.send("The configured notifier channel is no longer available.",ephemeral=True)
             return
-        stored_snapshot=await mongo_call(get_sae_snapshot_sync,self.guild_id)
-        embedded_text=stored_snapshot.get("data") if isinstance(stored_snapshot,dict) else None
-        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE),embedded_text)
-        if error:
-            message=(
-            "❌ **No workspace snapshot is available.**\n"
-            "Use `/break` again and attach your `workspace_snapshot.json`, or configure `SAE_SNAPSHOT_FILE`/`SAE_SNAPSHOT_JSON`."
-            if "Snapshot file not found" in error
-            else error
-            )
-            await interaction.followup.send(message,ephemeral=True)
+        best=sae_best_live_egg(record.get("universe_id") or SAE_UNIVERSE_ID)
+        target_rank=sae_rarity_rank(record.get("best_rarity"))
+        if best and (target_rank<0 or sae_rarity_rank(best.get("rarity"))==target_rank):
+            await sae_prepare_egg_image(best)
+            await channel.send(view=sae_notification_view(best,True))
+            await interaction.followup.send(f"🧪 Sent the live best-rarity result to {channel.mention}.",ephemeral=True)
             return
-        if not best:
-            await interaction.followup.send("No valid egg with a recognized rarity was found in the current snapshot.",ephemeral=True)
+        stored=await mongo_call(get_sae_snapshot_sync,self.guild_id)
+        embedded=stored.get("data") if isinstance(stored,dict) else None
+        snapshot_best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE),embedded)
+        if error or not snapshot_best:
+            await interaction.followup.send("No live Roblox server is connected yet and the saved snapshot has no usable best-rarity egg.",ephemeral=True)
             return
-        sent=0
-        for egg in best[:10]:
-            try:
-                await channel.send(view=sae_notification_view(egg,True))
-                sent+=1
-            except discord.HTTPException:
-                continue
-        if sent:
-            await interaction.followup.send(f"🧪 Sent `{sent}` best-rarity test notification{'s' if sent!=1 else ''} to {channel.mention}.",ephemeral=True)
-        else:
-            await interaction.followup.send("The test notification could not be sent.",ephemeral=True)
+        egg=dict(snapshot_best[0])
+        await sae_prepare_egg_image(egg)
+        await channel.send(view=sae_notification_view(egg,True))
+        await interaction.followup.send(f"🧪 No live server was available, so the catalog test result was posted to {channel.mention}.",ephemeral=True)
 
     async def start_callback(self,interaction):
         if not await self.authorized(interaction):
@@ -1628,6 +1899,7 @@ class BreakSAENotifierView(discord.ui.LayoutView):
         record["enabled"]=True
         record["updated_at"]=iso_now ()
         await mongo_call(save_sae_notifier_sync,record)
+        sae_notifier_configs[self.guild_id]=dict(record)
         self.record=dict(record)
         await start_sae_notifier(self.guild_id)
         self.render()
@@ -1643,6 +1915,7 @@ class BreakSAENotifierView(discord.ui.LayoutView):
         record["enabled"]=False
         record["updated_at"]=iso_now ()
         await mongo_call(save_sae_notifier_sync,record)
+        sae_notifier_configs[self.guild_id]=dict(record)
         await stop_sae_notifier(self.guild_id)
         self.record=dict(record)
         self.render()
@@ -1657,36 +1930,12 @@ def make_sae_panel_view(guild_id,record):
 
 async def sae_notifier_loop(guild_id):
     guild_id=int(guild_id)
-    last_ids=sae_notifier_baselines.get(guild_id,set())
-    first_scan=True
     while True:
-        record=await mongo_call(get_sae_notifier_sync,guild_id)
+        record=sae_notifier_configs.get(guild_id)
         if not record or not record.get("enabled",False):
             break
-        channel=bot.get_channel(int(record.get("channel_id",0)))
-        if not isinstance(channel,discord.TextChannel):
-            await asyncio.sleep(max(SAE_SCAN_INTERVAL,5.0))
-            continue
-        stored_snapshot=await mongo_call(get_sae_snapshot_sync,guild_id)
-        embedded_text=stored_snapshot.get("data") if isinstance(stored_snapshot,dict) else None
-        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE),embedded_text)
-        if error:
-            await asyncio.sleep(SAE_SCAN_INTERVAL)
-            continue
-        current_ids={sae_egg_id(egg)for egg in best}
-        if first_scan:
-            last_ids=current_ids
-            first_scan=False
-        else:
-            new_eggs=[egg for egg in best if sae_egg_id(egg)not in last_ids]
-            for egg in new_eggs[:10]:
-                try:
-                    await channel.send(view=sae_notification_view(egg,False))
-                except (discord.Forbidden,discord.HTTPException):
-                    break
-            last_ids=current_ids
-        sae_notifier_baselines[guild_id]=last_ids
-        await asyncio.sleep(SAE_SCAN_INTERVAL)
+        sae_prune_live_servers()
+        await asyncio.sleep(max(SAE_SCAN_INTERVAL,5.0))
 
 
 async def start_sae_notifier(guild_id):
@@ -1725,6 +1974,7 @@ async def restore_sae_notifiers():
         channel=guild.get_channel(channel_id)
         if not isinstance(channel,discord.TextChannel):
             continue
+        sae_notifier_configs[guild_id]=dict(record)
         view=None
         message_id=record.get("message_id")
         if message_id:
@@ -1752,6 +2002,212 @@ async def restore_sae_notifiers():
                 continue
         if record.get("enabled",False):
             await start_sae_notifier(guild_id)
+
+
+async def sae_roblox_bridge_handler(request):
+    expected=SAE_INGEST_TOKEN or await mongo_call(get_sae_bridge_token_sync)
+    provided=request.headers.get("X-SAE-Token","")
+    if not secrets.compare_digest(provided,expected):
+        return web.json_response({"ok":False,"error":"Unauthorized"},status=401)
+    try:
+        body=await request.read()
+        if len(body)>240000:
+            return web.json_response({"ok":False,"error":"Payload too large"},status=413)
+        payload=json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError,json.JSONDecodeError):
+        return web.json_response({"ok":False,"error":"Invalid JSON"},status=400)
+    if not isinstance(payload,dict):
+        return web.json_response({"ok":False,"error":"JSON object required"},status=400)
+    candidates,error=sae_update_live_state(payload)
+    if error:
+        return web.json_response({"ok":False,"error":error},status=403 if "rejected" in error.lower() else 400)
+    sent=await sae_send_live_alerts(candidates)
+    stats=sae_global_live_stats(payload.get("universeId"))
+    return web.json_response({"ok":True,"servers":stats["servers"],"candidates":len(candidates),"sent":sent})
+
+
+async def sae_health_handler(request):
+    stats=sae_global_live_stats()
+    return web.json_response({"ok":True,"servers":stats["servers"],"lastSeen":stats["last_seen"]})
+
+
+async def start_sae_http_server():
+    global sae_http_app,sae_http_runner,sae_http_site
+    if sae_http_runner is not None:
+        return
+    if not SAE_INGEST_TOKEN:
+        await mongo_call(get_sae_bridge_token_sync)
+    sae_http_app=web.Application(client_max_size=256*1024)
+    sae_http_app.router.add_post("/sae/ingest",sae_roblox_bridge_handler)
+    sae_http_app.router.add_get("/sae/health",sae_health_handler)
+    sae_http_runner=web.AppRunner(sae_http_app)
+    await sae_http_runner.setup()
+    sae_http_site=web.TCPSite(sae_http_runner,SAE_HTTP_HOST,SAE_HTTP_PORT)
+    await sae_http_site.start()
+    print(f"SAE live bridge listening on {SAE_HTTP_HOST}:{SAE_HTTP_PORT}")
+
+
+async def stop_sae_http_server():
+    global sae_http_app,sae_http_runner,sae_http_site
+    if sae_http_runner is not None:
+        await sae_http_runner.cleanup()
+    sae_http_site=None
+    sae_http_runner=None
+    sae_http_app=None
+
+
+SAE_ROBLOX_AGENT_TEMPLATE="""local HttpService=game:GetService(\"HttpService\")
+local Players=game:GetService(\"Players\")
+local ENDPOINT=\"__SAE_ENDPOINT__\"
+local TOKEN=\"__SAE_TOKEN__\"
+local INTERVAL=2
+local ROOT=workspace:FindFirstChild(\"Build\")
+ROOT=ROOT and ROOT:FindFirstChild(\"ZoneBuilds\") or workspace
+local known=setmetatable({}, {__mode=\"k\"})
+local initialized=false
+local function clean(v)
+    if v==nil then return \"\" end
+    return tostring(v)
+end
+local function normRarity(v)
+    local s=string.lower(clean(v))
+    local names={Common=true,Uncommon=true,Rare=true,Epic=true,Legendary=true,Mythic=true,Divine=true,Secret=true,Exotic=true,Rainbow=true}
+    for name in pairs(names) do
+        if s==string.lower(name) then return name end
+    end
+    return \"\"
+end
+local function valueText(obj)
+    local ok,v=pcall(function() return obj.Value end)
+    if ok and v~=nil then return clean(v) end
+    return \"\"
+end
+local function readNamedValue(obj,names)
+    for _,name in ipairs(names) do
+        local attr=obj:GetAttribute(name)
+        if attr~=nil and clean(attr)~=\"\" then return clean(attr) end
+        local target=string.lower(name)
+        for _,child in ipairs(obj:GetChildren()) do
+            if string.lower(child.Name)==target then
+                local v=valueText(child)
+                if v~=\"\" then return v end
+            end
+        end
+    end
+    return \"\"
+end
+local function findRarity(obj)
+    local direct=normRarity(readNamedValue(obj,{\"Rarity\",\"RarityName\",\"rarity\",\"rarityName\"}))
+    if direct~=\"\" then return direct end
+    for _,d in ipairs(obj:GetDescendants()) do
+        local r=normRarity(d:GetAttribute(\"Rarity\"))
+        if r~=\"\" then return r end
+        if string.lower(d.Name):find(\"rarity\",1,true) then
+            r=normRarity(valueText(d))
+            if r~=\"\" then return r end
+        end
+    end
+    return \"\"
+end
+local function imageValue(v)
+    local s=clean(v)
+    if s==\"\" then return \"\" end
+    if s:match(\"^%d+$\") then return s end
+    local n=s:match(\"[?&]asset[Ii][Dd]=(%d+)\")
+    if n then return n end
+    if s:find(\"rbxassetid://\",1,true) then return s:match(\"(%d+)\") or \"\" end
+    return s:match(\"(%d+)$\") or \"\"
+end
+local function findImage(obj)
+    local names={\"Image\",\"ImageId\",\"ImageID\",\"Icon\",\"IconId\",\"Texture\",\"TextureId\",\"Thumbnail\",\"ThumbnailUrl\",\"ImageUrl\",\"EggImage\",\"ImageAssetId\",\"AssetId\",\"AssetID\"}
+    for _,name in ipairs(names) do
+        local n=imageValue(obj:GetAttribute(name))
+        if n~=\"\" then return n end
+    end
+    for _,d in ipairs(obj:GetDescendants()) do
+        for _,name in ipairs(names) do
+            if string.lower(d.Name)==string.lower(name) then
+                local n=imageValue(valueText(d))
+                if n~=\"\" then return n end
+            end
+        end
+        local ok,v=pcall(function() return d.Image end)
+        if ok then
+            local n=imageValue(v)
+            if n~=\"\" then return n end
+        end
+        local ok2,v2=pcall(function() return d.Texture end)
+        if ok2 then
+            local n=imageValue(v2)
+            if n~=\"\" then return n end
+        end
+    end
+    return \"\"
+end
+local function friendlyName(name)
+    return name:match(\"^%s*%d+%s*:%s*(.+)$\") or name
+end
+local function locationFor(obj)
+    local cur=obj
+    while cur and cur~=workspace do
+        local zone=cur.Name:match(\"^[Zz]one[_%s%-]?(%d+)$\")
+        if zone then return \"Zone \"..tonumber(zone) end
+        cur=cur.Parent
+    end
+    return \"Workspace\"
+end
+local function eggInfo(obj)
+    if not string.lower(obj.Name):find(\"egg\",1,true) then return nil end
+    local rarity=findRarity(obj)
+    if rarity==\"\" then return nil end
+    return {id=obj:GetFullName(),name=friendlyName(obj.Name),rarity=rarity,image=findImage(obj),location=locationFor(obj)}
+end
+local function scan()
+    local active={}
+    local spawned={}
+    local present={}
+    for _,obj in ipairs(ROOT:GetDescendants()) do
+        local egg=eggInfo(obj)
+        if egg then
+            present[obj]=true
+            active[#active+1]=egg
+            if known[obj]==nil then
+                known[obj]=egg.name..\"|\"..egg.rarity..\"|\"..egg.image..\"|\"..egg.location
+                spawned[#spawned+1]=egg
+            end
+        end
+    end
+    for obj in pairs(known) do
+        if not present[obj] then known[obj]=nil end
+    end
+    if not initialized then
+        initialized=true
+        spawned={}
+    end
+    return active,spawned
+end
+local function send(active,spawned)
+    local payload={universeId=tostring(game.GameId),placeId=tostring(game.PlaceId),jobId=tostring(game.JobId),players=#Players:GetPlayers(),activeEggs=active,spawned=spawned,timestamp=os.time()}
+    pcall(function()
+        HttpService:RequestAsync({Url=ENDPOINT,Method=\"POST\",Headers={[\"Content-Type\"]=\"application/json\",[\"X-SAE-Token\"]=TOKEN},Body=HttpService:JSONEncode(payload)})
+    end)
+end
+while true do
+    local active,spawned=scan()
+    send(active,spawned)
+    task.wait(INTERVAL)
+end"""
+
+@bot.command(name="sae")
+async def sae_command(ctx:commands.Context,action:str=None):
+    if not action or action.lower()!="script":
+        await ctx.send("Usage: `.sae script`")
+        return
+    token=SAE_INGEST_TOKEN or await mongo_call(get_sae_bridge_token_sync)
+    endpoint=f"{SAE_PUBLIC_URL}/sae/ingest" if SAE_PUBLIC_URL else "https://YOUR_PUBLIC_BOT_HOST/sae/ingest"
+    script=SAE_ROBLOX_AGENT_TEMPLATE.replace("__SAE_ENDPOINT__",endpoint).replace("__SAE_TOKEN__",token)
+    file=discord.File(io.BytesIO(script.encode("utf-8")),filename="sae_roblox_bridge.lua")
+    await ctx.send("### 🔌 SAE Roblox Live Bridge\nPut the attached script into **ServerScriptService** and enable Roblox HTTP requests. Run the same script in every server so the bot receives live egg data from every server.",file=file)
 
 
 class ObfuscationResultView(discord.ui.LayoutView):
@@ -2621,9 +3077,9 @@ async def commands_list_command(ctx:commands.Context):
     view.message=message
 
 
-@bot.tree.command(name="break",description="Open the BREAK and SAE best-rarity egg notifier")
-@app_commands.describe(channel="Channel where best-rarity notifications will be sent",snapshot="Optional workspace_snapshot.json file to store for the notifier")
-async def break_sae_notifier(interaction:discord.Interaction,channel:discord.TextChannel|None=None,snapshot:discord.Attachment|None=None):
+@bot.tree.command(name="break",description="Configure BREAK & SAE notifier — channel and snapshot are required")
+@app_commands.describe(channel="Required channel where best-rarity notifications will be sent",snapshot="Required workspace snapshot JSON file — this cannot be omitted")
+async def break_sae_notifier(interaction:discord.Interaction,channel:discord.TextChannel,snapshot:discord.Attachment):
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used inside a server.",ephemeral=True)
         return
@@ -2631,8 +3087,6 @@ async def break_sae_notifier(interaction:discord.Interaction,channel:discord.Tex
         await interaction.response.send_message("You need the Manage Server permission to configure the BREAK & SAE Notifier.",ephemeral=True)
         return
     target=channel
-    if target is None and isinstance(interaction.channel,discord.TextChannel):
-        target=interaction.channel
     if not isinstance(target,discord.TextChannel):
         await interaction.response.send_message("Select a normal text channel for notifier alerts.",ephemeral=True)
         return
@@ -2647,39 +3101,48 @@ async def break_sae_notifier(interaction:discord.Interaction,channel:discord.Tex
     await interaction.response.defer(ephemeral=True)
     record=await mongo_call(get_sae_notifier_sync,interaction.guild.id)
     if record is None:
-        record={"guild_id":interaction.guild.id,"channel_id":target.id,"enabled":True,"snapshot_file":SAE_SNAPSHOT_FILE,"message_id":None,"created_at":iso_now(),"updated_at":iso_now()}
+        record={"guild_id":interaction.guild.id,"channel_id":target.id,"enabled":True,"snapshot_file":SAE_SNAPSHOT_FILE,"message_id":None,"created_at":iso_now(),"updated_at":iso_now(),"best_rarity":"","live_mode":True}
     else:
         record["channel_id"]=target.id
         record["enabled"]=True
         record["snapshot_file"]=record.get("snapshot_file")or SAE_SNAPSHOT_FILE
         record["updated_at"]=iso_now()
-    if snapshot is not None:
-        snapshot_name=os.path.basename(snapshot.filename or "workspace_snapshot.json")
-        if not snapshot_name.lower().endswith(".json"):
-            await interaction.followup.send("The snapshot attachment must be a `.json` file.",ephemeral=True)
-            return
-        if snapshot.size is not None and snapshot.size>8*1024*1024:
+    snapshot_name=os.path.basename(snapshot.filename or "workspace_snapshot.json")
+    if not snapshot_name.lower().endswith(".json"):
+        await interaction.followup.send("The snapshot attachment must be a `.json` file.",ephemeral=True)
+        return
+    if snapshot.size is not None and snapshot.size>8*1024*1024:
+        await interaction.followup.send("The snapshot file is too large. The maximum size is 8 MB.",ephemeral=True)
+        return
+    try:
+        snapshot_bytes=await snapshot.read()
+        if len(snapshot_bytes)>8*1024*1024:
             await interaction.followup.send("The snapshot file is too large. The maximum size is 8 MB.",ephemeral=True)
             return
-        try:
-            snapshot_bytes=await snapshot.read()
-            if len(snapshot_bytes)>8*1024*1024:
-                await interaction.followup.send("The snapshot file is too large. The maximum size is 8 MB.",ephemeral=True)
-                return
-            snapshot_text=snapshot_bytes.decode("utf-8-sig")
-            json.loads(snapshot_text)
-        except UnicodeDecodeError:
-            await interaction.followup.send("The snapshot file must be valid UTF-8 JSON.",ephemeral=True)
-            return
-        except json.JSONDecodeError as error:
-            await interaction.followup.send(f"The snapshot JSON is invalid at line {error.lineno}, column {error.colno}.",ephemeral=True)
-            return
-        except discord.HTTPException as error:
-            await interaction.followup.send(f"Could not read the snapshot attachment: {error}",ephemeral=True)
-            return
-        await mongo_call(save_sae_snapshot_sync,interaction.guild.id,snapshot_name,snapshot_text)
-        record["snapshot_file"]=snapshot_name
-        record["snapshot_source"]="MongoDB upload"
+        snapshot_text=snapshot_bytes.decode("utf-8-sig")
+        snapshot_data=json.loads(snapshot_text)
+    except UnicodeDecodeError:
+        await interaction.followup.send("The snapshot file must be valid UTF-8 JSON.",ephemeral=True)
+        return
+    except json.JSONDecodeError as error:
+        await interaction.followup.send(f"The snapshot JSON is invalid at line {error.lineno}, column {error.colno}.",ephemeral=True)
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(f"Could not read the snapshot attachment: {error}",ephemeral=True)
+        return
+    if not isinstance(snapshot_data,(dict,list)):
+        await interaction.followup.send("The snapshot JSON must contain an object or array.",ephemeral=True)
+        return
+    eggs=sae_extract_eggs(snapshot_data)
+    best=sae_best_eggs(eggs)
+    if not best:
+        await interaction.followup.send("The snapshot is valid JSON, but no egg with a recognized rarity was found.",ephemeral=True)
+        return
+    record["best_rarity"]=best[0].get("rarity","")
+    record["live_mode"]=True
+    await mongo_call(save_sae_snapshot_sync,interaction.guild.id,snapshot_name,snapshot_text)
+    record["snapshot_file"]=snapshot_name
+    record["snapshot_source"]="MongoDB upload"
     stored_snapshot=await mongo_call(get_sae_snapshot_sync,interaction.guild.id)
     embedded_text=stored_snapshot.get("data") if isinstance(stored_snapshot,dict) else None
     best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE),embedded_text)
@@ -2701,20 +3164,23 @@ async def break_sae_notifier(interaction:discord.Interaction,channel:discord.Tex
         message=existing
         await message.edit(view=view)
     await mongo_call(save_sae_notifier_sync,record)
+    sae_notifier_configs[interaction.guild.id]=dict(record)
     sae_notifier_views[interaction.guild.id]=view
     try:
         bot.add_view(view,message_id=message.id)
     except (TypeError,ValueError):
         pass
     await start_sae_notifier(interaction.guild.id)
-    status_text="Started"if error is None else "Started, but the current snapshot could not be read"
-    extra=f"\n**Snapshot:** `{sae_escape(record.get('snapshot_file',SAE_SNAPSHOT_FILE),160)}`"
-    if error:
-        extra+=f"\n**Snapshot status:** ⚠️ {sae_escape(error,300)}"
-    else:
-        extra+=f"\n**Current best:** `{len(best)}` egg{'s' if len(best)!=1 else ''}"
-    await interaction.followup.send(f"✅ **BREAK & SAE Notifier — {status_text}**\nAlerts will be sent to {target.mention}."+extra,ephemeral=True)
-
+    status_text="Started" if error is None else "Started with live bridge"
+    bridge_url=f"{SAE_PUBLIC_URL}/sae/ingest" if SAE_PUBLIC_URL else "Set SAE_PUBLIC_URL"
+    await interaction.followup.send(
+        f"✅ **BREAK & SAE LIVE Notifier — {status_text}**\n"
+        f"**Channel:** {target.mention}\n"
+        f"**Target rarity:** `{sae_escape(record.get("best_rarity","Unknown"),80)}`\n"
+        f"**Bridge:** `{sae_escape(bridge_url,180)}`\n"
+        "Run `.sae script` and install the generated script in every Roblox server.",
+        ephemeral=True,
+    )
 
 @bot.command(name="obf")
 async def lua_obfuscate_command(ctx:commands.Context,source:str=None):
@@ -3472,6 +3938,7 @@ async def on_ready ():
 
         synced =await bot .tree .sync ()
 
+        await start_sae_http_server ()
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
         await restore_sae_notifiers ()
@@ -3614,6 +4081,10 @@ async def start_bot ():
             print (f"Bot error: {error }")
             await asyncio .sleep (30 )
         finally :
+            try :
+                await stop_sae_http_server ()
+            except Exception :
+                pass
             ready_once =False 
 
 
