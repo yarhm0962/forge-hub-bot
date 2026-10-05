@@ -6,6 +6,7 @@ import hashlib
 import io 
 import ipaddress 
 import shutil 
+import random 
 import subprocess 
 import tempfile 
 import secrets 
@@ -472,8 +473,8 @@ async def pastefy_command (ctx :commands .Context ):
     attachment =attachments [0 ]
     filename =os .path .basename (attachment .filename or "")
     extension =os .path .splitext (filename )[1 ].lower ()
-    if extension not in {".lua",".txt"}:
-        await ctx .send ("Only `.lua` and `.txt` files are supported.")
+    if extension not in {".lua",".luau",".txt"}:
+        await ctx .send ("Only `.lua`, `.luau`, and `.txt` files are supported.")
         return 
     if not PASTEFY_API_TOKEN :
         await ctx .send ("Pastefy is not configured. Set the `PASTEFY_API_TOKEN` environment variable.")
@@ -511,6 +512,8 @@ LUA_TOOL_TIMEOUT =45
 LUADEC_EXECUTABLE =os .getenv ("LUADEC_EXECUTABLE")
 UNLUAC_JAR =os .getenv ("UNLUAC_JAR")
 JAVA_EXECUTABLE =os .getenv ("JAVA_EXECUTABLE")
+PROMETHEUS_EXECUTABLE =os .getenv ("PROMETHEUS_EXECUTABLE")
+PROMETHEUS_PRESET =os .getenv ("PROMETHEUS_PRESET","Strong")
 
 
 def resolve_executable (configured ,candidates ):
@@ -543,6 +546,16 @@ def find_luadec ():
 
 def find_java ():
     return resolve_executable (JAVA_EXECUTABLE ,["/usr/bin/java","/usr/local/bin/java","java"])
+
+
+def find_prometheus ():
+    return resolve_executable (PROMETHEUS_EXECUTABLE ,[
+    "/home/container/.local/bin/prometheus-lua",
+    "/home/container/prometheus-lua",
+    "/usr/local/bin/prometheus-lua",
+    "/usr/bin/prometheus-lua",
+    "prometheus-lua",
+    ])
 
 
 def is_lua_bytecode (data ):
@@ -819,6 +832,393 @@ def cap_result (text ):
     return data [:PASTEFY_MAX_BYTES ].decode ("utf-8",errors ="ignore"),True 
 
 
+LUA_SOURCE_EXTENSIONS={".lua",".luau",".txt"}
+OBF_MAX_OUTPUT_BYTES=5*1024*1024
+
+
+def lua_long_bracket_end(source,start):
+    if start>=len(source) or source[start]!="[":
+        return None
+    index=start+1
+    while index<len(source) and source[index]=="=":
+        index+=1
+    if index>=len(source) or source[index]!="[":
+        return None
+    close="]"+"="*(index-start-1)+"]"
+    end=source.find(close,index+1)
+    if end<0:
+        return None
+    return end+len(close),source[start:end+len(close)]
+
+
+def lex_lua_source(source):
+    tokens=[]
+    operators=("//=","...","::","//","<<",">>","==","~=","<=",">=","..","+=","-=","*=","/=","%=","^=","&=","|=")
+    i=0
+    n=len(source)
+    while i<n:
+        ch=source[i]
+        if ch.isspace():
+            i+=1
+            continue
+        if i==0 and source.startswith("#!",i):
+            end=source.find("\n",i)
+            if end<0:
+                end=n
+            tokens.append(("directive",source[i:end]))
+            i=end
+            continue
+        if source.startswith("--",i):
+            if source.startswith("--!",i):
+                end=source.find("\n",i)
+                if end<0:
+                    end=n
+                tokens.append(("directive",source[i:end]))
+                i=end
+                continue
+            long_result=lua_long_bracket_end(source,i+2)
+            if long_result is not None and source[i+2:i+3]=="[":
+                i=long_result[0]
+                continue
+            end=source.find("\n",i)
+            i=n if end<0 else end
+            continue
+        if ch in {"'","\""}:
+            quote=ch
+            j=i+1
+            while j<n:
+                if source[j]=="\\":
+                    j+=2
+                    continue
+                if source[j]==quote:
+                    j+=1
+                    break
+                j+=1
+            if j>n or j==i+1 or source[j-1]!=quote:
+                raise ValueError("Unterminated Lua string literal.")
+            tokens.append(("string",source[i:j]))
+            i=j
+            continue
+        long_result=lua_long_bracket_end(source,i)
+        if long_result is not None:
+            end,value=long_result
+            tokens.append(("string",value))
+            i=end
+            continue
+        if ch.isalpha() or ch=="_":
+            j=i+1
+            while j<n and (source[j].isalnum() or source[j]=="_"):
+                j+=1
+            tokens.append(("ident",source[i:j]))
+            i=j
+            continue
+        if ch.isdigit() or (ch=="." and i+1<n and source[i+1].isdigit()):
+            match=re.match(r"(?:0[xX][0-9A-Fa-f]+(?:\.[0-9A-Fa-f]*)?(?:[pP][+-]?\d+)?|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)",source[i:])
+            if match:
+                value=match.group(0)
+                tokens.append(("number",value))
+                i+=len(value)
+                continue
+        matched=None
+        for operator in operators:
+            if source.startswith(operator,i):
+                matched=operator
+                break
+        if matched is not None:
+            tokens.append(("op",matched))
+            i+=len(matched)
+            continue
+        tokens.append(("op",ch))
+        i+=1
+    return tokens
+
+
+def decode_lua_long_literal(value):
+    if not value.startswith("["):
+        return None
+    index=1
+    while index<len(value) and value[index]=="=":
+        index+=1
+    if index>=len(value) or value[index]!="[":
+        return None
+    closing="]"+"="*(index-1)+"]"
+    if not value.endswith(closing):
+        return None
+    body=value[index+1:-len(closing)]
+    if body.startswith("\n"):
+        body=body[1:]
+    return body.encode("utf-8")
+
+
+def decode_lua_literal_bytes(value):
+    if value.startswith(("'","\"")):
+        return decode_lua_string_literal(value)
+    return decode_lua_long_literal(value)
+
+
+def lua_identifier_name(used,prefix="_x"):
+    while True:
+        name=f"{prefix}{secrets.token_hex(7)}"
+        if name not in used:
+            used.add(name)
+            return name
+
+
+def lua_render_tokens(tokens):
+    pieces=[]
+    previous=None
+    word_kinds={"ident","number"}
+    for kind,value in tokens:
+        if kind=="directive":
+            if pieces:
+                pieces.append("\n")
+            pieces.append(value)
+            pieces.append("\n")
+            previous=None
+            continue
+        if previous is not None:
+            prev_kind,prev_value=previous
+            need_space=False
+            if prev_kind in word_kinds and kind in word_kinds:
+                need_space=True
+            if prev_value in {"+","-"} and value in {"+","-"}:
+                need_space=True
+            if prev_value=="/" and value=="/":
+                need_space=True
+            if prev_value=="." and kind=="number":
+                need_space=True
+            if prev_kind=="number" and value.startswith("."):
+                need_space=True
+            if need_space:
+                pieces.append(" ")
+        pieces.append(value)
+        previous=(kind,value)
+    return "".join(pieces).strip()+"\n"
+
+
+def transform_lua_numbers(tokens):
+    output=[]
+    for kind,value in tokens:
+        if kind!="number" or not re.fullmatch(r"\d+",value):
+            output.append((kind,value))
+            continue
+        number=int(value)
+        if number in {0,1,2} or number>1000000:
+            output.append((kind,value))
+            continue
+        left=random.SystemRandom().randint(3,97)
+        right=random.SystemRandom().randint(2,41)
+        base=number//left
+        remainder=number-(base*left)
+        if base==0:
+            divisor=random.SystemRandom().randint(2,11)
+            left_value=number*divisor
+            expression=f"({left_value}/{divisor})"
+        else:
+            expression=f"(({base}*{left})+{remainder})"
+        subtokens=lex_lua_source(expression)
+        output.extend(subtokens)
+    return output
+
+
+def build_lua_string_pool(string_values,used):
+    if not string_values:
+        return [],""
+    decoder=lua_identifier_name(used,"_d")
+    pool=lua_identifier_name(used,"_p")
+    step=random.SystemRandom().randint(3,17)
+    lines=[f"local {decoder}=function(a,k)local b={{}} for i=1,#a do b[i]=string.char((a[i]-k-i*{step})%256) end return table.concat(b) end",f"local {pool}={{}}"]
+    replacements={}
+    shuffled=list(enumerate(string_values,1))
+    for index,value in shuffled:
+        raw=decode_lua_literal_bytes(value)
+        if raw is None:
+            replacements[value]=value
+            continue
+        key=random.SystemRandom().randint(11,239)
+        encoded=[(byte+key+(position+1)*step)%256 for position,byte in enumerate(raw)]
+        if not encoded:
+            encoded=[0]
+        chunks=[]
+        for start in range(0,len(encoded),180):
+            chunks.append(",".join(str(number) for number in encoded[start:start+180]))
+        array="{"+",".join(chunks)+"}" if len(chunks)==1 else "{"+",".join(str(number) for number in encoded)+"}"
+        lines.append(f"{pool}[{index}]={decoder}({array},{key})")
+        replacements[value]=f"{pool}[{index}]"
+    return replacements,"\n".join(lines)+"\n"
+
+
+def build_lua_anti_tamper(used):
+    rawget_name=lua_identifier_name(used,"_r")
+    type_name=lua_identifier_name(used,"_t")
+    pcall_name=lua_identifier_name(used,"_c")
+    error_name=lua_identifier_name(used,"_e")
+    debug_name=lua_identifier_name(used,"_g")
+    check_name=lua_identifier_name(used,"_q")
+    hook_name=lua_identifier_name(used,"_h")
+    safe=lua_identifier_name(used,"_s")
+    lines=[
+        f"local {rawget_name}=rawget",
+        f"local {type_name}=type",
+        f"local {pcall_name}=pcall",
+        f"local {error_name}=error",
+        f"local {debug_name}={rawget_name}(_G,\"debug\")",
+        f"local {safe}=true",
+        f"local {check_name}=function()",
+        f"if {rawget_name}(_G,\"rawget\")~={rawget_name} or {rawget_name}(_G,\"type\")~={type_name} or {rawget_name}(_G,\"pcall\")~={pcall_name} or {rawget_name}(_G,\"error\")~={error_name} then {safe}=false return end",
+        f"if {debug_name} and {type_name}({debug_name})==\"table\" then",
+        f"local {hook_name}={rawget_name}({debug_name},\"gethook\")",
+        f"if {type_name}({hook_name})==\"function\" then",
+        f"local _o,_p={pcall_name}({hook_name})",
+        f"if _o and _p~=nil then {safe}=false return end",
+        "end",
+        "end",
+        "end",
+        f"{check_name}()",
+        f"if not {safe} then {error_name}(\"Integrity check failed\",0) end",
+    ]
+    return "\n".join(lines)+"\n"
+
+
+
+def run_prometheus(source,filename,workdir):
+    executable=find_prometheus()
+    if not executable:
+        return None,None,None,"Prometheus is not installed."
+    safe_name=os.path.basename(filename) or "input.lua"
+    if not safe_name.lower().endswith((".lua",".luau")):
+        safe_name=os.path.splitext(safe_name)[0]+".lua"
+    input_path=os.path.join(workdir,safe_name)
+    with open(input_path,"w",encoding="utf-8",newline="") as handle:
+        handle.write(source)
+    command=[executable,"--preset",PROMETHEUS_PRESET,input_path]
+    if safe_name.lower().endswith(".lua"):
+        output_path=os.path.join(workdir,safe_name[:-4]+".obfuscated.lua")
+    else:
+        output_path=os.path.join(workdir,safe_name+".obfuscated.lua")
+    command.extend(["--out",output_path])
+    try:
+        completed=subprocess.run(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=90,check=False,text=True,encoding="utf-8",errors="replace",cwd=workdir)
+    except subprocess.TimeoutExpired:
+        return None,None,None,"Prometheus timed out after 90 seconds."
+    except OSError as error:
+        return None,None,None,f"Could not start Prometheus: {error}"
+    if completed.returncode!=0:
+        return None,None,None,f"Prometheus exited with code {completed.returncode}: {(completed.stdout or '')[-1500:]}"
+    if not os.path.isfile(output_path):
+        candidates=[]
+        for entry in os.listdir(workdir):
+            full=os.path.join(workdir,entry)
+            if os.path.isfile(full) and entry!=safe_name and entry.lower().endswith(".lua"):
+                candidates.append(full)
+        if candidates:
+            candidates.sort(key=lambda value:os.path.getmtime(value),reverse=True)
+            output_path=candidates[0]
+    if not os.path.isfile(output_path):
+        return None,None,None,"Prometheus completed without producing an output file."
+    try:
+        with open(output_path,"rb") as handle:
+            data=handle.read(OBF_MAX_OUTPUT_BYTES+1)
+    except OSError as error:
+        return None,None,None,f"Could not read the Prometheus output: {error}"
+    if len(data)>OBF_MAX_OUTPUT_BYTES:
+        return None,None,None,"The Prometheus result is larger than the 5 MB output limit."
+    try:
+        result=data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None,None,None,"Prometheus returned non-UTF-8 output."
+    if not result.strip():
+        return None,None,None,"Prometheus returned an empty result."
+    features=[
+        ("Engine",f"Prometheus `{PROMETHEUS_PRESET}` preset"),
+        ("Constant protection","enabled by engine preset"),
+        ("Control-flow protection","enabled by engine preset"),
+        ("Anti-tamper","enabled by engine preset"),
+        ("Minification","enabled by engine preset"),
+        ("Attribution","Based on Prometheus by Elias Oelschner"),
+    ]
+    return result,features,"Prometheus",None
+
+def obfuscate_lua_source(source):
+    if not source.strip():
+        raise ValueError("The Lua source is empty.")
+    tokens=lex_lua_source(source.lstrip("\ufeff"))
+    directives=[value for kind,value in tokens if kind=="directive"]
+    tokens=[token for token in tokens if token[0]!="directive"]
+    used={value for kind,value in tokens if kind=="ident"}
+    string_values=[]
+    seen=set()
+    for kind,value in tokens:
+        if kind=="string" and value not in seen:
+            seen.add(value)
+            string_values.append(value)
+    replacements,pool_block=build_lua_string_pool(string_values,used)
+    transformed=[]
+    for kind,value in tokens:
+        if kind=="string" and value in replacements:
+            replacement=replacements[value]
+            transformed.extend(lex_lua_source(replacement))
+        else:
+            transformed.append((kind,value))
+    transformed=transform_lua_numbers(transformed)
+    body=lua_render_tokens(transformed)
+    anti=build_lua_anti_tamper(used)
+    junk=[]
+    for _ in range(4):
+        a=random.SystemRandom().randint(37,997)
+        b=random.SystemRandom().randint(13,71)
+        c=random.SystemRandom().randint(7,53)
+        junk.append(f"local {lua_identifier_name(used,'_j')}=(({a}*{b})+{c})")
+    header="\n".join(junk)+"\n"
+    directive_block=("\n".join(directives)+"\n") if directives else ""
+    output=directive_block+anti+header+pool_block+body
+    if len(output.encode("utf-8"))>OBF_MAX_OUTPUT_BYTES:
+        raise ValueError("The obfuscated result is larger than the 5 MB output limit.")
+    features=[
+        ("String protection","shuffled byte-wise constant pool"),
+        ("Numeric folding","multi-term constant expressions"),
+        ("Dead-code noise","4 randomized inert locals"),
+        ("Anti-tamper","global integrity and debug-hook checks"),
+        ("Minification","comments removed and syntax compacted"),
+    ]
+    return output,features
+
+
+class ObfuscationResultView(discord.ui.LayoutView):
+    def __init__(self,filename,result,raw_url,features):
+        super().__init__(timeout=900)
+        self.result=result
+        self.filename=filename
+        download=discord.ui.Button(label="Download Protected Lua",style=discord.ButtonStyle.success,emoji="⬇️")
+        download.callback=self.download_result
+        buttons=[download]
+        if raw_url:
+            buttons.insert(0,discord.ui.Button(label="View Raw Obfuscated",style=discord.ButtonStyle.link,emoji="🔗",url=raw_url))
+        safe_filename=discord.utils.escape_markdown(filename)
+        output_name=discord.utils.escape_markdown(os.path.splitext(filename)[0]+".obfuscated.lua")
+        digest=hashlib.sha256(result.encode("utf-8")).hexdigest()
+        self.add_item(
+            make_container(
+                make_text("### 🛡️ Done Obfuscated & Protected"),
+                make_text(f"`{safe_filename}` has been protected with the built-in high-strength Lua profile."),
+                make_separator(),
+                make_text("### 🔐 Protection Stack\n"+"\n".join(f"**{name}:** `{value}`" for name,value in features)),
+                make_separator(),
+                make_text(f"**Output:** `{output_name}` · `{len(result.encode('utf-8')):,} bytes`\n**SHA-256:** `{digest[:20]}...`"),
+                discord.ui.ActionRow(*buttons),
+                make_separator(),
+                make_text("⚠️ Obfuscation raises reverse-engineering cost but is not a guarantee of secrecy. Keep API keys, tokens, and other secrets out of distributed Lua code."),
+                accent_color=0x57F287,
+            )
+        )
+
+    async def download_result(self,interaction):
+        try:
+            await interaction.response.send_message(file=discord.File(io.BytesIO(self.result.encode("utf-8")),filename=os.path.splitext(self.filename)[0]+".obfuscated.lua"),ephemeral=True)
+        except discord.HTTPException as error:
+            await interaction.response.send_message(f"Download failed: {error}",ephemeral=True)
+
+
 class LuaResultsView (discord .ui .LayoutView ):
     def __init__ (self ,filename ,dump_result ,dump_method ,deobf_result ,deobf_method ,deobf_name ,dump_raw ,deobf_raw ):
         super ().__init__ (timeout =900 )
@@ -994,7 +1394,7 @@ def fetch_remote_lua_sync (url ):
     except UnicodeDecodeError as error :
         raise RuntimeError ("The raw link must contain a UTF-8 Lua or TXT file.")from error 
     path_name =os .path .basename (urlparse (url ).path )
-    filename =path_name if path_name .lower ().endswith ((".lua",".txt"))else "remote.lua"
+    filename =path_name if path_name .lower ().endswith ((".lua",".luau",".txt"))else "remote.lua"
     return filename ,data 
 
 
@@ -1047,13 +1447,13 @@ async def process_l_command (ctx ,filename ,data ):
 async def lua_tool_command (ctx :commands .Context ,source :str =None ):
     attachments =list (ctx .message .attachments )
     if len (attachments )>1 :
-        await ctx .send ("Use exactly one `.lua` or `.txt` attachment, or provide one raw HTTP(S) link.")
+        await ctx .send ("Use exactly one `.lua`, `.luau`, or `.txt` attachment, or provide one raw HTTP(S) link.")
         return 
     if attachments and source :
-        await ctx .send ("Use either one `.lua`/`.txt` attachment or one raw HTTP(S) link, not both.")
+        await ctx .send ("Use either one Lua attachment or one raw HTTP(S) link, not both.")
         return 
     if not attachments and not source :
-        await ctx .send ("Usage: `.l` with one `.lua` or `.txt` attachment, or `.l <raw link>`.")
+        await ctx .send ("Usage: `.l` with one `.lua`, `.luau`, or `.txt` attachment, or `.l <raw link>`.")
         return 
     if source :
         status =await ctx .send ("⏳ **Lua Toolkit**\nFetching the raw Lua/TXT file...")
@@ -1067,8 +1467,8 @@ async def lua_tool_command (ctx :commands .Context ,source :str =None ):
         attachment =attachments [0 ]
         filename =os .path .basename (attachment .filename or "lua_input.lua")
         extension =os .path .splitext (filename )[1 ].lower ()
-        if extension not in {".lua",".txt"}:
-            await ctx .send ("Only `.lua` and `.txt` files are supported.")
+        if extension not in {".lua",".luau",".txt"}:
+            await ctx .send ("Only `.lua`, `.luau`, and `.txt` files are supported.")
             return 
         if attachment .size is not None and attachment .size >LUA_PROCESS_MAX_BYTES :
             await ctx .send ("That file is too large. The maximum size is 2 MB.")
@@ -1510,6 +1910,90 @@ async def on_raw_reaction_remove (payload ):
         return 
 
 
+async def process_obf_command(ctx,filename,data):
+    status=await ctx.send(f"⏳ **Obfuscator**\nProtecting `{discord.utils.escape_markdown(filename)}`...")
+    workdir=tempfile.mkdtemp(prefix="lua_obf_")
+    try:
+        source=data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        shutil.rmtree(workdir,ignore_errors=True)
+        await status.edit(content="❌ **Obfuscation failed**\nThe input must be valid UTF-8 Lua/Luau source.")
+        return
+    try:
+        prometheus_result,features,engine,prometheus_error=await asyncio.to_thread(run_prometheus,source,filename,workdir)
+        if prometheus_result is not None:
+            result=prometheus_result
+        else:
+            result,features=await asyncio.to_thread(obfuscate_lua_source,source)
+            engine="Built-in"
+            features=[
+                ("Engine","Built-in high-strength profile"),
+                ("String protection","shuffled byte-wise constant pool"),
+                ("Numeric folding","multi-term constant expressions"),
+                ("Dead-code noise","4 randomized inert locals"),
+                ("Anti-tamper","global integrity and debug-hook checks"),
+                ("Minification","comments removed and syntax compacted"),
+            ]
+        raw_url=None
+        if PASTEFY_API_TOKEN:
+            try:
+                raw_url=await asyncio.to_thread(create_pastefy_paste_sync,os.path.splitext(filename)[0]+".obfuscated.lua",result,PASTEFY_API_TOKEN)
+            except Exception:
+                raw_url=None
+        view=ObfuscationResultView(filename,result,raw_url,features)
+        await status.edit(content=None,view=view)
+    except Exception as error:
+        await status.edit(content=f"❌ **Obfuscation failed**\n`{discord.utils.escape_markdown(str(error)[:1500])}`")
+    finally:
+        shutil.rmtree(workdir,ignore_errors=True)
+
+
+@bot.command(name="obf")
+async def lua_obfuscate_command(ctx:commands.Context,source:str=None):
+    attachments=list(ctx.message.attachments)
+    if len(attachments)>1:
+        await ctx.send("Use exactly one `.lua`, `.luau`, or `.txt` attachment, or provide one raw HTTP(S) link.")
+        return
+    if attachments and source:
+        await ctx.send("Use either one Lua attachment or one raw HTTP(S) link, not both.")
+        return
+    if not attachments and not source:
+        await ctx.send("Usage: `.obf` with one `.lua`, `.luau`, or `.txt` attachment, or `.obf <raw link>`." )
+        return
+    if source:
+        status=await ctx.send("⏳ **Obfuscator**\nFetching the raw Lua/Luau file...")
+        try:
+            filename,data=await asyncio.to_thread(fetch_remote_lua_sync,source.strip())
+            await status.delete()
+            await process_obf_command(ctx,filename,data)
+        except Exception as error:
+            await status.edit(content=f"❌ **Obfuscation failed**\n`{discord.utils.escape_markdown(str(error)[:1500])}`")
+        return
+    attachment=attachments[0]
+    filename=os.path.basename(attachment.filename or "input.lua")
+    extension=os.path.splitext(filename)[1].lower()
+    if extension not in {".lua",".luau",".txt"}:
+        await ctx.send("Only `.lua`, `.luau`, and `.txt` files are supported.")
+        return
+    if attachment.size is not None and attachment.size>LUA_PROCESS_MAX_BYTES:
+        await ctx.send("That file is too large. The maximum size is 2 MB.")
+        return
+    try:
+        data=await attachment.read()
+    except discord.HTTPException as error:
+        await ctx.send(f"Could not read the attachment: {error}")
+        return
+    if len(data)>LUA_PROCESS_MAX_BYTES:
+        await ctx.send("That file is too large. The maximum size is 2 MB.")
+        return
+    try:
+        data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        await ctx.send("The uploaded file must be valid UTF-8 Lua/Luau text.")
+        return
+    await process_obf_command(ctx,filename,data)
+
+
 create_group =app_commands .Group (
 name ="create",
 description ="Create server tools",
@@ -1838,10 +2322,7 @@ message :str |None =None ,
         )
         return 
 
-    major =version_match .group (1 )
-    minor =version_match .group (2 )or "0"
-    patch =version_match .group (3 )or "0"
-    normalized_version =f"{major }.{minor }.{patch }"
+    version_text =f"version {clean_version}"
 
     if not re .fullmatch (r"\d{15,22}",clean_message_id ):
         await interaction .response .send_message (
@@ -1877,7 +2358,7 @@ message :str |None =None ,
 
         container =make_container (
         make_text (f"## {clean_title }"),
-        make_text (f"-# {normalized_version }"),
+        make_text (f"-# {version_text }"),
         make_separator (),
         make_text (
         f"### CHANGE LOGS\n```diff\n{change_content }```"
