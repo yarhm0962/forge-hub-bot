@@ -265,17 +265,77 @@ def _find_moon_binary():
     return _recursive_find(names)
 
 
-def _is_dotnet_available():
-    found = shutil.which("dotnet")
-    if not found:
-        return None
+DOTNET_INSTALL_DIR = BASE_DIR / ".dotnet"
+DOTNET_INSTALL_SCRIPT = BASE_DIR / ".dotnet-install.sh"
+DOTNET_BOOTSTRAP_ERROR = None
+
+
+def _check_dotnet(path):
     try:
-        result = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=10)
         if result.returncode == 0 and result.stdout.strip():
-            return found
+            return str(path)
     except Exception:
         pass
     return None
+
+
+def _install_dotnet_sdk():
+    global DOTNET_BOOTSTRAP_ERROR
+    DOTNET_BOOTSTRAP_ERROR = None
+    DOTNET_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    local_dotnet = DOTNET_INSTALL_DIR / ("dotnet.exe" if platform.system() == "Windows" else "dotnet")
+    existing = _check_dotnet(local_dotnet)
+    if existing:
+        return existing
+    script_url = "https://dot.net/v1/dotnet-install.sh" if platform.system() != "Windows" else "https://dot.net/v1/dotnet-install.ps1"
+    try:
+        request = urllib.request.Request(script_url, headers={"User-Agent": "DiscordBot/1.0"})
+        with urllib.request.urlopen(request, timeout=180) as response:
+            DOTNET_INSTALL_SCRIPT.write_bytes(response.read())
+        if platform.system() == "Windows":
+            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(DOTNET_INSTALL_SCRIPT), "-Channel", "9.0", "-InstallDir", str(DOTNET_INSTALL_DIR), "-NoPath"]
+        else:
+            DOTNET_INSTALL_SCRIPT.chmod(DOTNET_INSTALL_SCRIPT.stat().st_mode | 0o111)
+            bash = shutil.which("bash") or "/bin/bash"
+            command = [bash, str(DOTNET_INSTALL_SCRIPT), "--channel", "9.0", "--install-dir", str(DOTNET_INSTALL_DIR), "--no-path"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=900, cwd=str(BASE_DIR))
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip())
+            DOTNET_BOOTSTRAP_ERROR = f"Automatic .NET 9 SDK installation failed: {detail[-1400:] if detail else 'unknown installer error'}"
+            return None
+        installed = _check_dotnet(local_dotnet)
+        if installed:
+            return installed
+        DOTNET_BOOTSTRAP_ERROR = "The .NET 9 SDK installer completed, but the dotnet executable could not be found."
+        return None
+    except urllib.error.URLError as error:
+        DOTNET_BOOTSTRAP_ERROR = f"The .NET installer could not be downloaded: {error.reason}"
+        return None
+    except subprocess.TimeoutExpired:
+        DOTNET_BOOTSTRAP_ERROR = "The .NET 9 SDK installation timed out."
+        return None
+    except Exception as error:
+        DOTNET_BOOTSTRAP_ERROR = f"Automatic .NET setup failed: {error}"
+        return None
+
+
+def _is_dotnet_available():
+    configured = os.getenv("DOTNET_EXECUTABLE")
+    if configured and not _looks_like_placeholder(configured):
+        found = _check_dotnet(Path(configured).expanduser())
+        if found:
+            return found
+    local = DOTNET_INSTALL_DIR / ("dotnet.exe" if platform.system() == "Windows" else "dotnet")
+    found = _check_dotnet(local)
+    if found:
+        return found
+    found = shutil.which("dotnet")
+    if found:
+        checked = _check_dotnet(found)
+        if checked:
+            return checked
+    return _install_dotnet_sdk()
 
 
 def _find_project_root(directory):
