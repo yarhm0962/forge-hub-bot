@@ -1280,8 +1280,6 @@ class ScriptUploadView(discord.ui.LayoutView):
         self.copy_button.callback=self.copy_script
         safe_title=discord.utils.escape_markdown(title)
         preview=self._preview(script)
-        lines=script.count("\n")+1
-        size=len(script.encode("utf-8"))
         self.add_item(
             make_container(
                 make_text(f"## {safe_title}"),
@@ -1289,7 +1287,6 @@ class ScriptUploadView(discord.ui.LayoutView):
                 make_separator(),
                 make_text(f"```\n{preview}\n```"),
                 make_separator(),
-                make_text(f"**Lines** `{lines:,}`  ·  **Size** `{size:,} bytes`"),
                 discord.ui.ActionRow(self.copy_button),
                 make_separator(),
                 make_text("📋 **Copy Script** to open a clean, copy-ready version."),
