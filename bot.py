@@ -1050,35 +1050,79 @@ def build_lua_string_pool(string_values,used):
 
 def build_lua_anti_tamper(used):
     rawget_name=lua_identifier_name(used,"_r")
+    rawset_name=lua_identifier_name(used,"_w")
     type_name=lua_identifier_name(used,"_t")
     pcall_name=lua_identifier_name(used,"_c")
     error_name=lua_identifier_name(used,"_e")
+    tostring_name=lua_identifier_name(used,"_n")
+    getmetatable_name=lua_identifier_name(used,"_m")
     debug_name=lua_identifier_name(used,"_g")
+    string_name=lua_identifier_name(used,"_b")
+    byte_name=lua_identifier_name(used,"_y")
     check_name=lua_identifier_name(used,"_q")
-    hook_name=lua_identifier_name(used,"_h")
     safe=lua_identifier_name(used,"_s")
+    reason=lua_identifier_name(used,"_rj")
+    sentinel=lua_identifier_name(used,"_v")
+    sentinel_value=secrets.token_hex(18)
+    checksum=sum((index+1)*byte for index,byte in enumerate(sentinel_value.encode("utf-8")))
     lines=[
-        f"local {rawget_name}=rawget",
-        f"local {type_name}=type",
-        f"local {pcall_name}=pcall",
-        f"local {error_name}=error",
-        f"local {debug_name}={rawget_name}(_G,\"debug\")",
-        f"local {safe}=true",
-        f"local {check_name}=function()",
-        f"if {rawget_name}(_G,\"rawget\")~={rawget_name} or {rawget_name}(_G,\"type\")~={type_name} or {rawget_name}(_G,\"pcall\")~={pcall_name} or {rawget_name}(_G,\"error\")~={error_name} then {safe}=false return end",
-        f"if {debug_name} and {type_name}({debug_name})==\"table\" then",
-        f"local {hook_name}={rawget_name}({debug_name},\"gethook\")",
-        f"if {type_name}({hook_name})==\"function\" then",
-        f"local _o,_p={pcall_name}({hook_name})",
-        f"if _o and _p~=nil then {safe}=false return end",
-        "end",
-        "end",
-        "end",
-        f"{check_name}()",
-        f"if not {safe} then {error_name}(\"Integrity check failed\",0) end",
+        f'local {rawget_name}=rawget',
+        f'local {rawset_name}=rawset',
+        f'local {type_name}=type',
+        f'local {pcall_name}=pcall',
+        f'local {error_name}=error',
+        f'local {tostring_name}=tostring',
+        f'local {getmetatable_name}=getmetatable',
+        f'local {string_name}={rawget_name}(_G,"string")',
+        f'local {byte_name}={rawget_name}({string_name},"byte")',
+        f'local {debug_name}={rawget_name}(_G,"debug")',
+        f'local {safe}=true',
+        f'local {reason}=""',
+        f'local {sentinel}="{sentinel_value}"',
+        f'local {check_name}=function()',
+        f'if {rawget_name}(_G,"rawget")~={rawget_name} then {safe}=false {reason}="rawget hook detected" return false end',
+        f'if {rawget_name}(_G,"rawset")~={rawset_name} then {safe}=false {reason}="rawset hook detected" return false end',
+        f'if {rawget_name}(_G,"type")~={type_name} then {safe}=false {reason}="type hook detected" return false end',
+        f'if {rawget_name}(_G,"pcall")~={pcall_name} then {safe}=false {reason}="pcall hook detected" return false end',
+        f'if {rawget_name}(_G,"error")~={error_name} then {safe}=false {reason}="error hook detected" return false end',
+        f'if {rawget_name}(_G,"tostring")~={tostring_name} then {safe}=false {reason}="tostring hook detected" return false end',
+        f'if {rawget_name}(_G,"string")~={string_name} then {safe}=false {reason}="string library hook detected" return false end',
+        f'if {rawget_name}({string_name},"byte")~={byte_name} then {safe}=false {reason}="string byte hook detected" return false end',
+        f'local _sum=0',
+        f'for _i=1,#{sentinel} do _sum=_sum+(_i*{byte_name}({sentinel},_i)) end',
+        f'if _sum~={checksum} then {safe}=false {reason}="embedded integrity fingerprint changed" return false end',
+        f'if {getmetatable_name} and {type_name}({getmetatable_name})=="function" then',
+        f'local _a,_b={pcall_name}({getmetatable_name},_G)',
+        f'if not _a then {safe}=false {reason}="global metatable access changed" return false end',
+        'end',
+        f'if {debug_name}~=nil and {type_name}({debug_name})=="table" then',
+        f'local _h={rawget_name}({debug_name},"gethook")',
+        f'local _s={rawget_name}({debug_name},"sethook")',
+        f'if _h~=nil and {type_name}(_h)~="function" then {safe}=false {reason}="debug hook API changed" return false end',
+        f'if _s~=nil and {type_name}(_s)~="function" then {safe}=false {reason}="debug setter changed" return false end',
+        f'if _h~=nil then',
+        f'local _ok,_hook={pcall_name}(_h)',
+        f'if not _ok then {safe}=false {reason}="debug hook probe failed" return false end',
+        f'if _hook~=nil then {safe}=false {reason}="debug hook detected" return false end',
+        'end',
+        f'local _i={rawget_name}({debug_name},"getinfo")',
+        f'if _i~=nil then',
+        f'if {type_name}(_i)~="function" then {safe}=false {reason}="debug info API changed" return false end',
+        f'local _ok,_info={pcall_name}(_i,{check_name},"S")',
+        f'if not _ok or {type_name}(_info)~="table" then {safe}=false {reason}="function integrity metadata failed" return false end',
+        f'if type(_info.linedefined)~="number" or type(_info.lastlinedefined)~="number" or _info.lastlinedefined<_info.linedefined then {safe}=false {reason}="function line metadata changed" return false end',
+        'end',
+        'end',
+        f'local _env={rawget_name}(_G,"getfenv")',
+        f'if _env and {type_name}(_env)=="function" then',
+        f'local _ok,_got={pcall_name}(_env,0)',
+        f'if _ok and {type_name}(_got)=="table" and _got~=_G then {safe}=false {reason}="environment mismatch detected" return false end',
+        'end',
+        f'return {safe}',
+        'end',
+        f'if not {check_name}() then {error_name}("Anti-tamper blocked execution: "..{reason},0) end',
     ]
     return "\n".join(lines)+"\n"
-
 
 
 def run_prometheus(source,filename,workdir):
@@ -1133,7 +1177,7 @@ def run_prometheus(source,filename,workdir):
         ("Engine",f"Prometheus `{PROMETHEUS_PRESET}` preset"),
         ("Constant protection","enabled by engine preset"),
         ("Control-flow protection","enabled by engine preset"),
-        ("Anti-tamper","enabled by engine preset"),
+        ("Anti-tamper","engine preset with integrity and tamper checks"),
         ("Minification","enabled by engine preset"),
         ("Attribution","Based on Prometheus by Elias Oelschner"),
     ]
@@ -1178,7 +1222,7 @@ def obfuscate_lua_source(source):
         ("String protection","shuffled byte-wise constant pool"),
         ("Numeric folding","multi-term constant expressions"),
         ("Dead-code noise","4 randomized inert locals"),
-        ("Anti-tamper","global integrity and debug-hook checks"),
+        ("Anti-tamper","multi-point global, environment, debug-hook, and metadata integrity checks"),
         ("Minification","comments removed and syntax compacted"),
     ]
     return output,features
@@ -1217,6 +1261,83 @@ class ObfuscationResultView(discord.ui.LayoutView):
             await interaction.response.send_message(file=discord.File(io.BytesIO(self.result.encode("utf-8")),filename=os.path.splitext(self.filename)[0]+".obfuscated.lua"),ephemeral=True)
         except discord.HTTPException as error:
             await interaction.response.send_message(f"Download failed: {error}",ephemeral=True)
+
+
+class CmdsView(discord.ui.LayoutView):
+    def __init__(self,ctx,prefix_entries,slash_entries,page=0):
+        super().__init__(timeout=300)
+        self.ctx=ctx
+        self.prefix_entries=prefix_entries
+        self.slash_entries=slash_entries
+        self.page=max(0,page)
+        self.previous_button=discord.ui.Button(label="Previous",style=discord.ButtonStyle.secondary,emoji="◀️")
+        self.next_button=discord.ui.Button(label="Next",style=discord.ButtonStyle.primary,emoji="▶️")
+        self.previous_button.callback=self.previous_page
+        self.next_button.callback=self.next_page
+        self.render()
+
+    @property
+    def max_page(self):
+        prefix_pages=(len(self.prefix_entries)+3)//4
+        slash_pages=(len(self.slash_entries)+3)//4
+        return max(1,prefix_pages,slash_pages)
+
+    def render(self):
+        self.clear_items()
+        start=self.page*4
+        prefix_page=self.prefix_entries[start:start+4]
+        slash_page=self.slash_entries[start:start+4]
+        prefix_text="\n\n".join(f"**.{name}**\n> {discord.utils.escape_markdown(description or 'Prefix command')}" for name,description in prefix_page)
+        slash_text="\n\n".join(f"**/{name}**\n> {discord.utils.escape_markdown(description or 'Slash command')}" for name,description in slash_page)
+        sections=[]
+        if prefix_text:
+            sections.extend([make_text("### ⚡ Prefix Commands"),make_text(prefix_text)])
+        if slash_text:
+            if sections:
+                sections.append(make_separator())
+            sections.extend([make_text("### ◆ Slash Commands"),make_text(slash_text)])
+        if not sections:
+            sections.append(make_text("No commands are currently available."))
+        self.previous_button.disabled=self.page<=0
+        self.next_button.disabled=self.page>=self.max_page-1
+        self.add_item(make_container(
+            make_text("## 🧭 Command Center"),
+            make_text(f"Browse every available bot command.\n**Page {self.page+1}/{self.max_page}** · **{len(self.prefix_entries)+len(self.slash_entries)} total commands**"),
+            make_separator(),
+            *sections,
+            make_separator(),
+            discord.ui.ActionRow(self.previous_button,self.next_button),
+            accent_color=0x5865F2,
+        ))
+
+    async def previous_page(self,interaction):
+        if interaction.user.id!=self.ctx.author.id:
+            await interaction.response.send_message("This command list belongs to the user who opened it.",ephemeral=True)
+            return
+        if self.page>0:
+            self.page-=1
+            self.render()
+        await interaction.response.edit_message(view=self)
+
+    async def next_page(self,interaction):
+        if interaction.user.id!=self.ctx.author.id:
+            await interaction.response.send_message("This command list belongs to the user who opened it.",ephemeral=True)
+            return
+        if self.page<self.max_page-1:
+            self.page+=1
+            self.render()
+        await interaction.response.edit_message(view=self)
+
+    async def on_timeout(self):
+        self.previous_button.disabled=True
+        self.next_button.disabled=True
+        message=getattr(self,"message",None)
+        if message:
+            try:
+                self.render()
+                await message.edit(view=self)
+            except (discord.HTTPException,discord.NotFound):
+                pass
 
 
 class LuaResultsView (discord .ui .LayoutView ):
@@ -1931,7 +2052,7 @@ async def process_obf_command(ctx,filename,data):
                 ("String protection","shuffled byte-wise constant pool"),
                 ("Numeric folding","multi-term constant expressions"),
                 ("Dead-code noise","4 randomized inert locals"),
-                ("Anti-tamper","global integrity and debug-hook checks"),
+                ("Anti-tamper","multi-point global, environment, debug-hook, and metadata integrity checks"),
                 ("Minification","comments removed and syntax compacted"),
             ]
         raw_url=None
@@ -1946,6 +2067,32 @@ async def process_obf_command(ctx,filename,data):
         await status.edit(content=f"❌ **Obfuscation failed**\n`{discord.utils.escape_markdown(str(error)[:1500])}`")
     finally:
         shutil.rmtree(workdir,ignore_errors=True)
+
+
+@bot.command(name="cmds")
+async def commands_list_command(ctx:commands.Context):
+    prefix_entries=[(command.qualified_name,command.help or command.description or "Prefix command") for command in sorted(bot.commands,key=lambda item:item.qualified_name.lower())]
+
+    slash_entries=[]
+    def walk(group,prefix=""):
+        for command in sorted(group.commands,key=lambda item:item.name.lower()):
+            qualified=f"{prefix} {command.name}".strip()
+            if isinstance(command,app_commands.Group):
+                walk(command,qualified)
+            else:
+                slash_entries.append((qualified,command.description or "Slash command"))
+
+    for command in sorted(bot.tree.get_commands(),key=lambda item:item.name.lower()):
+        if isinstance(command,app_commands.Group):
+            walk(command,command.name)
+        else:
+            slash_entries.append((command.name,command.description or "Slash command"))
+
+    prefix_entries.sort(key=lambda item:item[0].lower())
+    slash_entries.sort(key=lambda item:item[0].lower())
+    view=CmdsView(ctx,prefix_entries,slash_entries)
+    message=await ctx.send(view=view)
+    view.message=message
 
 
 @bot.command(name="obf")
