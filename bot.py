@@ -255,6 +255,15 @@ def _find_moon_binary():
         found = shutil.which(configured)
         if found:
             return found
+    explicit_outputs = [
+        MOONSEC_BOOTSTRAP_DIR / "source" / "bin" / "Release" / "net9.0" / "MoonsecDeobfuscator.dll",
+        MOONSEC_BOOTSTRAP_DIR / "source" / "bin" / "Release" / "net9.0" / "MoonsecDeobfuscator",
+        MOONSEC_BOOTSTRAP_DIR / "source" / "bin" / "Release" / "net9.0" / "MoonsecDeobfuscator.exe",
+        MOONSEC_BOOTSTRAP_DIR / "source" / "bin" / "Release" / "net9.0" / "MoonsecDeobfuscator",
+    ]
+    for candidate in explicit_outputs:
+        if candidate.is_file():
+            return str(candidate)
     for candidate in _existing_path_candidates(None, names):
         if candidate.is_file():
             return str(candidate)
@@ -262,7 +271,7 @@ def _find_moon_binary():
         found = shutil.which(name)
         if found:
             return found
-    return _recursive_find(names)
+    return None
 
 
 DOTNET_INSTALL_DIR = BASE_DIR / ".dotnet"
@@ -486,7 +495,7 @@ def get_decompiler_script():
     embedded = runtime_dir / "decom.lua"
     if embedded.is_file():
         return str(embedded)
-    return _recursive_find(names)
+    return None
 
 
 def _is_lua_51(path):
@@ -533,7 +542,7 @@ def get_lua_binary():
     embedded = runtime_dir / "bin" / ("lua5.1.exe" if system == "Windows" else "lua5.1")
     if embedded.is_file() and _is_lua_51(embedded):
         return str(embedded)
-    return _recursive_find(names)
+    return None
 
 
 def validate_deobf_configuration():
@@ -599,11 +608,12 @@ async def process_deobf_file(input_path):
     print(f"[DEOBF] {MOON_SETUP_STATUS}")
     work_dir = Path(tempfile.mkdtemp(prefix="moonsec_"))
     try:
-        moon_executable = await asyncio.to_thread(get_moon_executable, True)
+        moon_executable = await asyncio.to_thread(get_moon_executable, False)
         decompiler_script = get_decompiler_script()
         lua_binary = get_lua_binary()
         if not moon_executable:
-            return None, MOON_BOOTSTRAP_ERROR or "MoonSec executable was not found."
+            expected = "/home/container/.moonsec_runtime/source/bin/Release/net9.0/MoonsecDeobfuscator.dll"
+            return None, f"MoonSec engine was not found. Build it before using `.deobf`, or set MOON_EXECUTABLE to the built file. Expected path: {expected}"
         MOON_SETUP_STATUS = "MoonSec engine is ready. Running deobfuscation..."
         print(f"[DEOBF] {MOON_SETUP_STATUS}")
         if not decompiler_script:
@@ -1564,11 +1574,15 @@ async def deobf(ctx, url=None):
                 await status.edit(content=f"❌ Unable to download the supplied file: {error}")
                 return
 
+        try:
+            await status.edit(content="⏳ Starting MoonSec deobfuscation...")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
         process_task = asyncio.create_task(process_deobf_file(input_path))
         elapsed = 0
         while not process_task.done():
-            await asyncio.sleep(15)
-            elapsed += 15
+            await asyncio.sleep(5)
+            elapsed += 5
             if process_task.done():
                 break
             try:
