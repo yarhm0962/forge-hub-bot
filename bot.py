@@ -1,7 +1,17 @@
 import os
 import asyncio
+import json
+import platform
 import re
+import secrets
+import shutil
+import string
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -12,6 +22,9 @@ from pymongo.errors import PyMongoError
 TOKEN = os.getenv("DISCORD_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "PanelBot")
+MOON_EXECUTABLE = os.getenv("MOON_EXECUTABLE")
+DECOM_SCRIPT = os.getenv("DECOM_SCRIPT", "decom.lua")
+PASTEFY_API_TOKEN = os.getenv("PASTEFY_API_TOKEN")
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN environment variable is missing")
@@ -37,11 +50,187 @@ intents.guilds = True
 intents.members = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=("!", "."), intents=intents)
 
 created_channels = {}
 reaction_role_cache = {}
 ready_once = False
+BASE_DIR = Path(__file__).resolve().parent
+DECOM_PATH = BASE_DIR / DECOM_SCRIPT
+
+
+def random_name(length=16):
+    characters = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(characters) for _ in range(length))
+
+
+def get_lua_binary():
+    system = platform.system()
+    if system == "Windows":
+        path = BASE_DIR / "bin" / "lua5.1.exe"
+    elif system == "Linux":
+        path = BASE_DIR / "bin" / "lua5.1"
+        if path.exists():
+            path.chmod(path.stat().st_mode | 0o111)
+    else:
+        return shutil.which("lua5.1")
+    return str(path) if path.exists() else None
+
+
+def validate_deobf_configuration():
+    errors = []
+    if not MOON_EXECUTABLE:
+        errors.append("MOON_EXECUTABLE is not configured.")
+    elif not Path(MOON_EXECUTABLE).exists():
+        errors.append("MOON_EXECUTABLE was not found.")
+    if not DECOM_PATH.exists():
+        errors.append(f"Decompiler script was not found: {DECOM_PATH}")
+    if not get_lua_binary():
+        errors.append("Lua 5.1 executable was not found.")
+    if not PASTEFY_API_TOKEN:
+        errors.append("PASTEFY_API_TOKEN is not configured.")
+    return errors
+
+
+def download_url_sync(url, destination):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(request, timeout=180) as response:
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "text/html" in content_type:
+            raise ValueError("The supplied URL returned an HTML page instead of a Lua file.")
+        data = response.read()
+        if not data:
+            raise ValueError("The supplied URL returned an empty file.")
+        destination.write_bytes(data)
+
+
+def run_deobf_process(command, timeout=180):
+    environment = os.environ.copy()
+    if platform.system() == "Linux":
+        existing = environment.get("LD_LIBRARY_PATH", "")
+        library_paths = "/usr/lib:/usr/local/lib"
+        environment["LD_LIBRARY_PATH"] = f"{library_paths}:{existing}" if existing else library_paths
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(BASE_DIR),
+            env=environment,
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "Process timed out."
+    except Exception as error:
+        return -1, "", str(error)
+
+
+async def process_deobf_file(input_path):
+    work_dir = Path(tempfile.mkdtemp(prefix="moonsec_"))
+    try:
+        source_path = work_dir / input_path.name
+        luac_path = work_dir / f"{random_name()}.luac"
+        output_path = work_dir / "decompiled.lua"
+        shutil.copy2(input_path, source_path)
+        moon_command = [
+            str(MOON_EXECUTABLE),
+            "-dev",
+            "-i",
+            str(source_path),
+            "-o",
+            str(luac_path),
+        ]
+        moon_code, moon_stdout, moon_stderr = await asyncio.to_thread(
+            run_deobf_process,
+            moon_command,
+        )
+        if moon_code != 0:
+            error = moon_stderr.strip() or moon_stdout.strip() or "MoonSec processing failed."
+            return None, None, f"MoonSec error:\n{error}"
+        if not luac_path.exists():
+            return None, None, "MoonSec finished without producing a .luac file."
+        lua_binary = get_lua_binary()
+        if not lua_binary:
+            return luac_path, None, "Lua 5.1 executable was not found."
+        decom_command = [
+            str(lua_binary),
+            str(DECOM_PATH),
+            str(luac_path),
+            str(output_path),
+        ]
+        decom_code, decom_stdout, decom_stderr = await asyncio.to_thread(
+            run_deobf_process,
+            decom_command,
+        )
+        if decom_code != 0 and not output_path.exists():
+            error = decom_stderr.strip() or decom_stdout.strip() or "Decompiler failed."
+            return luac_path, None, f"Decompiler error:\n{error}"
+        if not output_path.exists():
+            return luac_path, None, "Decompiler did not produce an output file."
+        return luac_path, output_path, None
+    except Exception as error:
+        return None, None, str(error)
+
+
+def create_pastefy_sync(title, content):
+    if not PASTEFY_API_TOKEN:
+        raise RuntimeError("PASTEFY_API_TOKEN is not configured.")
+    payload = {
+        "title": title,
+        "content": content,
+        "visibility": "UNLISTED",
+        "encrypted": False,
+        "type": "PASTE",
+    }
+    request = urllib.request.Request(
+        "https://pastefy.app/api/v2/paste",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": PASTEFY_API_TOKEN,
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Pastefy returned HTTP {error.code}: {detail[:500]}")
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Pastefy connection failed: {error.reason}")
+    paste = result.get("paste", result)
+    raw_url = paste.get("raw_url")
+    paste_id = paste.get("id")
+    if not raw_url and paste_id:
+        raw_url = f"https://pastefy.app/{paste_id}/raw"
+    if not raw_url:
+        raise RuntimeError("Pastefy did not return a raw URL.")
+    return raw_url
+
+
+class DeobfResultView(discord.ui.LayoutView):
+    def __init__(self, filename, paste_url):
+        super().__init__(timeout=None)
+        self.filename = filename
+        self.paste_url = paste_url
+        container = make_container(
+            make_text("## Deobfuscation Complete"),
+            make_separator(),
+            make_text(f"**File:** `{filename}`\nThe decompiled Lua file is attached below. You can also view the result directly through Pastefy."),
+            accent_color=0x5865F2,
+        )
+        self.add_item(container)
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(label="View Raw Result", style=discord.ButtonStyle.link, url=paste_url, emoji="🔗"))
+        self.add_item(row)
+
+
 
 ANTI_SCAM_TITLE = "## 🛡️ Anti-Scam Protection"
 ANTI_SCAM_BODY = (
@@ -831,6 +1020,107 @@ reaction_group = app_commands.Group(
 )
 
 
+@bot.command(name="deobf")
+@commands.cooldown(1, 10, commands.BucketType.user)
+async def deobf(ctx, url=None):
+    configuration_errors = validate_deobf_configuration()
+    if configuration_errors:
+        await ctx.send(
+            "```text\n" + "\n".join(configuration_errors)[:1900] + "\n```"
+        )
+        return
+
+    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
+    if attachment is None and not url:
+        await ctx.send("Usage: `.deobf` with a `.lua` or `.txt` attachment, or `.deobf <direct-file-url>`.")
+        return
+
+    work_dir = Path(tempfile.mkdtemp(prefix="moonsec_input_"))
+    input_path = None
+    status = None
+    try:
+        if attachment:
+            source_name = Path(attachment.filename).name
+            extension = Path(source_name).suffix.lower()
+            if extension not in {".lua", ".txt"}:
+                await ctx.send("Only `.lua` and `.txt` files are supported.")
+                return
+            input_path = work_dir / source_name
+        else:
+            source_url = url.strip()
+            if not re.match(r"^https?://", source_url, re.IGNORECASE):
+                await ctx.send("The URL must be a valid HTTP or HTTPS raw-file URL.")
+                return
+            source_name = Path(source_url.split("?", 1)[0].split("#", 1)[0]).name or "input.lua"
+            if Path(source_name).suffix.lower() not in {".lua", ".txt"}:
+                source_name = "input.lua"
+            input_path = work_dir / source_name
+
+        status = await ctx.send("⏳ Processing your Lua file...")
+
+        if attachment:
+            await attachment.save(str(input_path))
+        else:
+            try:
+                await asyncio.to_thread(download_url_sync, source_url, input_path)
+            except Exception as error:
+                await status.edit(content=f"❌ Unable to download the supplied file: {error}")
+                return
+
+        _, output_path, error = await process_deobf_file(input_path)
+        if error:
+            await status.edit(content="❌ Deobfuscation failed.")
+            await ctx.send("```text\n" + error[:1900] + "\n```")
+            return
+
+        output_content = output_path.read_text(encoding="utf-8", errors="replace")
+        if not output_content.strip():
+            await status.edit(content="❌ The decompiler produced an empty result.")
+            return
+
+        try:
+            paste_url = await asyncio.to_thread(
+                create_pastefy_sync,
+                "Decompiled Lua",
+                output_content,
+            )
+        except Exception as error:
+            await status.edit(content="❌ Deobfuscation completed, but the Pastefy upload failed.")
+            await ctx.send("```text\n" + str(error)[:1900] + "\n```")
+            return
+
+        await status.delete()
+        result_file = discord.File(str(output_path), filename="decompiled.lua")
+        view = DeobfResultView("decompiled.lua", paste_url)
+        await ctx.send(view=view, file=result_file)
+
+    except discord.HTTPException as error:
+        try:
+            await ctx.send(f"❌ Discord error: {error}")
+        except Exception:
+            pass
+    except Exception as error:
+        try:
+            await ctx.send(f"❌ Unexpected error: {error}")
+        except Exception:
+            pass
+    finally:
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@deobf.error
+async def deobf_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"Please wait {error.retry_after:.1f} seconds before using `.deobf` again.")
+        return
+    await ctx.send(f"Command error: {error}")
+
+
 @anti_group.command(
     name="scam",
     description="Create an anti-scam protection channel",
@@ -1362,55 +1652,43 @@ async def on_message(message: discord.Message):
         return
 
     data = created_channels.get(message.channel.id)
-    if data is None:
-        return
-
-    member = message.author
-    if not isinstance(member, discord.Member):
-        return
-
-    if member.guild_permissions.administrator:
-        return
-
-    try:
-        await message.delete()
-    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-        pass
-
-    me = message.guild.me
-    kicked = False
-
-    if me is not None and me.guild_permissions.kick_members:
-        if member.top_role < me.top_role:
+    if data is not None:
+        member = message.author
+        if isinstance(member, discord.Member) and not member.guild_permissions.administrator:
             try:
-                await member.kick(reason="Message sent in anti-scam channel")
-                kicked = True
+                await message.delete()
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 pass
 
-    try:
-        record = await mongo_call(
-            increment_anti_scam_sync,
-            message.channel.id,
-            kicked,
-        )
-
-        if record:
-            data["view"].update_stats(
-                kicks=int(record.get("kicks", 0)),
-                violations=int(record.get("violations", 0)),
-            )
-
-            if data.get("message") is not None:
+            me = message.guild.me
+            kicked = False
+            if me is not None and me.guild_permissions.kick_members and member.top_role < me.top_role:
                 try:
-                    await data["message"].edit(view=data["view"])
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    await member.kick(reason="Message sent in anti-scam channel")
+                    kicked = True
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                     pass
-    except PyMongoError as error:
-        print(
-            f"MongoDB anti-scam update error for channel "
-            f"{message.channel.id}: {error}"
-        )
+
+            try:
+                record = await mongo_call(
+                    increment_anti_scam_sync,
+                    message.channel.id,
+                    kicked,
+                )
+                if record:
+                    data["view"].update_stats(
+                        kicks=int(record.get("kicks", 0)),
+                        violations=int(record.get("violations", 0)),
+                    )
+                    if data.get("message") is not None:
+                        try:
+                            await data["message"].edit(view=data["view"])
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            pass
+            except PyMongoError as error:
+                print(f"MongoDB anti-scam update error for channel {message.channel.id}: {error}")
+
+    await bot.process_commands(message)
 
 
 async def restore_anti_scam_channels():
