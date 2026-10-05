@@ -268,6 +268,7 @@ def _find_moon_binary():
 DOTNET_INSTALL_DIR = BASE_DIR / ".dotnet"
 DOTNET_INSTALL_SCRIPT = BASE_DIR / ".dotnet-install.sh"
 DOTNET_BOOTSTRAP_ERROR = None
+MOON_SETUP_STATUS = "Checking for the MoonSec engine..."
 
 
 def _check_dotnet(path):
@@ -281,7 +282,9 @@ def _check_dotnet(path):
 
 
 def _install_dotnet_sdk():
-    global DOTNET_BOOTSTRAP_ERROR
+    global DOTNET_BOOTSTRAP_ERROR, MOON_SETUP_STATUS
+    MOON_SETUP_STATUS = "Installing the .NET 9 SDK required by MoonSec..."
+    print(f"[DEOBF] {MOON_SETUP_STATUS}")
     DOTNET_BOOTSTRAP_ERROR = None
     DOTNET_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     local_dotnet = DOTNET_INSTALL_DIR / ("dotnet.exe" if platform.system() == "Windows" else "dotnet")
@@ -373,8 +376,10 @@ def _search_build_output(source_root):
 
 
 def bootstrap_moonsec():
-    global MOON_BOOTSTRAP_ERROR
+    global MOON_BOOTSTRAP_ERROR, MOON_SETUP_STATUS
     MOON_BOOTSTRAP_ERROR = None
+    MOON_SETUP_STATUS = "Checking for the MoonSec engine..."
+    print(f"[DEOBF] {MOON_SETUP_STATUS}")
     existing = _find_moon_binary()
     if existing:
         return existing
@@ -384,6 +389,8 @@ def bootstrap_moonsec():
         return None
     try:
         MOONSEC_BOOTSTRAP_DIR.mkdir(parents=True, exist_ok=True)
+        MOON_SETUP_STATUS = "Downloading the MoonSec deobfuscator source..."
+        print(f"[DEOBF] {MOON_SETUP_STATUS}")
         source_root = _find_project_root(MOONSEC_BOOTSTRAP_DIR)
         if source_root is None:
             clone_dir = MOONSEC_BOOTSTRAP_DIR / "source"
@@ -415,6 +422,8 @@ def bootstrap_moonsec():
             return None
         source_root = Path(source_root)
         project_file = source_root / "MoonsecDeobfuscator.csproj"
+        MOON_SETUP_STATUS = "Restoring MoonSec build dependencies..."
+        print(f"[DEOBF] {MOON_SETUP_STATUS}")
         restore = subprocess.run(
             [dotnet, "restore", str(project_file)],
             capture_output=True,
@@ -426,6 +435,8 @@ def bootstrap_moonsec():
             detail = (restore.stderr.strip() or restore.stdout.strip())
             MOON_BOOTSTRAP_ERROR = f".NET restore failed: {detail[-1200:] if detail else 'unknown restore error'}"
             return None
+        MOON_SETUP_STATUS = "Building the MoonSec engine. This can take several minutes on shared hosting..."
+        print(f"[DEOBF] {MOON_SETUP_STATUS}")
         build = subprocess.run(
             [dotnet, "build", str(project_file), "-c", "Release", "--no-restore"],
             capture_output=True,
@@ -437,6 +448,8 @@ def bootstrap_moonsec():
             detail = (build.stderr.strip() or build.stdout.strip())
             MOON_BOOTSTRAP_ERROR = f"MoonSec build failed: {detail[-1600:] if detail else 'unknown build error'}"
             return None
+        MOON_SETUP_STATUS = "Locating the completed MoonSec engine..."
+        print(f"[DEOBF] {MOON_SETUP_STATUS}")
         found = _search_build_output(source_root)
         if found:
             return found
@@ -581,6 +594,9 @@ def run_deobf_process(command, timeout=180, cwd=None):
 
 
 async def process_deobf_file(input_path):
+    global MOON_SETUP_STATUS
+    MOON_SETUP_STATUS = "Preparing your Lua file..."
+    print(f"[DEOBF] {MOON_SETUP_STATUS}")
     work_dir = Path(tempfile.mkdtemp(prefix="moonsec_"))
     try:
         moon_executable = await asyncio.to_thread(get_moon_executable, True)
@@ -588,6 +604,8 @@ async def process_deobf_file(input_path):
         lua_binary = get_lua_binary()
         if not moon_executable:
             return None, MOON_BOOTSTRAP_ERROR or "MoonSec executable was not found."
+        MOON_SETUP_STATUS = "MoonSec engine is ready. Running deobfuscation..."
+        print(f"[DEOBF] {MOON_SETUP_STATUS}")
         if not decompiler_script:
             return None, "Decompiler script was not found."
         if not lua_binary:
@@ -608,6 +626,8 @@ async def process_deobf_file(input_path):
             except OSError:
                 pass
             moon_command = [str(moon_executable), "-dev", "-i", str(source_path), "-o", str(luac_path)]
+        MOON_SETUP_STATUS = "Running MoonSec bytecode extraction..."
+        print(f"[DEOBF] {MOON_SETUP_STATUS}")
         moon_code, moon_stdout, moon_stderr = await asyncio.to_thread(
             run_deobf_process,
             moon_command,
@@ -620,6 +640,8 @@ async def process_deobf_file(input_path):
         if not luac_path.exists():
             return None, "MoonSec finished without producing a .luac file."
         decom_command = [str(lua_binary), str(decompiler_script), str(luac_path), str(output_path)]
+        MOON_SETUP_STATUS = "Decompiling the extracted Lua 5.1 bytecode..."
+        print(f"[DEOBF] {MOON_SETUP_STATUS}")
         decom_code, decom_stdout, decom_stderr = await asyncio.to_thread(
             run_deobf_process,
             decom_command,
@@ -1542,7 +1564,18 @@ async def deobf(ctx, url=None):
                 await status.edit(content=f"❌ Unable to download the supplied file: {error}")
                 return
 
-        output_content, error = await process_deobf_file(input_path)
+        process_task = asyncio.create_task(process_deobf_file(input_path))
+        elapsed = 0
+        while not process_task.done():
+            await asyncio.sleep(15)
+            elapsed += 15
+            if process_task.done():
+                break
+            try:
+                await status.edit(content=f"⏳ {MOON_SETUP_STATUS}\nElapsed: `{elapsed}s`")
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        output_content, error = await process_task
         if error:
             await status.edit(content="❌ Deobfuscation failed.")
             await ctx.send("```text\n" + error[:1900] + "\n```")
