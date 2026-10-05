@@ -2,10 +2,18 @@ import os
 import asyncio
 import json
 import re
+import hashlib
+import io
+import ipaddress
+import shutil
+import subprocess
+import tempfile
 import secrets
+import socket
 import string
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -496,6 +504,588 @@ async def pastefy_command(ctx: commands.Context):
         await status.edit(content=None, view=PastefyResultView(filename, raw_url))
     except Exception as error:
         await status.edit(content=f"Pastefy upload failed: {error}")
+
+
+LUA_PROCESS_MAX_BYTES = 2 * 1024 * 1024
+LUA_TOOL_TIMEOUT = 90
+LUADEC_EXECUTABLE = os.getenv("LUADEC_EXECUTABLE")
+UNLUAC_JAR = os.getenv("UNLUAC_JAR")
+JAVA_EXECUTABLE = os.getenv("JAVA_EXECUTABLE")
+
+
+def resolve_executable(configured, candidates):
+    checked = []
+    if configured:
+        checked.append(configured)
+    checked.extend(candidates)
+    for value in checked:
+        if not value:
+            continue
+        if os.path.isabs(value) and os.path.isfile(value) and os.access(value, os.X_OK):
+            return value
+        resolved = shutil.which(value)
+        if resolved:
+            return resolved
+    return None
+
+
+def find_luadec():
+    return resolve_executable(
+        LUADEC_EXECUTABLE,
+        [
+            "/home/container/luadec",
+            "/home/container/bin/luadec",
+            "/home/container/bin/luadec51",
+            "luadec",
+            "luadec51",
+        ],
+    )
+
+
+def find_java():
+    return resolve_executable(
+        JAVA_EXECUTABLE,
+        ["/usr/bin/java", "/usr/local/bin/java", "java"],
+    )
+
+
+def is_lua_bytecode(data):
+    return data.startswith(b"\x1bLua")
+
+
+def decode_lua_string_literal(value):
+    if len(value) < 2 or value[0] not in {'"', "'"} or value[-1] != value[0]:
+        return None
+    body = value[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        i += 1
+        if i >= len(body):
+            return None
+        esc = body[i]
+        simple = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, "\\": 92, '"': 34, "'": 39}
+        if esc in simple:
+            out.append(simple[esc])
+            i += 1
+            continue
+        if esc.isdigit():
+            j = i
+            while j < len(body) and j < i + 3 and body[j].isdigit():
+                j += 1
+            number = int(body[i:j], 10)
+            if number > 255:
+                return None
+            out.append(number)
+            i = j
+            continue
+        if esc == "z":
+            i += 1
+            while i < len(body) and body[i].isspace():
+                i += 1
+            continue
+        out.extend(esc.encode("utf-8"))
+        i += 1
+    return bytes(out)
+
+
+def lua_quote_bytes(value):
+    text = value.decode("utf-8", errors="replace")
+    text = text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
+    return f'"{text}"'
+
+
+def static_deobfuscate_lua(source):
+    result = source.lstrip("\ufeff")
+    for _ in range(5):
+        previous = result
+
+        def replace_string_char(match):
+            args = match.group(1)
+            parts = [part.strip() for part in args.split(",") if part.strip()]
+            if not parts or any(not re.fullmatch(r"-?\d+", part) for part in parts):
+                return match.group(0)
+            values = [int(part) for part in parts]
+            if any(value < 0 or value > 255 for value in values):
+                return match.group(0)
+            return lua_quote_bytes(bytes(values))
+
+        result = re.sub(r"string\.char\s*\(([^()]*?)\)", replace_string_char, result, flags=re.DOTALL)
+
+        def replace_reverse(match):
+            decoded = decode_lua_string_literal(match.group(1))
+            if decoded is None:
+                return match.group(0)
+            return lua_quote_bytes(decoded[::-1])
+
+        result = re.sub(r"string\.reverse\s*(([\"'][^\"']*[\"']))", replace_reverse, result)
+
+        def replace_rep(match):
+            literal = decode_lua_string_literal(match.group(1))
+            count = int(match.group(2))
+            if literal is None or count < 0 or count > 10000:
+                return match.group(0)
+            value = literal * count
+            if len(value) > 100000:
+                return match.group(0)
+            return lua_quote_bytes(value)
+
+        result = re.sub(r"string\.rep\s*(([\"'][^\"']*[\"']))\s*,\s*(\d+)", replace_rep, result)
+        if result == previous:
+            break
+
+    return result
+
+
+def printable_strings(data, minimum=4):
+    strings = []
+    current = bytearray()
+    for byte in data:
+        if 32 <= byte <= 126 or byte in (9,):
+            current.append(byte)
+        else:
+            if len(current) >= minimum:
+                strings.append(current.decode("ascii", errors="replace"))
+            current.clear()
+    if len(current) >= minimum:
+        strings.append(current.decode("ascii", errors="replace"))
+    return strings
+
+
+def make_static_dump(filename, data):
+    digest = hashlib.sha256(data).hexdigest()
+    kind = "Lua 5.x bytecode" if is_lua_bytecode(data) else "Lua/source text"
+    strings = printable_strings(data)
+    lines = [
+        "LUA STATIC DUMP",
+        "================",
+        f"File: {filename}",
+        f"Size: {len(data):,} bytes",
+        f"Format: {kind}",
+        f"SHA-256: {digest}",
+        "",
+        f"Printable strings ({len(strings):,}):",
+    ]
+    lines.extend(f"[{index:04d}] {value}" for index, value in enumerate(strings[:5000], 1))
+    if len(strings) > 5000:
+        lines.append(f"... {len(strings) - 5000:,} additional strings omitted ...")
+    return "\n".join(lines) + "\n"
+
+
+def run_luadec(data, mode, workdir, filename):
+    luadec = find_luadec()
+    if not luadec:
+        return None, "LuaDec is not installed. Set LUADEC_EXECUTABLE to the LuaDec binary path."
+    input_path = os.path.join(workdir, filename)
+    with open(input_path, "wb") as handle:
+        handle.write(data)
+    command = [luadec]
+    if mode == "dump":
+        command.append("-dis")
+    command.append(input_path)
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=LUA_TOOL_TIMEOUT,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired as error:
+        return None, f"LuaDec timed out after {LUA_TOOL_TIMEOUT} seconds."
+    except OSError as error:
+        return None, f"Could not start LuaDec: {error}"
+    output = completed.stdout or ""
+    if completed.returncode != 0:
+        return None, f"LuaDec exited with code {completed.returncode}.\n{output[-4000:]}"
+    if not output.strip():
+        return None, "LuaDec returned an empty result."
+    return output, None
+
+
+def run_unluac(data, workdir, filename):
+    jar = UNLUAC_JAR
+    if not jar or not os.path.isfile(jar):
+        return None, "unluac.jar is not configured. Set UNLUAC_JAR to a downloaded unluac JAR."
+    java = find_java()
+    if not java:
+        return None, "Java was not found for unluac."
+    input_path = os.path.join(workdir, filename)
+    with open(input_path, "wb") as handle:
+        handle.write(data)
+    try:
+        completed = subprocess.run(
+            [java, "-jar", jar, input_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=LUA_TOOL_TIMEOUT,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"unluac timed out after {LUA_TOOL_TIMEOUT} seconds."
+    except OSError as error:
+        return None, f"Could not start unluac: {error}"
+    output = completed.stdout or ""
+    if completed.returncode != 0:
+        return None, f"unluac exited with code {completed.returncode}.\n{output[-4000:]}"
+    if not output.strip():
+        return None, "unluac returned an empty result."
+    return output, None
+
+
+def process_lua_upload(filename, data, mode, workdir):
+    if mode == "dump":
+        if is_lua_bytecode(data):
+            result, error = run_luadec(data, "dump", workdir, filename)
+            if result is not None:
+                return result, "dump.txt", "LuaDec bytecode disassembly"
+        return make_static_dump(filename, data), "dump.txt", "Static Lua dump"
+
+    if is_lua_bytecode(data):
+        result, error = run_unluac(data, workdir, filename)
+        if result is None:
+            result, error = run_luadec(data, "deobf", workdir, filename)
+        if result is None:
+            raise RuntimeError(error or "No Lua bytecode decompiler is available. Set UNLUAC_JAR or LUADEC_EXECUTABLE.")
+        return result, "deobfuscated.lua", "Lua bytecode decompilation"
+
+    result = static_deobfuscate_lua(data.decode("utf-8-sig", errors="replace"))
+    return result, "deobfuscated.lua", "Static Lua deobfuscation"
+
+
+class LuaToolView(discord.ui.LayoutView):
+    def __init__(self, ctx, filename, data):
+        super().__init__(timeout=900)
+        self.ctx = ctx
+        self.filename = filename
+        self.data = data
+        self.busy = False
+        self.message = None
+        self.dump_button = discord.ui.Button(label="Dump Lua", style=discord.ButtonStyle.secondary, emoji="🔎")
+        self.deobf_button = discord.ui.Button(label="Deobfuscate Lua", style=discord.ButtonStyle.primary, emoji="🧹")
+        self.cancel_button = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✕")
+
+        async def run_dump(interaction):
+            await self.run(interaction, "dump")
+
+        async def run_deobf(interaction):
+            await self.run(interaction, "deobf")
+
+        async def cancel(interaction):
+            self.stop()
+            await interaction.response.edit_message(content="Lua processing cancelled.", view=None)
+            self.cleanup()
+
+        self.dump_button.callback = run_dump
+        self.deobf_button.callback = run_deobf
+        self.cancel_button.callback = cancel
+        self.add_item(
+            make_container(
+                make_text("## 🧰 Lua Toolkit"),
+                make_text(
+                    f"**File:** `{discord.utils.escape_markdown(self.filename)}`\n"
+                    f"**Size:** `{len(self.data):,} bytes`\n\n"
+                    "Choose a static dump or deobfuscation pass. Uploaded Lua is never executed by the bot."
+                ),
+                make_separator(),
+                discord.ui.ActionRow(self.dump_button, self.deobf_button, self.cancel_button),
+            )
+        )
+
+    def cleanup(self):
+        try:
+            for name in os.listdir(self.workdir):
+                path = os.path.join(self.workdir, name)
+                if os.path.isfile(path):
+                    os.remove(path)
+        except Exception:
+            pass
+        try:
+            os.rmdir(self.workdir)
+        except Exception:
+            pass
+
+    async def run(self, interaction, mode):
+        if self.busy:
+            await interaction.response.send_message("A Lua job is already running for this upload.", ephemeral=True)
+            return
+        self.busy = True
+        self.dump_button.disabled = True
+        self.deobf_button.disabled = True
+        self.cancel_button.disabled = True
+        await interaction.response.edit_message(
+            content=None,
+            view=LuaProcessingView(self.filename, "Dumping and analyzing..." if mode == "dump" else "Deobfuscating and analyzing..."),
+        )
+        try:
+            result, output_name, method = await asyncio.to_thread(
+                process_lua_upload,
+                self.filename,
+                self.data,
+                mode,
+                self.workdir,
+            )
+            if len(result.encode("utf-8")) > PASTEFY_MAX_BYTES:
+                result = result[:PASTEFY_MAX_BYTES]
+                method += " · output truncated to 5 MB"
+            raw_url = None
+            if PASTEFY_API_TOKEN:
+                try:
+                    raw_url = await asyncio.to_thread(
+                        create_pastefy_paste_sync,
+                        output_name,
+                        result,
+                        PASTEFY_API_TOKEN,
+                    )
+                except Exception:
+                    raw_url = None
+            await interaction.edit_original_response(
+                content=None,
+                view=LuaResultView(self.filename, output_name, result, method, raw_url),
+                attachments=[discord.File(__import__("io").BytesIO(result.encode("utf-8")), filename=output_name)],
+            )
+            self.stop()
+            self.cleanup()
+        except Exception as error:
+            self.busy = False
+            self.dump_button.disabled = False
+            self.deobf_button.disabled = False
+            self.cancel_button.disabled = False
+            await interaction.edit_original_response(
+                content=f"Lua processing failed: {error}",
+                view=self,
+            )
+
+    async def on_timeout(self):
+        self.cleanup()
+        try:
+            if self.message is not None:
+                await self.message.edit(view=None)
+        except Exception:
+            pass
+
+
+class LuaProcessingView(discord.ui.LayoutView):
+    def __init__(self, filename, status):
+        super().__init__(timeout=None)
+        self.add_item(
+            make_container(
+                make_text("## ⚙️ Lua Toolkit"),
+                make_text(f"**File:** `{discord.utils.escape_markdown(filename)}`\n{status}"),
+            )
+        )
+
+
+class LuaResultView(discord.ui.LayoutView):
+    def __init__(self, source_name, output_name, result, method, raw_url):
+        super().__init__(timeout=900)
+        self.source_name = source_name
+        self.output_name = output_name
+        self.result = result
+        self.raw_url = raw_url
+        self.download_button = discord.ui.Button(
+            label="Download",
+            style=discord.ButtonStyle.success,
+            emoji="⬇️",
+        )
+        self.download_button.callback = self.download_result
+        buttons = []
+        if self.raw_url:
+            buttons.append(
+                discord.ui.Button(
+                    label="View Raw",
+                    style=discord.ButtonStyle.link,
+                    emoji="🔗",
+                    url=self.raw_url,
+                )
+            )
+        buttons.append(self.download_button)
+        self.add_item(
+            make_container(
+                make_text("## ✅ Lua Result"),
+                make_text(
+                    f"**Input:** `{discord.utils.escape_markdown(source_name)}`\n"
+                    f"**Output:** `{discord.utils.escape_markdown(output_name)}`\n"
+                    f"**Method:** `{discord.utils.escape_markdown(method)}`\n"
+                    f"**Output size:** `{len(result.encode('utf-8')):,} bytes`"
+                ),
+                make_separator(),
+                make_text(
+                    f"**Raw result:** {raw_url}"
+                    if raw_url
+                    else "**Raw result:** Pastefy is not configured or the upload failed. Use Download below for the complete result."
+                ),
+                make_separator(),
+                discord.ui.ActionRow(*buttons),
+            )
+        )
+
+    async def download_result(self, interaction):
+        self.download_button.disabled = True
+        await interaction.response.edit_message(view=self)
+        try:
+            await interaction.followup.send(
+                file=discord.File(io.BytesIO(self.result.encode("utf-8")), filename=self.output_name),
+                ephemeral=True,
+            )
+        except discord.HTTPException as error:
+            await interaction.followup.send(f"Download failed: {error}", ephemeral=True)
+        finally:
+            self.download_button.disabled = False
+            try:
+                await interaction.edit_original_response(view=self)
+            except discord.HTTPException:
+                pass
+
+    async def on_timeout(self):
+        self.stop()
+
+
+def is_public_http_url(value):
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme.lower() == "https" else 80), type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError, ValueError):
+        return False
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address[4][0])
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return False
+    return True
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_public_http_url(newurl):
+            raise urllib.error.URLError("Redirect target is not a public HTTP(S) URL.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_remote_lua_sync(url):
+    if not is_public_http_url(url):
+        raise RuntimeError("The raw link must be a public HTTP(S) URL.")
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/plain,text/*;q=0.9,*/*;q=0.1",
+            "User-Agent": "PanelBot/1.0",
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(SafeRedirectHandler)
+    try:
+        with opener.open(request, timeout=20) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > LUA_PROCESS_MAX_BYTES:
+                        raise RuntimeError("That raw file is too large. The maximum size is 2 MB.")
+                except ValueError:
+                    pass
+            chunks = []
+            total = 0
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > LUA_PROCESS_MAX_BYTES:
+                    raise RuntimeError("That raw file is too large. The maximum size is 2 MB.")
+                chunks.append(chunk)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"The raw link returned HTTP {error.code}.") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Could not fetch the raw link: {error.reason}") from error
+    data = b"".join(chunks)
+    if not data:
+        raise RuntimeError("The raw file is empty.")
+    try:
+        data.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("The raw link must contain a UTF-8 Lua or TXT file.") from error
+    path_name = os.path.basename(urlparse(url).path)
+    if path_name.lower().endswith((".lua", ".txt")):
+        filename = path_name
+    else:
+        filename = "remote.lua"
+    return filename, data
+
+
+@bot.command(name="l")
+async def lua_tool_command(ctx: commands.Context, source: str = None):
+    attachments = list(ctx.message.attachments)
+    if len(attachments) > 1:
+        await ctx.send("Use exactly one `.lua` or `.txt` attachment, or provide one raw HTTP(S) link.")
+        return
+    if attachments and source:
+        await ctx.send("Use either one `.lua`/`.txt` attachment or one raw HTTP(S) link, not both.")
+        return
+    if not attachments and not source:
+        await ctx.send("Usage: `.l` with a `.lua` or `.txt` attachment, or `.l <raw link>`.")
+        return
+
+    filename = None
+    data = None
+    if source:
+        source = source.strip()
+        status = await ctx.send("⏳ Fetching the raw Lua/TXT file...")
+        try:
+            filename, data = await asyncio.to_thread(fetch_remote_lua_sync, source)
+        except Exception as error:
+            await status.edit(content=f"Could not fetch the raw link: {error}")
+            return
+        await status.delete()
+    else:
+        attachment = attachments[0]
+        filename = os.path.basename(attachment.filename or "lua_input.lua")
+        extension = os.path.splitext(filename)[1].lower()
+        if extension not in {".lua", ".txt"}:
+            await ctx.send("Only `.lua` and `.txt` files are supported.")
+            return
+        if attachment.size is not None and attachment.size > LUA_PROCESS_MAX_BYTES:
+            await ctx.send("That file is too large. The maximum size is 2 MB.")
+            return
+        try:
+            data = await attachment.read()
+        except discord.HTTPException as error:
+            await ctx.send(f"I could not read that file: {error}")
+            return
+        if len(data) > LUA_PROCESS_MAX_BYTES:
+            await ctx.send("That file is too large. The maximum size is 2 MB.")
+            return
+        if not data:
+            await ctx.send("The uploaded file is empty.")
+            return
+        try:
+            data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            await ctx.send("The uploaded file must contain valid UTF-8 Lua or TXT text.")
+            return
+
+    view = LuaToolView(ctx, filename, data)
+    view.workdir = tempfile.mkdtemp(prefix="lua_tool_")
+    view.message = await ctx.send(content=None, view=view)
 
 
 class PurgeView(discord.ui.LayoutView):
