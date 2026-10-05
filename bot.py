@@ -822,59 +822,105 @@ def cap_result (text ):
 class LuaResultsView (discord .ui .LayoutView ):
     def __init__ (self ,filename ,dump_result ,dump_method ,deobf_result ,deobf_method ,deobf_name ,dump_raw ,deobf_raw ):
         super ().__init__ (timeout =900 )
-        self .dump_result =dump_result 
-        self .deobf_result =deobf_result 
-        self .deobf_name =deobf_name 
-        self .dump_raw =dump_raw 
-        self .deobf_raw =deobf_raw 
-        buttons =[]
+        self .dump_result =dump_result
+        self .deobf_result =deobf_result
+        self .deobf_name =deobf_name
+
+        self .dump_download =discord .ui .Button (
+        label ="Download Dump",
+        style =discord .ButtonStyle .secondary ,
+        emoji ="📄",
+        )
+        self .dump_download .callback =self .download_dump
+
+        self .deobf_download =discord .ui .Button (
+        label ="Download Deobf",
+        style =discord .ButtonStyle .success ,
+        emoji ="⬇️",
+        )
+        self .deobf_download .callback =self .download_deobf
+
+        dump_buttons =[]
         if dump_raw :
-            buttons .append (discord .ui .Button (label ="Raw Dump",style =discord .ButtonStyle .link ,emoji ="🔎",url =dump_raw ))
+            dump_buttons .append (
+            discord .ui .Button (
+            label ="View Raw Dump",
+            style =discord .ButtonStyle .link ,
+            emoji ="🔎",
+            url =dump_raw ,
+            )
+            )
+        dump_buttons .append (self .dump_download )
+
+        deobf_buttons =[]
         if deobf_raw :
-            buttons .append (discord .ui .Button (label ="Raw Deobfuscated",style =discord .ButtonStyle .link ,emoji ="🔗",url =deobf_raw ))
-        self .dump_button =discord .ui .Button (label ="Download Dump",style =discord .ButtonStyle .secondary ,emoji ="📄")
-        self .deobf_button =discord .ui .Button (label ="Download Result",style =discord .ButtonStyle .success ,emoji ="⬇️")
-        self .dump_button .callback =self .download_dump 
-        self .deobf_button .callback =self .download_deobf 
-        buttons .extend ([self .dump_button ,self .deobf_button ])
+            deobf_buttons .append (
+            discord .ui .Button (
+            label ="View Raw Deobf",
+            style =discord .ButtonStyle .link ,
+            emoji ="🔗",
+            url =deobf_raw ,
+            )
+            )
+        deobf_buttons .append (self .deobf_download )
+
+        input_name =discord .utils .escape_markdown (filename )
+        dump_name ="dump.txt"
+        deobf_file =discord .utils .escape_markdown (deobf_name )
+        dump_size =len (dump_result .encode ("utf-8"))
+        deobf_size =len (deobf_result .encode ("utf-8"))
+
         self .add_item (
         make_container (
-        make_text ("## ✅ Lua Toolkit Results"),
+        make_text ("### 📜 Done Dumped & Deobf"),
+        make_text (f"`{input_name }` was processed successfully."),
         make_separator (),
         make_text (
-        f"**Input:** `{discord .utils .escape_markdown (filename )}`\n"
-        f"**Dump:** `{discord .utils .escape_markdown (dump_method )}`\n"
-        f"**Deobfuscation:** `{discord .utils .escape_markdown (deobf_method )}`\n"
-        f"**Dump size:** `{len (dump_result .encode ('utf-8')):,} bytes`\n"
-        f"**Result size:** `{len (deobf_result .encode ('utf-8')):,} bytes`"
+        f"### 📦 Dump\n"
+        f"**Method:** `{discord .utils .escape_markdown (dump_method )}`\n"
+        f"**Output:** `{dump_name }` · `{dump_size :,} bytes`"
         ),
+        discord .ui .ActionRow (*dump_buttons ),
         make_separator (),
         make_text (
-        (f"**Raw Dump:** {dump_raw }\n"if dump_raw else "**Raw Dump:** unavailable\n")
-        +(f"**Raw Deobfuscated:** {deobf_raw }"if deobf_raw else "**Raw Deobfuscated:** unavailable")
+        f"### 🧹 Deobf\n"
+        f"**Method:** `{discord .utils .escape_markdown (deobf_method )}`\n"
+        f"**Output:** `{deobf_file }` · `{deobf_size :,} bytes`"
         ),
-        make_separator (),
-        discord .ui .ActionRow (*buttons ),
+        discord .ui .ActionRow (*deobf_buttons ),
+        accent_color =0x5865F2 ,
         )
         )
 
     async def download_dump (self ,interaction ):
         try :
             await interaction .response .send_message (
-            file =discord .File (io .BytesIO (self .dump_result .encode ("utf-8")),filename ="dump.txt"),
+            file =discord .File (
+            io .BytesIO (self .dump_result .encode ("utf-8")),
+            filename ="dump.txt",
+            ),
             ephemeral =True ,
             )
         except discord .HTTPException as error :
-            await interaction .response .send_message (f"Download failed: {error }",ephemeral =True )
+            await interaction .response .send_message (
+            f"Download failed: {error }",
+            ephemeral =True ,
+            )
 
     async def download_deobf (self ,interaction ):
         try :
             await interaction .response .send_message (
-            file =discord .File (io .BytesIO (self .deobf_result .encode ("utf-8")),filename =self .deobf_name ),
+            file =discord .File (
+            io .BytesIO (self .deobf_result .encode ("utf-8")),
+            filename =self .deobf_name ,
+            ),
             ephemeral =True ,
             )
         except discord .HTTPException as error :
-            await interaction .response .send_message (f"Download failed: {error }",ephemeral =True )
+            await interaction .response .send_message (
+            f"Download failed: {error }",
+            ephemeral =True ,
+            )
 
     async def on_timeout (self ):
         self .stop ()
