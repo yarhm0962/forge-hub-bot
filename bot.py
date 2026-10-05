@@ -56,6 +56,7 @@ anti_scam_collection =mongo_db ["anti_scam_channels"]
 reaction_roles_collection =mongo_db ["reaction_roles"]
 member_snapshots_collection =mongo_db ["member_snapshots"]
 sae_notifiers_collection =mongo_db ["sae_notifiers"]
+sae_snapshots_collection =mongo_db ["sae_snapshots"]
 
 intents =discord .Intents .default ()
 intents .guilds =True 
@@ -307,6 +308,27 @@ def delete_sae_notifier_sync (guild_id ):
 
 def list_sae_notifiers_sync ():
     return list (sae_notifiers_collection .find ({ }))
+
+
+def save_sae_snapshot_sync (guild_id ,filename ,data_text ):
+    sae_snapshots_collection .replace_one (
+    {"_id":int (guild_id )},
+    {
+    "_id":int (guild_id ),
+    "filename":str (filename ),
+    "data":str (data_text ),
+    "updated_at":iso_now (),
+    },
+    upsert =True ,
+    )
+
+
+def get_sae_snapshot_sync (guild_id ):
+    return sae_snapshots_collection .find_one ({"_id":int (guild_id )})
+
+
+def delete_sae_snapshot_sync (guild_id ):
+    sae_snapshots_collection .delete_one ({"_id":int (guild_id )})
 
 
 def make_container (*items ,accent_color =None ):
@@ -1393,27 +1415,60 @@ def sae_egg_id(egg ):
     return hashlib .sha256 (raw .encode ("utf-8")).hexdigest ()
 
 
-def sae_load_snapshot_sync(path_value ):
-    path =Path (path_value )
-    try :
-        text_value =path .read_text (encoding ="utf-8-sig")
-    except FileNotFoundError :
-        return None ,f"Snapshot file not found: `{path }`"
-    except OSError as error :
-        return None ,f"Could not read the snapshot file: {error }"
-    try :
-        return json .loads (text_value ),None
-    except json .JSONDecodeError as error :
-        return None ,f"Snapshot JSON is invalid at line {error .lineno }, column {error .colno }."
+def sae_snapshot_candidates(path_value ):
+    raw =sae_clean_text (path_value )or SAE_SNAPSHOT_FILE
+    configured =Path (raw ).expanduser ()
+    candidates =[configured ]
+    if not configured .is_absolute ():
+        base =Path (__file__).resolve ().parent
+        candidates .append (base /configured )
+        candidates .append (Path ("/home/container")/configured )
+        candidates .append (Path ("/home/container/data")/configured )
+    unique =[]
+    seen =set ()
+    for candidate in candidates :
+        value =str (candidate )
+        if value not in seen :
+            seen .add (value )
+            unique .append (candidate )
+    return unique
 
 
-def sae_scan_snapshot_sync(path_value ):
-    snapshot ,error =sae_load_snapshot_sync (path_value )
+def sae_load_snapshot_sync(path_value ,embedded_text =None ):
+    if embedded_text :
+        try :
+            return json .loads (embedded_text ),None
+        except json .JSONDecodeError as error :
+            return None ,f"Stored snapshot JSON is invalid at line {error .lineno }, column {error .colno }."
+    env_json =os .getenv ("SAE_SNAPSHOT_JSON")
+    if env_json :
+        try :
+            return json .loads (env_json ),None
+        except json .JSONDecodeError as error :
+            return None ,f"SAE_SNAPSHOT_JSON is invalid at line {error .lineno }, column {error .colno }."
+    last_error =None
+    for path in sae_snapshot_candidates (path_value ):
+        try :
+            text_value =path .read_text (encoding ="utf-8-sig")
+        except FileNotFoundError :
+            last_error =f"Snapshot file not found: `{path }`"
+            continue
+        except OSError as error :
+            last_error =f"Could not read the snapshot file: {error }"
+            continue
+        try :
+            return json .loads (text_value ),None
+        except json .JSONDecodeError as error :
+            return None ,f"Snapshot JSON is invalid at line {error .lineno }, column {error .colno }."
+    return None ,last_error or f"Snapshot file not found: `{SAE_SNAPSHOT_FILE}`"
+
+
+def sae_scan_snapshot_sync(path_value ,embedded_text =None ):
+    snapshot ,error =sae_load_snapshot_sync (path_value ,embedded_text )
     if error :
-        return [],error 
+        return [],error
     eggs =sae_extract_eggs (snapshot )
-    return sae_best_eggs (eggs ),None 
-
+    return sae_best_eggs (eggs ),None
 
 def sae_escape(value ,limit =160 ):
     return discord .utils .escape_markdown (sae_clean_text (value ))[:limit]
@@ -1536,9 +1591,17 @@ class BreakSAENotifierView(discord.ui.LayoutView):
         if not isinstance(channel,discord.TextChannel):
             await interaction.followup.send("The configured notifier channel is no longer available.",ephemeral=True)
             return
-        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE))
+        stored_snapshot=await mongo_call(get_sae_snapshot_sync,self.guild_id)
+        embedded_text=stored_snapshot.get("data") if isinstance(stored_snapshot,dict) else None
+        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE),embedded_text)
         if error:
-            await interaction.followup.send(error,ephemeral=True)
+            message=(
+            "❌ **No workspace snapshot is available.**\n"
+            "Use `/break` again and attach your `workspace_snapshot.json`, or configure `SAE_SNAPSHOT_FILE`/`SAE_SNAPSHOT_JSON`."
+            if "Snapshot file not found" in error
+            else error
+            )
+            await interaction.followup.send(message,ephemeral=True)
             return
         if not best:
             await interaction.followup.send("No valid egg with a recognized rarity was found in the current snapshot.",ephemeral=True)
@@ -1604,7 +1667,9 @@ async def sae_notifier_loop(guild_id):
         if not isinstance(channel,discord.TextChannel):
             await asyncio.sleep(max(SAE_SCAN_INTERVAL,5.0))
             continue
-        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE))
+        stored_snapshot=await mongo_call(get_sae_snapshot_sync,guild_id)
+        embedded_text=stored_snapshot.get("data") if isinstance(stored_snapshot,dict) else None
+        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE),embedded_text)
         if error:
             await asyncio.sleep(SAE_SCAN_INTERVAL)
             continue
@@ -2557,8 +2622,8 @@ async def commands_list_command(ctx:commands.Context):
 
 
 @bot.tree.command(name="break",description="Open the BREAK and SAE best-rarity egg notifier")
-@app_commands.describe(channel="Channel where best-rarity notifications will be sent")
-async def break_sae_notifier(interaction:discord.Interaction,channel:discord.TextChannel|None=None):
+@app_commands.describe(channel="Channel where best-rarity notifications will be sent",snapshot="Optional workspace_snapshot.json file to store for the notifier")
+async def break_sae_notifier(interaction:discord.Interaction,channel:discord.TextChannel|None=None,snapshot:discord.Attachment|None=None):
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used inside a server.",ephemeral=True)
         return
@@ -2588,7 +2653,36 @@ async def break_sae_notifier(interaction:discord.Interaction,channel:discord.Tex
         record["enabled"]=True
         record["snapshot_file"]=record.get("snapshot_file")or SAE_SNAPSHOT_FILE
         record["updated_at"]=iso_now()
-    best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE))
+    if snapshot is not None:
+        snapshot_name=os.path.basename(snapshot.filename or "workspace_snapshot.json")
+        if not snapshot_name.lower().endswith(".json"):
+            await interaction.followup.send("The snapshot attachment must be a `.json` file.",ephemeral=True)
+            return
+        if snapshot.size is not None and snapshot.size>8*1024*1024:
+            await interaction.followup.send("The snapshot file is too large. The maximum size is 8 MB.",ephemeral=True)
+            return
+        try:
+            snapshot_bytes=await snapshot.read()
+            if len(snapshot_bytes)>8*1024*1024:
+                await interaction.followup.send("The snapshot file is too large. The maximum size is 8 MB.",ephemeral=True)
+                return
+            snapshot_text=snapshot_bytes.decode("utf-8-sig")
+            json.loads(snapshot_text)
+        except UnicodeDecodeError:
+            await interaction.followup.send("The snapshot file must be valid UTF-8 JSON.",ephemeral=True)
+            return
+        except json.JSONDecodeError as error:
+            await interaction.followup.send(f"The snapshot JSON is invalid at line {error.lineno}, column {error.colno}.",ephemeral=True)
+            return
+        except discord.HTTPException as error:
+            await interaction.followup.send(f"Could not read the snapshot attachment: {error}",ephemeral=True)
+            return
+        await mongo_call(save_sae_snapshot_sync,interaction.guild.id,snapshot_name,snapshot_text)
+        record["snapshot_file"]=snapshot_name
+        record["snapshot_source"]="MongoDB upload"
+    stored_snapshot=await mongo_call(get_sae_snapshot_sync,interaction.guild.id)
+    embedded_text=stored_snapshot.get("data") if isinstance(stored_snapshot,dict) else None
+    best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE),embedded_text)
     view=make_sae_panel_view(interaction.guild.id,record)
     existing=None
     if record.get("message_id"):
