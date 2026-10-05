@@ -16,6 +16,7 @@ import urllib .error
 import urllib .request 
 from urllib .parse import urlparse 
 from datetime import datetime ,timedelta ,timezone 
+from pathlib import Path 
 
 import discord 
 from discord import app_commands 
@@ -28,6 +29,13 @@ MONGODB_URI =os .getenv ("MONGODB_URI")
 MONGODB_DATABASE =os .getenv ("MONGODB_DATABASE","PanelBot")
 PASTEFY_API_TOKEN =os .getenv ("PASTEFY_API_TOKEN")
 PASTEFY_MAX_BYTES =5 *1024 *1024 
+SAE_SNAPSHOT_FILE =os .getenv ("SAE_SNAPSHOT_FILE","workspace_snapshot.json")
+try :
+    SAE_SCAN_INTERVAL =float (os .getenv ("SAE_SCAN_INTERVAL","1.0"))
+except (TypeError ,ValueError ):
+    SAE_SCAN_INTERVAL =1.0 
+if SAE_SCAN_INTERVAL <0.25 :
+    SAE_SCAN_INTERVAL =0.25 
 
 if not TOKEN :
     raise RuntimeError ("DISCORD_TOKEN environment variable is missing")
@@ -47,6 +55,7 @@ insights_collection =mongo_db ["server_insights"]
 anti_scam_collection =mongo_db ["anti_scam_channels"]
 reaction_roles_collection =mongo_db ["reaction_roles"]
 member_snapshots_collection =mongo_db ["member_snapshots"]
+sae_notifiers_collection =mongo_db ["sae_notifiers"]
 
 intents =discord .Intents .default ()
 intents .guilds =True 
@@ -57,6 +66,9 @@ bot =commands .Bot (command_prefix =("!","."),intents =intents )
 
 created_channels ={}
 reaction_role_cache ={}
+sae_notifier_tasks ={}
+sae_notifier_views ={}
+sae_notifier_baselines ={}
 ready_once =False 
 
 ANTI_SCAM_TITLE ="## 🛡️ Anti-Scam Protection"
@@ -272,6 +284,29 @@ def list_reaction_roles_sync ():
 
 async def mongo_call (function ,*args ):
     return await asyncio .to_thread (function ,*args )
+
+
+def save_sae_notifier_sync (record ):
+    guild_id =int (record ["guild_id"])
+    data =dict (record )
+    data ["_id"] =guild_id
+    sae_notifiers_collection .replace_one (
+    {"_id":guild_id },
+    data ,
+    upsert =True ,
+    )
+
+
+def get_sae_notifier_sync (guild_id ):
+    return sae_notifiers_collection .find_one ({"_id":int (guild_id )})
+
+
+def delete_sae_notifier_sync (guild_id ):
+    sae_notifiers_collection .delete_one ({"_id":int (guild_id )})
+
+
+def list_sae_notifiers_sync ():
+    return list (sae_notifiers_collection .find ({ }))
 
 
 def make_container (*items ,accent_color =None ):
@@ -1228,6 +1263,432 @@ def obfuscate_lua_source(source):
     return output,features
 
 
+SAE_RARITY_ORDER ={
+    "Common":1,
+    "Uncommon":2,
+    "Rare":3,
+    "Epic":4,
+    "Legendary":5,
+    "Mythic":6,
+    "Divine":7,
+    "Secret":8,
+    "Exotic":9,
+    "Rainbow":10,
+}
+
+SAE_RARITY_COLORS ={
+    "Common":0xB8B8B8,
+    "Uncommon":0x55FF55,
+    "Rare":0x55AAFF,
+    "Epic":0xAA55FF,
+    "Legendary":0xFFAA00,
+    "Mythic":0xFF5555,
+    "Divine":0x55FFFF,
+    "Secret":0xFF55FF,
+    "Exotic":0xFFFF55,
+    "Rainbow":0xFFFFFF,
+}
+
+SAE_IMAGE_KEYS =(
+    "Image","ImageId","ImageID","Icon","IconId","Texture","TextureId",
+    "Thumbnail","ThumbnailUrl","ImageUrl",
+)
+
+SAE_RARITY_KEYS =("Rarity","RarityName","rarity","rarityName")
+SAE_NAME_KEYS =("Name","name","EggName","eggName")
+
+
+def sae_clean_text(value ):
+    if value is None :
+        return ""
+    if isinstance (value ,(str ,int ,float )):
+        return str (value ).strip ()
+    return ""
+
+
+def sae_get_value(data ,keys ):
+    if not isinstance (data ,dict ):
+        return ""
+    for key in keys :
+        if key in data :
+            value =sae_clean_text (data [key ])
+            if value :
+                return value 
+    return ""
+
+
+def sae_normalize_rarity(value ):
+    value =sae_clean_text (value )
+    if not value :
+        return ""
+    lowered =value .lower ()
+    for rarity in SAE_RARITY_ORDER :
+        if lowered ==rarity .lower ():
+            return rarity 
+    for rarity in SAE_RARITY_ORDER :
+        if rarity .lower ()in lowered :
+            return rarity 
+    return value 
+
+
+def sae_normalize_image(value ):
+    value =sae_clean_text (value )
+    if not value :
+        return ""
+    if value .startswith (("http://","https://")):
+        return value 
+    numeric ="".join (character for character in value if character .isdigit ())
+    if numeric :
+        return f"https://www.roblox.com/asset-thumbnail/image?assetId={numeric}&width=420&height=420&format=png"
+    return ""
+
+
+def sae_looks_like_egg(data ):
+    if not isinstance (data ,dict ):
+        return False
+    name =sae_get_value (data ,SAE_NAME_KEYS )
+    rarity =sae_get_value (data ,SAE_RARITY_KEYS )
+    if not name or not rarity :
+        return False
+    keys =" ".join (str (key ).lower ()for key in data .keys ())
+    return "egg"in name .lower ()or "egg"in keys 
+
+
+def sae_extract_eggs(data ,location ="workspace",output =None ):
+    if output is None :
+        output =[]
+    if isinstance (data ,dict ):
+        if sae_looks_like_egg (data ):
+            name =sae_get_value (data ,SAE_NAME_KEYS )
+            rarity =sae_normalize_rarity (sae_get_value (data ,SAE_RARITY_KEYS ))
+            image =""
+            for key in SAE_IMAGE_KEYS :
+                if key in data :
+                    image =sae_normalize_image (data [key ])
+                    if image :
+                        break 
+            output .append ({"name":name ,"rarity":rarity ,"image":image ,"location":location })
+        for key ,value in data .items ():
+            sae_extract_eggs (value ,f"{location }.{key }",output )
+    elif isinstance (data ,list ):
+        for index ,value in enumerate (data ):
+            sae_extract_eggs (value ,f"{location }[{index }]",output )
+    return output 
+
+
+def sae_rarity_rank(rarity ):
+    return SAE_RARITY_ORDER .get (rarity ,-1)
+
+
+def sae_best_eggs(eggs ):
+    valid =[egg for egg in eggs if egg .get ("name")and egg .get ("rarity")]
+    if not valid :
+        return []
+    highest =max (sae_rarity_rank (egg ["rarity"])for egg in valid )
+    return [egg for egg in valid if sae_rarity_rank (egg ["rarity"])==highest]
+
+
+def sae_egg_id(egg ):
+    raw =f'{egg ["location"]}|{egg ["name"]}|{egg ["rarity"]}|{egg ["image"]}'
+    return hashlib .sha256 (raw .encode ("utf-8")).hexdigest ()
+
+
+def sae_load_snapshot_sync(path_value ):
+    path =Path (path_value )
+    try :
+        text_value =path .read_text (encoding ="utf-8-sig")
+    except FileNotFoundError :
+        return None ,f"Snapshot file not found: `{path }`"
+    except OSError as error :
+        return None ,f"Could not read the snapshot file: {error }"
+    try :
+        return json .loads (text_value ),None
+    except json .JSONDecodeError as error :
+        return None ,f"Snapshot JSON is invalid at line {error .lineno }, column {error .colno }."
+
+
+def sae_scan_snapshot_sync(path_value ):
+    snapshot ,error =sae_load_snapshot_sync (path_value )
+    if error :
+        return [],error 
+    eggs =sae_extract_eggs (snapshot )
+    return sae_best_eggs (eggs ),None 
+
+
+def sae_escape(value ,limit =160 ):
+    return discord .utils .escape_markdown (sae_clean_text (value ))[:limit]
+
+
+def sae_notification_view(egg ,test =False ):
+    rarity =egg ["rarity"]
+    color =SAE_RARITY_COLORS .get (rarity ,0x5865F2 )
+    name =sae_escape (egg ["name"],200 )
+    location =sae_escape (egg .get ("location","workspace"),220 )
+    title ="### 🧪 Test — Best Rarity Detected"if test else "### 🚨 Best Rarity Egg Spawned"
+    subtitle ="Notifier test result from the current workspace snapshot."if test else "A new best-rarity egg was detected by the BREAK & SAE Notifier."
+    children =[
+        make_text (title ),
+        make_text (subtitle ),
+        make_separator (),
+    ]
+    text_block =make_text (
+        f"### ✨ {name}\n"
+        f"**Rarity:** `{sae_escape (rarity,80 )}`\n"
+        f"**Location:** `{location}`"
+    )
+    image =egg .get ("image")
+    if image :
+        section =discord .ui .Section (
+            text_block ,
+            accessory =discord .ui .Thumbnail (image ,description =f"{name} · {rarity}"),
+        )
+        children .append (section )
+    else :
+        children .append (text_block )
+        children .append (make_text ("🖼️ **Image:** `Not available in snapshot`"))
+    children .extend ([
+        make_separator (),
+        make_text ("🔔 **Best rarity only** · Lower-rarity eggs are ignored."),
+    ])
+    view =discord .ui .LayoutView (timeout =None )
+    view .add_item (make_container (*children ,accent_color =color ))
+    return view
+
+
+def sae_panel_status(record ):
+    enabled =bool (record .get ("enabled",False ))
+    status ="🟢 Active"if enabled else "🔴 Paused"
+    path_value =sae_escape (record .get ("snapshot_file",SAE_SNAPSHOT_FILE),160 )
+    channel_id =record .get ("channel_id")
+    channel_text =f"<#{int (channel_id )}>"if channel_id else "`Not configured`"
+    return (
+        f"**Status:** {status}\n"
+        f"**Notify Channel:** {channel_text}\n"
+        f"**Snapshot:** `{path_value}`\n"
+        f"**Scan Interval:** `{SAE_SCAN_INTERVAL:.2f}s`\n"
+        "**Filter:** `Best rarity only`"
+    )
+
+
+class BreakSAENotifierView(discord.ui.LayoutView):
+    def __init__(self,guild_id,record):
+        super().__init__(timeout=None)
+        self.guild_id=int(guild_id)
+        self.record=dict(record)
+        self.refresh_button=discord.ui.Button(label="Refresh",style=discord.ButtonStyle.secondary,emoji="🔄",custom_id=f"sae_refresh:{self.guild_id}")
+        self.test_button=discord.ui.Button(label="Test Best",style=discord.ButtonStyle.primary,emoji="🧪",custom_id=f"sae_test:{self.guild_id}")
+        self.start_button=discord.ui.Button(label="Enable",style=discord.ButtonStyle.success,emoji="▶️",custom_id=f"sae_enable:{self.guild_id}")
+        self.stop_button=discord.ui.Button(label="Pause",style=discord.ButtonStyle.danger,emoji="⏸️",custom_id=f"sae_pause:{self.guild_id}")
+        self.refresh_button.callback=self.refresh_callback
+        self.test_button.callback=self.test_callback
+        self.start_button.callback=self.start_callback
+        self.stop_button.callback=self.stop_callback
+        self.render()
+
+    def render(self):
+        self.clear_items()
+        enabled=bool(self.record.get("enabled",False))
+        self.start_button.disabled=enabled
+        self.stop_button.disabled=not enabled
+        self.add_item(make_container(
+            make_text("## 🚨 BREAK & SAE Notifier"),
+            make_text("Live workspace watcher for the highest rarity egg. The scanner follows the snapshot structure you provided and ignores lower rarities."),
+            make_separator(),
+            make_text("### 📡 Notifier Status"),
+            make_text(sae_panel_status(self.record)),
+            make_separator(),
+            make_text("### 🧪 Controls"),
+            discord.ui.ActionRow(self.refresh_button,self.test_button,self.start_button,self.stop_button),
+            make_separator(),
+            make_text("**Test Best** reads the current snapshot and posts the highest-rarity egg with its name, rarity, location, and image when available."),
+            accent_color=0x5865F2,
+        ))
+
+    async def authorized(self,interaction):
+        if interaction.guild is None or interaction.guild.id!=self.guild_id:
+            await interaction.response.send_message("This notifier belongs to another server.",ephemeral=True)
+            return False
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("You need the Manage Server permission to use these notifier controls.",ephemeral=True)
+            return False
+        return True
+
+    async def refresh_callback(self,interaction):
+        if not await self.authorized(interaction):
+            return
+        record=await mongo_call(get_sae_notifier_sync,self.guild_id)
+        if not record:
+            await interaction.response.send_message("The notifier configuration no longer exists.",ephemeral=True)
+            return
+        self.record=dict(record)
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    async def test_callback(self,interaction):
+        if not await self.authorized(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        record=await mongo_call(get_sae_notifier_sync,self.guild_id)
+        if not record or not record.get("channel_id"):
+            await interaction.followup.send("The notifier is not configured with a channel.",ephemeral=True)
+            return
+        channel=interaction.guild.get_channel(int(record["channel_id"]))
+        if not isinstance(channel,discord.TextChannel):
+            await interaction.followup.send("The configured notifier channel is no longer available.",ephemeral=True)
+            return
+        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE))
+        if error:
+            await interaction.followup.send(error,ephemeral=True)
+            return
+        if not best:
+            await interaction.followup.send("No valid egg with a recognized rarity was found in the current snapshot.",ephemeral=True)
+            return
+        sent=0
+        for egg in best[:10]:
+            try:
+                await channel.send(view=sae_notification_view(egg,True))
+                sent+=1
+            except discord.HTTPException:
+                continue
+        if sent:
+            await interaction.followup.send(f"🧪 Sent `{sent}` best-rarity test notification{'s' if sent!=1 else ''} to {channel.mention}.",ephemeral=True)
+        else:
+            await interaction.followup.send("The test notification could not be sent.",ephemeral=True)
+
+    async def start_callback(self,interaction):
+        if not await self.authorized(interaction):
+            return
+        record=await mongo_call(get_sae_notifier_sync,self.guild_id)
+        if not record:
+            await interaction.response.send_message("The notifier configuration no longer exists.",ephemeral=True)
+            return
+        record["enabled"]=True
+        record["updated_at"]=iso_now ()
+        await mongo_call(save_sae_notifier_sync,record)
+        self.record=dict(record)
+        await start_sae_notifier(self.guild_id)
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    async def stop_callback(self,interaction):
+        if not await self.authorized(interaction):
+            return
+        record=await mongo_call(get_sae_notifier_sync,self.guild_id)
+        if not record:
+            await interaction.response.send_message("The notifier configuration no longer exists.",ephemeral=True)
+            return
+        record["enabled"]=False
+        record["updated_at"]=iso_now ()
+        await mongo_call(save_sae_notifier_sync,record)
+        await stop_sae_notifier(self.guild_id)
+        self.record=dict(record)
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+
+def make_sae_panel_view(guild_id,record):
+    view=BreakSAENotifierView(guild_id,record)
+    sae_notifier_views[int(guild_id)]=view
+    return view
+
+
+async def sae_notifier_loop(guild_id):
+    guild_id=int(guild_id)
+    last_ids=sae_notifier_baselines.get(guild_id,set())
+    first_scan=True
+    while True:
+        record=await mongo_call(get_sae_notifier_sync,guild_id)
+        if not record or not record.get("enabled",False):
+            break
+        channel=bot.get_channel(int(record.get("channel_id",0)))
+        if not isinstance(channel,discord.TextChannel):
+            await asyncio.sleep(max(SAE_SCAN_INTERVAL,5.0))
+            continue
+        best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE))
+        if error:
+            await asyncio.sleep(SAE_SCAN_INTERVAL)
+            continue
+        current_ids={sae_egg_id(egg)for egg in best}
+        if first_scan:
+            last_ids=current_ids
+            first_scan=False
+        else:
+            new_eggs=[egg for egg in best if sae_egg_id(egg)not in last_ids]
+            for egg in new_eggs[:10]:
+                try:
+                    await channel.send(view=sae_notification_view(egg,False))
+                except (discord.Forbidden,discord.HTTPException):
+                    break
+            last_ids=current_ids
+        sae_notifier_baselines[guild_id]=last_ids
+        await asyncio.sleep(SAE_SCAN_INTERVAL)
+
+
+async def start_sae_notifier(guild_id):
+    guild_id=int(guild_id)
+    task=sae_notifier_tasks.get(guild_id)
+    if task and not task.done():
+        return
+    sae_notifier_baselines[guild_id]=set()
+    task=asyncio.create_task(sae_notifier_loop(guild_id),name=f"sae_notifier_{guild_id}")
+    sae_notifier_tasks[guild_id]=task
+
+
+async def stop_sae_notifier(guild_id):
+    guild_id=int(guild_id)
+    task=sae_notifier_tasks.pop(guild_id,None)
+    sae_notifier_baselines.pop(guild_id,None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def restore_sae_notifiers():
+    records=await mongo_call(list_sae_notifiers_sync)
+    for record in records:
+        try:
+            guild_id=int(record["guild_id"])
+            channel_id=int(record["channel_id"])
+        except (KeyError,TypeError,ValueError):
+            continue
+        guild=bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        channel=guild.get_channel(channel_id)
+        if not isinstance(channel,discord.TextChannel):
+            continue
+        view=None
+        message_id=record.get("message_id")
+        if message_id:
+            try:
+                message=await channel.fetch_message(int(message_id))
+                view=make_sae_panel_view(guild_id,record)
+                await message.edit(view=view)
+                try:
+                    bot.add_view(view,message_id=int(message_id))
+                except (TypeError,ValueError):
+                    pass
+            except (discord.NotFound,discord.Forbidden,discord.HTTPException):
+                view=None
+        if view is None:
+            try:
+                view=make_sae_panel_view(guild_id,record)
+                message=await channel.send(view=view)
+                record["message_id"]=message.id
+                await mongo_call(save_sae_notifier_sync,record)
+                try:
+                    bot.add_view(view,message_id=message.id)
+                except (TypeError,ValueError):
+                    pass
+            except (discord.Forbidden,discord.HTTPException):
+                continue
+        if record.get("enabled",False):
+            await start_sae_notifier(guild_id)
+
+
 class ObfuscationResultView(discord.ui.LayoutView):
     def __init__(self,filename,result,raw_url,features):
         super().__init__(timeout=900)
@@ -2095,6 +2556,72 @@ async def commands_list_command(ctx:commands.Context):
     view.message=message
 
 
+@bot.tree.command(name="break",description="Open the BREAK and SAE best-rarity egg notifier")
+@app_commands.describe(channel="Channel where best-rarity notifications will be sent")
+async def break_sae_notifier(interaction:discord.Interaction,channel:discord.TextChannel|None=None):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server.",ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need the Manage Server permission to configure the BREAK & SAE Notifier.",ephemeral=True)
+        return
+    target=channel
+    if target is None and isinstance(interaction.channel,discord.TextChannel):
+        target=interaction.channel
+    if not isinstance(target,discord.TextChannel):
+        await interaction.response.send_message("Select a normal text channel for notifier alerts.",ephemeral=True)
+        return
+    me=interaction.guild.me
+    if me is None:
+        await interaction.response.send_message("I could not verify my server permissions.",ephemeral=True)
+        return
+    permissions=target.permissions_for(me)
+    if not permissions.view_channel or not permissions.send_messages:
+        await interaction.response.send_message(f"I need View Channel and Send Messages permissions in {target.mention}.",ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    record=await mongo_call(get_sae_notifier_sync,interaction.guild.id)
+    if record is None:
+        record={"guild_id":interaction.guild.id,"channel_id":target.id,"enabled":True,"snapshot_file":SAE_SNAPSHOT_FILE,"message_id":None,"created_at":iso_now(),"updated_at":iso_now()}
+    else:
+        record["channel_id"]=target.id
+        record["enabled"]=True
+        record["snapshot_file"]=record.get("snapshot_file")or SAE_SNAPSHOT_FILE
+        record["updated_at"]=iso_now()
+    best,error=await asyncio.to_thread(sae_scan_snapshot_sync,record.get("snapshot_file",SAE_SNAPSHOT_FILE))
+    view=make_sae_panel_view(interaction.guild.id,record)
+    existing=None
+    if record.get("message_id"):
+        try:
+            old_channel=interaction.guild.get_channel(int(record["channel_id"]))
+            if isinstance(old_channel,discord.TextChannel):
+                existing=await old_channel.fetch_message(int(record["message_id"]))
+                if old_channel.id!=target.id:
+                    existing=None
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException):
+            existing=None
+    if existing is None:
+        message=await target.send(view=view)
+        record["message_id"]=message.id
+    else:
+        message=existing
+        await message.edit(view=view)
+    await mongo_call(save_sae_notifier_sync,record)
+    sae_notifier_views[interaction.guild.id]=view
+    try:
+        bot.add_view(view,message_id=message.id)
+    except (TypeError,ValueError):
+        pass
+    await start_sae_notifier(interaction.guild.id)
+    status_text="Started"if error is None else "Started, but the current snapshot could not be read"
+    extra=f"\n**Snapshot:** `{sae_escape(record.get('snapshot_file',SAE_SNAPSHOT_FILE),160)}`"
+    if error:
+        extra+=f"\n**Snapshot status:** ⚠️ {sae_escape(error,300)}"
+    else:
+        extra+=f"\n**Current best:** `{len(best)}` egg{'s' if len(best)!=1 else ''}"
+    await interaction.followup.send(f"✅ **BREAK & SAE Notifier — {status_text}**\nAlerts will be sent to {target.mention}."+extra,ephemeral=True)
+
+
 @bot.command(name="obf")
 async def lua_obfuscate_command(ctx:commands.Context,source:str=None):
     attachments=list(ctx.message.attachments)
@@ -2853,6 +3380,7 @@ async def on_ready ():
 
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
+        await restore_sae_notifiers ()
 
         ready_once =True 
 
@@ -2871,6 +3399,7 @@ async def on_ready ():
         print (
         f"Restored {len (reaction_role_cache )} reaction-role message(s)"
         )
+        print (f"Restored {len (sae_notifier_tasks )} SAE notifier(s)")
 
     except PyMongoError as error :
         print (f"MongoDB startup error: {error }")
