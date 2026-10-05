@@ -4,6 +4,8 @@ import json
 import re
 import secrets
 import string
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -15,6 +17,8 @@ from pymongo.errors import PyMongoError
 TOKEN = os.getenv("DISCORD_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "PanelBot")
+PASTEFY_API_TOKEN = os.getenv("PASTEFY_API_TOKEN")
+PASTEFY_MAX_BYTES = 5 * 1024 * 1024
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN environment variable is missing")
@@ -381,6 +385,117 @@ class InsightsView(discord.ui.LayoutView):
                 ),
             )
         )
+
+
+class PastefyResultView(discord.ui.LayoutView):
+    def __init__(self, filename, raw_url):
+        super().__init__(timeout=None)
+        self.add_item(
+            make_container(
+                make_text("## 📋 Pastefy Upload Complete"),
+                make_separator(),
+                make_text(
+                    f"**File:** `{discord.utils.escape_markdown(filename)}`\n"
+                    f"**Raw URL:** {raw_url}"
+                ),
+                make_separator(),
+                discord.ui.ActionRow(
+                    discord.ui.Button(
+                        label="View Raw Result",
+                        style=discord.ButtonStyle.link,
+                        url=raw_url,
+                    )
+                ),
+            )
+        )
+
+
+def create_pastefy_paste_sync(filename, content, token):
+    payload = {
+        "title": filename,
+        "content": content,
+        "visibility": "UNLISTED",
+        "encrypted": False,
+        "type": "PASTE",
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    auth = token.strip()
+    if not auth.lower().startswith("bearer "):
+        auth = f"Bearer {auth}"
+    request = urllib.request.Request(
+        "https://pastefy.app/api/v2/paste",
+        data=data,
+        headers={
+            "Authorization": auth,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "PanelBot/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        try:
+            detail = error.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"Pastefy API returned HTTP {error.code}: {detail[:500]}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Could not connect to Pastefy: {error.reason}") from error
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Pastefy returned an invalid response.") from error
+    paste = result.get("paste") if isinstance(result, dict) else None
+    raw_url = paste.get("raw_url") if isinstance(paste, dict) else None
+    if not raw_url or not isinstance(raw_url, str):
+        raise RuntimeError("Pastefy did not return a raw URL.")
+    return raw_url
+
+
+@bot.command(name="pastefy")
+async def pastefy_command(ctx: commands.Context):
+    attachments = list(ctx.message.attachments)
+    if len(attachments) != 1:
+        await ctx.send("Upload exactly one `.lua` or `.txt` file with `.pastefy`.")
+        return
+    attachment = attachments[0]
+    filename = os.path.basename(attachment.filename or "")
+    extension = os.path.splitext(filename)[1].lower()
+    if extension not in {".lua", ".txt"}:
+        await ctx.send("Only `.lua` and `.txt` files are supported.")
+        return
+    if not PASTEFY_API_TOKEN:
+        await ctx.send("Pastefy is not configured. Set the `PASTEFY_API_TOKEN` environment variable.")
+        return
+    if attachment.size is not None and attachment.size > PASTEFY_MAX_BYTES:
+        await ctx.send("That file is too large. The maximum size is 5 MB.")
+        return
+    status = await ctx.send("⏳ Uploading your file to Pastefy...")
+    try:
+        raw = await attachment.read()
+        if len(raw) > PASTEFY_MAX_BYTES:
+            await status.edit(content="That file is too large. The maximum size is 5 MB.")
+            return
+        try:
+            content = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            await status.edit(content="The uploaded file must be valid UTF-8 text.")
+            return
+        if not content:
+            await status.edit(content="The uploaded file is empty.")
+            return
+        raw_url = await asyncio.to_thread(
+            create_pastefy_paste_sync,
+            filename,
+            content,
+            PASTEFY_API_TOKEN,
+        )
+        await status.edit(content=None, view=PastefyResultView(filename, raw_url))
+    except Exception as error:
+        await status.edit(content=f"Pastefy upload failed: {error}")
 
 
 class PurgeView(discord.ui.LayoutView):
