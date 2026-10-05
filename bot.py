@@ -1267,6 +1267,87 @@ class ObfuscationResultView(discord.ui.LayoutView):
             await interaction.response.send_message(f"Download failed: {error}",ephemeral=True)
 
 
+class ScriptUploadView(discord.ui.LayoutView):
+    def __init__(self, title, script):
+        super().__init__(timeout=1800)
+        self.title_text=title
+        self.script=script
+        self.copy_button=discord.ui.Button(
+            label="Copy Script",
+            style=discord.ButtonStyle.primary,
+            emoji="📋",
+        )
+        self.download_button=discord.ui.Button(
+            label="Download .lua",
+            style=discord.ButtonStyle.secondary,
+            emoji="⬇️",
+        )
+        self.copy_button.callback=self.copy_script
+        self.download_button.callback=self.download_script
+        safe_title=discord.utils.escape_markdown(title)
+        preview=self._preview(script)
+        lines=script.count("\n")+1
+        size=len(script.encode("utf-8"))
+        self.add_item(
+            make_container(
+                make_text(f"## {safe_title}"),
+                make_text("-# 📤 Script Upload · Ready to copy or download"),
+                make_separator(),
+                make_text(
+                    f"### 🧾 Script Preview\n```lua\n{preview}\n```"
+                ),
+                make_separator(),
+                make_text(
+                    f"**Language:** `Lua / Luau`   **Lines:** `{lines:,}`   **Size:** `{size:,} bytes`"
+                ),
+                make_separator(),
+                discord.ui.ActionRow(self.copy_button, self.download_button),
+                make_separator(),
+                make_text("✨ **Clean preview** · Use **Copy Script** for a copy-ready code block."),
+                accent_color=0x5865F2,
+            )
+        )
+
+    def _preview(self, script):
+        limit=3300
+        if len(script)<=limit:
+            return script
+        return script[:limit]+"\n\n-- … preview truncated. Use Copy Script for the full text. --"
+
+    async def copy_script(self, interaction):
+        safe_title=discord.utils.escape_markdown(self.title_text)
+        if len(self.script)<=3850:
+            view=discord.ui.LayoutView(timeout=300)
+            view.add_item(
+                make_container(
+                    make_text(f"## 📋 Copy Ready · {safe_title}"),
+                    make_separator(),
+                    make_text(f"```lua\n{self.script}\n```"),
+                    make_separator(),
+                    make_text("Tap the code block's native **Copy** control to copy the script."),
+                    accent_color=0x57F287,
+                )
+            )
+            await interaction.response.send_message(view=view,ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"The script is too long for a single copy-ready Discord code block. Use **Download .lua** for the complete `{safe_title}` script.",
+            ephemeral=True,
+        )
+
+    async def download_script(self, interaction):
+        filename=re.sub(r"[^A-Za-z0-9._-]+","_",self.title_text).strip("._") or "script"
+        if not filename.lower().endswith((".lua",".luau")):
+            filename += ".lua"
+        try:
+            await interaction.response.send_message(
+                file=discord.File(io.BytesIO(self.script.encode("utf-8")),filename=filename),
+                ephemeral=True,
+            )
+        except discord.HTTPException as error:
+            await interaction.response.send_message(f"Download failed: {error}",ephemeral=True)
+
+
 class CmdsView(discord.ui.LayoutView):
     def __init__(self,ctx,prefix_entries,slash_entries,page=0):
         super().__init__(timeout=300)
@@ -2171,6 +2252,11 @@ name ="update",
 description ="Post update logs",
 )
 
+upload_group =app_commands .Group (
+name ="upload",
+description ="Upload and preview scripts",
+)
+
 reaction_group =app_commands .Group (
 name ="reaction",
 description ="Reaction role tools",
@@ -2555,6 +2641,48 @@ message :str |None =None ,
         f"Unexpected error while posting the update: {error }",
         ephemeral =True ,
         )
+
+
+@upload_group .command (
+name ="script",
+description ="Post a clean Components V2 script preview",
+)
+@app_commands .describe (
+title ="Required title for the script post",
+script ="Required Lua/Luau script text",
+)
+async def upload_script (
+interaction :discord .Interaction ,
+title :str ,
+script :str ,
+):
+    clean_title=re.sub(r"^#+\s*", "", title.strip())
+    clean_script=script.strip("\n")
+
+    if not clean_title:
+        await interaction.response.send_message("The title cannot be empty.",ephemeral=True)
+        return
+
+    if not clean_script:
+        await interaction.response.send_message("The script cannot be empty.",ephemeral=True)
+        return
+
+    if len(clean_title)>256:
+        await interaction.response.send_message("The title is too long. Keep it under 256 characters.",ephemeral=True)
+        return
+
+    if len(clean_script)>6000:
+        await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
+        return
+
+    try:
+        await interaction.response.send_message(view=ScriptUploadView(clean_title,clean_script))
+    except discord.HTTPException as error:
+        message=f"Could not post the script preview: {error}"
+        if interaction.response.is_done():
+            await interaction.followup.send(message,ephemeral=True)
+        else:
+            await interaction.response.send_message(message,ephemeral=True)
 
 
 @reaction_group .command (
@@ -2974,6 +3102,7 @@ bot .tree .add_command (create_group )
 bot .tree .add_command (server_group )
 bot .tree .add_command (add_group )
 bot .tree .add_command (update_group )
+bot .tree .add_command (upload_group )
 
 
 async def start_bot ():
