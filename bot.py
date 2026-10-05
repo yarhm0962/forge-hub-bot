@@ -1,2365 +1,2323 @@
-import os
-import asyncio
-import json
-import re
-import hashlib
-import io
-import ipaddress
-import shutil
-import subprocess
-import tempfile
-import secrets
-import socket
-import string
-import urllib.error
-import urllib.request
-from urllib.parse import urlparse
-from datetime import datetime, timedelta, timezone
+import os 
+import asyncio 
+import json 
+import re 
+import hashlib 
+import io 
+import ipaddress 
+import shutil 
+import subprocess 
+import tempfile 
+import secrets 
+import socket 
+import string 
+import urllib .error 
+import urllib .request 
+from urllib .parse import urlparse 
+from datetime import datetime ,timedelta ,timezone 
 
-import discord
-from discord import app_commands
-from discord.ext import commands
-from pymongo import MongoClient, ReturnDocument
-from pymongo.errors import PyMongoError
+import discord 
+from discord import app_commands 
+from discord .ext import commands 
+from pymongo import MongoClient ,ReturnDocument 
+from pymongo .errors import PyMongoError 
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "PanelBot")
-PASTEFY_API_TOKEN = os.getenv("PASTEFY_API_TOKEN")
-PASTEFY_MAX_BYTES = 5 * 1024 * 1024
+TOKEN =os .getenv ("DISCORD_TOKEN")
+MONGODB_URI =os .getenv ("MONGODB_URI")
+MONGODB_DATABASE =os .getenv ("MONGODB_DATABASE","PanelBot")
+PASTEFY_API_TOKEN =os .getenv ("PASTEFY_API_TOKEN")
+PASTEFY_MAX_BYTES =5 *1024 *1024 
 
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN environment variable is missing")
+if not TOKEN :
+    raise RuntimeError ("DISCORD_TOKEN environment variable is missing")
 
-if not MONGODB_URI:
-    raise RuntimeError("MONGODB_URI environment variable is missing")
+if not MONGODB_URI :
+    raise RuntimeError ("MONGODB_URI environment variable is missing")
 
-mongo_client = MongoClient(
-    MONGODB_URI,
-    serverSelectionTimeoutMS=10000,
-    connectTimeoutMS=10000,
-    socketTimeoutMS=10000,
+mongo_client =MongoClient (
+MONGODB_URI ,
+serverSelectionTimeoutMS =10000 ,
+connectTimeoutMS =10000 ,
+socketTimeoutMS =10000 ,
 )
 
-mongo_db = mongo_client[MONGODB_DATABASE]
-insights_collection = mongo_db["server_insights"]
-anti_scam_collection = mongo_db["anti_scam_channels"]
-reaction_roles_collection = mongo_db["reaction_roles"]
-member_snapshots_collection = mongo_db["member_snapshots"]
+mongo_db =mongo_client [MONGODB_DATABASE ]
+insights_collection =mongo_db ["server_insights"]
+anti_scam_collection =mongo_db ["anti_scam_channels"]
+reaction_roles_collection =mongo_db ["reaction_roles"]
+member_snapshots_collection =mongo_db ["member_snapshots"]
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.message_content = True
+intents =discord .Intents .default ()
+intents .guilds =True 
+intents .members =True 
+intents .message_content =True 
 
-bot = commands.Bot(command_prefix=("!", "."), intents=intents)
+bot =commands .Bot (command_prefix =("!","."),intents =intents )
 
-created_channels = {}
-reaction_role_cache = {}
-ready_once = False
+created_channels ={}
+reaction_role_cache ={}
+ready_once =False 
 
-ANTI_SCAM_TITLE = "## 🛡️ Anti-Scam Protection"
-ANTI_SCAM_BODY = (
-    "This channel is reserved for suspicious or fake social-media spam.\n"
-    "**Do not send messages here.** Messages are removed automatically and the sender "
-    "may be kicked."
+ANTI_SCAM_TITLE ="## 🛡️ Anti-Scam Protection"
+ANTI_SCAM_BODY =(
+"This channel is reserved for suspicious or fake social-media spam.\n"
+"**Do not send messages here.** Messages are removed automatically and the sender "
+"may be kicked."
 )
 
 
-def utc_now():
-    return datetime.now(timezone.utc)
+def utc_now ():
+    return datetime .now (timezone .utc )
 
 
-def iso_now():
-    return utc_now().isoformat()
+def iso_now ():
+    return utc_now ().isoformat ()
 
 
-def parse_datetime(value):
-    if not isinstance(value, str):
-        return None
-    try:
-        result = datetime.fromisoformat(value)
-        if result.tzinfo is None:
-            result = result.replace(tzinfo=timezone.utc)
-        return result.astimezone(timezone.utc)
-    except ValueError:
-        return None
+def parse_datetime (value ):
+    if not isinstance (value ,str ):
+        return None 
+    try :
+        result =datetime .fromisoformat (value )
+        if result .tzinfo is None :
+            result =result .replace (tzinfo =timezone .utc )
+        return result .astimezone (timezone .utc )
+    except ValueError :
+        return None 
 
 
-def cleanup_events_sync(document):
-    cutoff = utc_now() - timedelta(days=30)
-    joins = []
-    leaves = []
-    for event in document.get("joins", []):
-        value = event.get("timestamp") if isinstance(event, dict) else event
-        dt = parse_datetime(value)
-        if dt and dt >= cutoff:
-            joins.append(value)
-    for event in document.get("leaves", []):
-        value = event.get("timestamp") if isinstance(event, dict) else event
-        dt = parse_datetime(value)
-        if dt and dt >= cutoff:
-            leaves.append(value)
-    document["joins"] = joins
-    document["leaves"] = leaves
-    document.setdefault("total_joins", 0)
-    document.setdefault("total_leaves", 0)
-    if document["total_joins"] == 0 and joins:
-        document["total_joins"] = len(joins)
-    if document["total_leaves"] == 0 and leaves:
-        document["total_leaves"] = len(leaves)
-    return document
+def cleanup_events_sync (document ):
+    cutoff =utc_now ()-timedelta (days =30 )
+    joins =[]
+    leaves =[]
+    for event in document .get ("joins",[]):
+        value =event .get ("timestamp")if isinstance (event ,dict )else event 
+        dt =parse_datetime (value )
+        if dt and dt >=cutoff :
+            joins .append (value )
+    for event in document .get ("leaves",[]):
+        value =event .get ("timestamp")if isinstance (event ,dict )else event 
+        dt =parse_datetime (value )
+        if dt and dt >=cutoff :
+            leaves .append (value )
+    document ["joins"]=joins 
+    document ["leaves"]=leaves 
+    document .setdefault ("total_joins",0 )
+    document .setdefault ("total_leaves",0 )
+    if document ["total_joins"]==0 and joins :
+        document ["total_joins"]=len (joins )
+    if document ["total_leaves"]==0 and leaves :
+        document ["total_leaves"]=len (leaves )
+    return document 
 
 
-def get_guild_insights_sync(guild_id):
-    guild_id = int(guild_id)
-    document = insights_collection.find_one({"_id": guild_id})
-    if not document:
-        document = {
-            "_id": guild_id,
-            "joins": [],
-            "leaves": [],
-            "total_joins": 0,
-            "total_leaves": 0,
+def get_guild_insights_sync (guild_id ):
+    guild_id =int (guild_id )
+    document =insights_collection .find_one ({"_id":guild_id })
+    if not document :
+        document ={
+        "_id":guild_id ,
+        "joins":[],
+        "leaves":[],
+        "total_joins":0 ,
+        "total_leaves":0 ,
         }
-    document.setdefault("joins", [])
-    document.setdefault("leaves", [])
-    document.setdefault("total_joins", 0)
-    document.setdefault("total_leaves", 0)
-    if document["total_joins"] == 0 and document["joins"]:
-        document["total_joins"] = len(document["joins"])
-    if document["total_leaves"] == 0 and document["leaves"]:
-        document["total_leaves"] = len(document["leaves"])
-    cleanup_events_sync(document)
-    insights_collection.replace_one({"_id": guild_id}, document, upsert=True)
-    return document
+    document .setdefault ("joins",[])
+    document .setdefault ("leaves",[])
+    document .setdefault ("total_joins",0 )
+    document .setdefault ("total_leaves",0 )
+    if document ["total_joins"]==0 and document ["joins"]:
+        document ["total_joins"]=len (document ["joins"])
+    if document ["total_leaves"]==0 and document ["leaves"]:
+        document ["total_leaves"]=len (document ["leaves"])
+    cleanup_events_sync (document )
+    insights_collection .replace_one ({"_id":guild_id },document ,upsert =True )
+    return document 
 
 
-def add_member_event_sync(guild_id, event_type):
-    guild_id = int(guild_id)
-    field = "joins" if event_type == "join" else "leaves"
-    total_field = "total_joins" if event_type == "join" else "total_leaves"
-    insights_collection.update_one(
-        {"_id": guild_id},
-        {
-            "$setOnInsert": {
-                "joins": [],
-                "leaves": [],
-                "total_joins": 0,
-                "total_leaves": 0,
-            }
-        },
-        upsert=True,
-    )
-    document = insights_collection.find_one_and_update(
-        {"_id": guild_id},
-        {
-            "$push": {field: iso_now()},
-            "$inc": {total_field: 1},
-        },
-        return_document=ReturnDocument.AFTER,
-    )
-    cleanup_events_sync(document)
-    insights_collection.replace_one({"_id": guild_id}, document, upsert=True)
-    return document
-
-
-def get_member_snapshot_sync(guild_id):
-    document = member_snapshots_collection.find_one({"_id": int(guild_id)})
-    if not document:
-        return None
-    return {int(member_id) for member_id in document.get("member_ids", [])}
-
-
-def save_member_snapshot_sync(guild_id, member_ids):
-    member_snapshots_collection.replace_one(
-        {"_id": int(guild_id)},
-        {
-            "_id": int(guild_id),
-            "member_ids": [int(member_id) for member_id in member_ids],
-            "updated_at": iso_now(),
-        },
-        upsert=True,
-    )
-
-
-def add_member_to_snapshot_sync(guild_id, member_id):
-    member_snapshots_collection.update_one(
-        {"_id": int(guild_id)},
-        {
-            "$addToSet": {"member_ids": int(member_id)},
-            "$set": {"updated_at": iso_now()},
-        },
-        upsert=True,
-    )
-
-
-def remove_member_from_snapshot_sync(guild_id, member_id):
-    member_snapshots_collection.update_one(
-        {"_id": int(guild_id)},
-        {
-            "$pull": {"member_ids": int(member_id)},
-            "$set": {"updated_at": iso_now()},
-        },
-    )
-
-
-def reconcile_member_snapshot_sync(guild_id, current_member_ids):
-    guild_id = int(guild_id)
-    current = {int(member_id) for member_id in current_member_ids}
-    previous = get_member_snapshot_sync(guild_id)
-    if previous is None:
-        save_member_snapshot_sync(guild_id, current)
-        return 0, 0, True
-    joined = current - previous
-    left = previous - current
-    save_member_snapshot_sync(guild_id, current)
-    return joined, left, False
-
-def list_anti_scam_sync():
-    return list(anti_scam_collection.find({}))
-
-
-def save_anti_scam_sync(record):
-    channel_id = int(record["channel_id"])
-    data = dict(record)
-    data["_id"] = channel_id
-    anti_scam_collection.replace_one(
-        {"_id": channel_id},
-        data,
-        upsert=True,
-    )
-
-
-def delete_anti_scam_sync(channel_id):
-    anti_scam_collection.delete_one({"_id": int(channel_id)})
-
-
-def increment_anti_scam_sync(channel_id, kicked):
-    increments = {"violations": 1}
-    if kicked:
-        increments["kicks"] = 1
-    return anti_scam_collection.find_one_and_update(
-        {"_id": int(channel_id)},
-        {"$inc": increments},
-        return_document=ReturnDocument.AFTER,
-    )
-
-
-def save_reaction_role_sync(record):
-    message_id = int(record["message_id"])
-    data = dict(record)
-    data["_id"] = message_id
-    reaction_roles_collection.replace_one(
-        {"_id": message_id},
-        data,
-        upsert=True,
-    )
-
-
-def get_reaction_role_sync(message_id):
-    return reaction_roles_collection.find_one({"_id": int(message_id)})
-
-
-def delete_reaction_role_sync(message_id):
-    reaction_roles_collection.delete_one({"_id": int(message_id)})
-
-
-def list_reaction_roles_sync():
-    return list(reaction_roles_collection.find({}))
-
-
-async def mongo_call(function, *args):
-    return await asyncio.to_thread(function, *args)
-
-
-def make_container(*items, accent_color=None):
-    container = discord.ui.Container(*items)
-    if accent_color is not None:
-        container.accent_color = accent_color
-    return container
-
-
-def make_text(content):
-    return discord.ui.TextDisplay(content)
-
-
-def make_separator():
-    return discord.ui.Separator(
-        spacing=discord.SeparatorSpacing.small,
-        visible=True,
-    )
-
-
-class AntiScamView(discord.ui.LayoutView):
-    def __init__(self, kicks=0, violations=0):
-        super().__init__(timeout=None)
-        self.kicks = int(kicks)
-        self.violations = int(violations)
-
-        self.kick_button = discord.ui.Button(
-            label=f"{self.kicks:,} kicks",
-            style=discord.ButtonStyle.danger,
-            emoji="🛡️",
-            disabled=True,
-        )
-
-        self.violation_button = discord.ui.Button(
-            label=f"{self.violations:,} blocked",
-            style=discord.ButtonStyle.secondary,
-            emoji="🚫",
-            disabled=True,
-        )
-
-        status = discord.ui.Section(
-            make_text("### 🟢 Protection is active"),
-            make_text(
-                "This channel is monitored continuously. Messages are removed and "
-                "members who can be moderated are kicked automatically."
-            ),
-            accessory=self.kick_button,
-        )
-
-        self.add_item(
-            make_container(
-                make_text("## 🛡️ Anti-Scam Protection"),
-                make_text("Automatic enforcement for this protected channel."),
-                make_separator(),
-                status,
-                make_separator(),
-                make_text(
-                    "### Channel rules\n"
-                    "• Do not send messages in this channel.\n"
-                    "• Messages are removed automatically.\n"
-                    "• Moderation is applied when the bot has permission.\n"
-                    "• Administrators are not automatically kicked."
-                ),
-                make_separator(),
-                discord.ui.ActionRow(self.violation_button),
-                accent_color=0xED4245,
-            )
-        )
-
-    def update_stats(self, kicks=None, violations=None):
-        if kicks is not None:
-            self.kicks = int(kicks)
-        if violations is not None:
-            self.violations = int(violations)
-        self.kick_button.label = f"{self.kicks:,} kicks"
-        self.violation_button.label = f"{self.violations:,} blocked"
-
-    def update_kicks(self, kicks=None):
-        self.update_stats(kicks=kicks)
-
-
-class InsightsView(discord.ui.LayoutView):
-    def __init__(self, guild, document):
-        super().__init__(timeout=None)
-        joins = list(document.get("joins", []))
-        leaves = list(document.get("leaves", []))
-        net = len(joins) - len(leaves)
-        lifetime_joins = int(document.get("total_joins", 0))
-        lifetime_leaves = int(document.get("total_leaves", 0))
-        lifetime_net = lifetime_joins - lifetime_leaves
-        status = "📈 Growing" if net > 0 else "📉 Declining" if net < 0 else "➖ Stable"
-        net_text = f"+{net:,}" if net > 0 else f"{net:,}"
-        lifetime_net_text = f"+{lifetime_net:,}" if lifetime_net > 0 else f"{lifetime_net:,}"
-
-        self.add_item(
-            make_container(
-                make_text(f"## 📊 Server Insights · {guild.name}"),
-                make_separator(),
-                make_text(
-                    f"**Current Members:** `{guild.member_count or 0:,}`   **Status:** {status}\n"
-                    f"**30-Day Net:** `{net_text}`   **Lifetime Net:** `{lifetime_net_text}`"
-                ),
-                make_separator(),
-                make_text(
-                    "### 🗓️ Last 30 Days\n"
-                    f"**Joined:** `{len(joins):,}`   **Left:** `{len(leaves):,}`   **Net:** `{net_text}`\n"
-                    "Activity automatically expires after 30 days."
-                ),
-                make_separator(),
-                make_text(
-                    "### ♾️ Lifetime Totals\n"
-                    f"**Total Joins:** `{lifetime_joins:,}`\n"
-                    f"**Total Departures:** `{lifetime_leaves:,}`\n"
-                    f"**Lifetime Net:** `{lifetime_net_text}`"
-                ),
-                make_separator(),
-                make_text(
-                    "💾 **MongoDB Persistence**\n"
-                    "Member activity is stored persistently. The activity list uses a rolling 30-day window, while lifetime totals remain available."
-                ),
-            )
-        )
-
-
-class PastefyResultView(discord.ui.LayoutView):
-    def __init__(self, filename, raw_url):
-        super().__init__(timeout=None)
-        self.add_item(
-            make_container(
-                make_text("## 📋 Pastefy Upload Complete"),
-                make_separator(),
-                make_text(
-                    f"**File:** `{discord.utils.escape_markdown(filename)}`\n"
-                    f"**Raw URL:** {raw_url}"
-                ),
-                make_separator(),
-                discord.ui.ActionRow(
-                    discord.ui.Button(
-                        label="View Raw Result",
-                        style=discord.ButtonStyle.link,
-                        url=raw_url,
-                    )
-                ),
-            )
-        )
-
-
-def create_pastefy_paste_sync(filename, content, token):
-    payload = {
-        "title": filename,
-        "content": content,
-        "visibility": "UNLISTED",
-        "encrypted": False,
-        "type": "PASTE",
+def add_member_event_sync (guild_id ,event_type ):
+    guild_id =int (guild_id )
+    field ="joins"if event_type =="join"else "leaves"
+    total_field ="total_joins"if event_type =="join"else "total_leaves"
+    insights_collection .update_one (
+    {"_id":guild_id },
+    {
+    "$setOnInsert":{
+    "joins":[],
+    "leaves":[],
+    "total_joins":0 ,
+    "total_leaves":0 ,
     }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    auth = token.strip()
-    if not auth.lower().startswith("bearer "):
-        auth = f"Bearer {auth}"
-    request = urllib.request.Request(
-        "https://pastefy.app/api/v2/paste",
-        data=data,
-        headers={
-            "Authorization": auth,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "PanelBot/1.0",
-        },
-        method="POST",
+    },
+    upsert =True ,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as error:
-        try:
-            detail = error.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"Pastefy API returned HTTP {error.code}: {detail[:500]}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"Could not connect to Pastefy: {error.reason}") from error
-    try:
-        result = json.loads(body)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Pastefy returned an invalid response.") from error
-    paste = result.get("paste") if isinstance(result, dict) else None
-    raw_url = paste.get("raw_url") if isinstance(paste, dict) else None
-    if not raw_url or not isinstance(raw_url, str):
-        raise RuntimeError("Pastefy did not return a raw URL.")
-    return raw_url
+    document =insights_collection .find_one_and_update (
+    {"_id":guild_id },
+    {
+    "$push":{field :iso_now ()},
+    "$inc":{total_field :1 },
+    },
+    return_document =ReturnDocument .AFTER ,
+    )
+    cleanup_events_sync (document )
+    insights_collection .replace_one ({"_id":guild_id },document ,upsert =True )
+    return document 
 
 
-@bot.command(name="pastefy")
-async def pastefy_command(ctx: commands.Context):
-    attachments = list(ctx.message.attachments)
-    if len(attachments) != 1:
-        await ctx.send("Upload exactly one `.lua` or `.txt` file with `.pastefy`.")
-        return
-    attachment = attachments[0]
-    filename = os.path.basename(attachment.filename or "")
-    extension = os.path.splitext(filename)[1].lower()
-    if extension not in {".lua", ".txt"}:
-        await ctx.send("Only `.lua` and `.txt` files are supported.")
-        return
-    if not PASTEFY_API_TOKEN:
-        await ctx.send("Pastefy is not configured. Set the `PASTEFY_API_TOKEN` environment variable.")
-        return
-    if attachment.size is not None and attachment.size > PASTEFY_MAX_BYTES:
-        await ctx.send("That file is too large. The maximum size is 5 MB.")
-        return
-    status = await ctx.send("⏳ Uploading your file to Pastefy...")
-    try:
-        raw = await attachment.read()
-        if len(raw) > PASTEFY_MAX_BYTES:
-            await status.edit(content="That file is too large. The maximum size is 5 MB.")
-            return
-        try:
-            content = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            await status.edit(content="The uploaded file must be valid UTF-8 text.")
-            return
-        if not content:
-            await status.edit(content="The uploaded file is empty.")
-            return
-        raw_url = await asyncio.to_thread(
-            create_pastefy_paste_sync,
-            filename,
-            content,
-            PASTEFY_API_TOKEN,
+def get_member_snapshot_sync (guild_id ):
+    document =member_snapshots_collection .find_one ({"_id":int (guild_id )})
+    if not document :
+        return None 
+    return {int (member_id )for member_id in document .get ("member_ids",[])}
+
+
+def save_member_snapshot_sync (guild_id ,member_ids ):
+    member_snapshots_collection .replace_one (
+    {"_id":int (guild_id )},
+    {
+    "_id":int (guild_id ),
+    "member_ids":[int (member_id )for member_id in member_ids ],
+    "updated_at":iso_now (),
+    },
+    upsert =True ,
+    )
+
+
+def add_member_to_snapshot_sync (guild_id ,member_id ):
+    member_snapshots_collection .update_one (
+    {"_id":int (guild_id )},
+    {
+    "$addToSet":{"member_ids":int (member_id )},
+    "$set":{"updated_at":iso_now ()},
+    },
+    upsert =True ,
+    )
+
+
+def remove_member_from_snapshot_sync (guild_id ,member_id ):
+    member_snapshots_collection .update_one (
+    {"_id":int (guild_id )},
+    {
+    "$pull":{"member_ids":int (member_id )},
+    "$set":{"updated_at":iso_now ()},
+    },
+    )
+
+
+def reconcile_member_snapshot_sync (guild_id ,current_member_ids ):
+    guild_id =int (guild_id )
+    current ={int (member_id )for member_id in current_member_ids }
+    previous =get_member_snapshot_sync (guild_id )
+    if previous is None :
+        save_member_snapshot_sync (guild_id ,current )
+        return 0 ,0 ,True 
+    joined =current -previous 
+    left =previous -current 
+    save_member_snapshot_sync (guild_id ,current )
+    return joined ,left ,False 
+
+def list_anti_scam_sync ():
+    return list (anti_scam_collection .find ({}))
+
+
+def save_anti_scam_sync (record ):
+    channel_id =int (record ["channel_id"])
+    data =dict (record )
+    data ["_id"]=channel_id 
+    anti_scam_collection .replace_one (
+    {"_id":channel_id },
+    data ,
+    upsert =True ,
+    )
+
+
+def delete_anti_scam_sync (channel_id ):
+    anti_scam_collection .delete_one ({"_id":int (channel_id )})
+
+
+def increment_anti_scam_sync (channel_id ,kicked ):
+    increments ={"violations":1 }
+    if kicked :
+        increments ["kicks"]=1 
+    return anti_scam_collection .find_one_and_update (
+    {"_id":int (channel_id )},
+    {"$inc":increments },
+    return_document =ReturnDocument .AFTER ,
+    )
+
+
+def save_reaction_role_sync (record ):
+    message_id =int (record ["message_id"])
+    data =dict (record )
+    data ["_id"]=message_id 
+    reaction_roles_collection .replace_one (
+    {"_id":message_id },
+    data ,
+    upsert =True ,
+    )
+
+
+def get_reaction_role_sync (message_id ):
+    return reaction_roles_collection .find_one ({"_id":int (message_id )})
+
+
+def delete_reaction_role_sync (message_id ):
+    reaction_roles_collection .delete_one ({"_id":int (message_id )})
+
+
+def list_reaction_roles_sync ():
+    return list (reaction_roles_collection .find ({}))
+
+
+async def mongo_call (function ,*args ):
+    return await asyncio .to_thread (function ,*args )
+
+
+def make_container (*items ,accent_color =None ):
+    container =discord .ui .Container (*items )
+    if accent_color is not None :
+        container .accent_color =accent_color 
+    return container 
+
+
+def make_text (content ):
+    return discord .ui .TextDisplay (content )
+
+
+def make_separator ():
+    return discord .ui .Separator (
+    spacing =discord .SeparatorSpacing .small ,
+    visible =True ,
+    )
+
+
+class AntiScamView (discord .ui .LayoutView ):
+    def __init__ (self ,kicks =0 ,violations =0 ):
+        super ().__init__ (timeout =None )
+        self .kicks =int (kicks )
+        self .violations =int (violations )
+
+        self .kick_button =discord .ui .Button (
+        label =f"{self .kicks :,} kicks",
+        style =discord .ButtonStyle .danger ,
+        emoji ="🛡️",
+        disabled =True ,
         )
-        await status.edit(content=None, view=PastefyResultView(filename, raw_url))
-    except Exception as error:
-        await status.edit(content=f"Pastefy upload failed: {error}")
+
+        self .violation_button =discord .ui .Button (
+        label =f"{self .violations :,} blocked",
+        style =discord .ButtonStyle .secondary ,
+        emoji ="🚫",
+        disabled =True ,
+        )
+
+        status =discord .ui .Section (
+        make_text ("### 🟢 Protection is active"),
+        make_text (
+        "This channel is monitored continuously. Messages are removed and "
+        "members who can be moderated are kicked automatically."
+        ),
+        accessory =self .kick_button ,
+        )
+
+        self .add_item (
+        make_container (
+        make_text ("## 🛡️ Anti-Scam Protection"),
+        make_text ("Automatic enforcement for this protected channel."),
+        make_separator (),
+        status ,
+        make_separator (),
+        make_text (
+        "### Channel rules\n"
+        "• Do not send messages in this channel.\n"
+        "• Messages are removed automatically.\n"
+        "• Moderation is applied when the bot has permission.\n"
+        "• Administrators are not automatically kicked."
+        ),
+        make_separator (),
+        discord .ui .ActionRow (self .violation_button ),
+        accent_color =0xED4245 ,
+        )
+        )
+
+    def update_stats (self ,kicks =None ,violations =None ):
+        if kicks is not None :
+            self .kicks =int (kicks )
+        if violations is not None :
+            self .violations =int (violations )
+        self .kick_button .label =f"{self .kicks :,} kicks"
+        self .violation_button .label =f"{self .violations :,} blocked"
+
+    def update_kicks (self ,kicks =None ):
+        self .update_stats (kicks =kicks )
 
 
-LUA_PROCESS_MAX_BYTES = 2 * 1024 * 1024
-LUA_TOOL_TIMEOUT = 90
-LUADEC_EXECUTABLE = os.getenv("LUADEC_EXECUTABLE")
-UNLUAC_JAR = os.getenv("UNLUAC_JAR")
-JAVA_EXECUTABLE = os.getenv("JAVA_EXECUTABLE")
+class InsightsView (discord .ui .LayoutView ):
+    def __init__ (self ,guild ,document ):
+        super ().__init__ (timeout =None )
+        joins =list (document .get ("joins",[]))
+        leaves =list (document .get ("leaves",[]))
+        net =len (joins )-len (leaves )
+        lifetime_joins =int (document .get ("total_joins",0 ))
+        lifetime_leaves =int (document .get ("total_leaves",0 ))
+        lifetime_net =lifetime_joins -lifetime_leaves 
+        status ="📈 Growing"if net >0 else "📉 Declining"if net <0 else "➖ Stable"
+        net_text =f"+{net :,}"if net >0 else f"{net :,}"
+        lifetime_net_text =f"+{lifetime_net :,}"if lifetime_net >0 else f"{lifetime_net :,}"
+
+        self .add_item (
+        make_container (
+        make_text (f"## 📊 Server Insights · {guild .name }"),
+        make_separator (),
+        make_text (
+        f"**Current Members:** `{guild .member_count or 0 :,}`   **Status:** {status }\n"
+        f"**30-Day Net:** `{net_text }`   **Lifetime Net:** `{lifetime_net_text }`"
+        ),
+        make_separator (),
+        make_text (
+        "### 🗓️ Last 30 Days\n"
+        f"**Joined:** `{len (joins ):,}`   **Left:** `{len (leaves ):,}`   **Net:** `{net_text }`\n"
+        "Activity automatically expires after 30 days."
+        ),
+        make_separator (),
+        make_text (
+        "### ♾️ Lifetime Totals\n"
+        f"**Total Joins:** `{lifetime_joins :,}`\n"
+        f"**Total Departures:** `{lifetime_leaves :,}`\n"
+        f"**Lifetime Net:** `{lifetime_net_text }`"
+        ),
+        make_separator (),
+        make_text (
+        "💾 **MongoDB Persistence**\n"
+        "Member activity is stored persistently. The activity list uses a rolling 30-day window, while lifetime totals remain available."
+        ),
+        )
+        )
 
 
-def resolve_executable(configured, candidates):
-    checked = []
-    if configured:
-        checked.append(configured)
-    checked.extend(candidates)
-    for value in checked:
-        if not value:
-            continue
-        if os.path.isabs(value) and os.path.isfile(value) and os.access(value, os.X_OK):
-            return value
-        resolved = shutil.which(value)
-        if resolved:
-            return resolved
-    return None
+class PastefyResultView (discord .ui .LayoutView ):
+    def __init__ (self ,filename ,raw_url ):
+        super ().__init__ (timeout =None )
+        self .add_item (
+        make_container (
+        make_text ("## 📋 Pastefy Upload Complete"),
+        make_separator (),
+        make_text (
+        f"**File:** `{discord .utils .escape_markdown (filename )}`\n"
+        f"**Raw URL:** {raw_url }"
+        ),
+        make_separator (),
+        discord .ui .ActionRow (
+        discord .ui .Button (
+        label ="View Raw Result",
+        style =discord .ButtonStyle .link ,
+        url =raw_url ,
+        )
+        ),
+        )
+        )
 
 
-def find_luadec():
-    return resolve_executable(
-        LUADEC_EXECUTABLE,
-        [
-            "/home/container/luadec",
-            "/home/container/bin/luadec",
-            "/home/container/bin/luadec51",
-            "luadec",
-            "luadec51",
-        ],
+def create_pastefy_paste_sync (filename ,content ,token ):
+    payload ={
+    "title":filename ,
+    "content":content ,
+    "visibility":"UNLISTED",
+    "encrypted":False ,
+    "type":"PASTE",
+    }
+    data =json .dumps (payload ,ensure_ascii =False ).encode ("utf-8")
+    auth =token .strip ()
+    if not auth .lower ().startswith ("bearer "):
+        auth =f"Bearer {auth }"
+    request =urllib .request .Request (
+    "https://pastefy.app/api/v2/paste",
+    data =data ,
+    headers ={
+    "Authorization":auth ,
+    "Content-Type":"application/json",
+    "Accept":"application/json",
+    "User-Agent":"PanelBot/1.0",
+    },
+    method ="POST",
     )
+    try :
+        with urllib .request .urlopen (request ,timeout =30 )as response :
+            body =response .read ().decode ("utf-8")
+    except urllib .error .HTTPError as error :
+        try :
+            detail =error .read ().decode ("utf-8",errors ="replace")
+        except Exception :
+            detail =""
+        raise RuntimeError (f"Pastefy API returned HTTP {error .code }: {detail [:500 ]}")from error 
+    except urllib .error .URLError as error :
+        raise RuntimeError (f"Could not connect to Pastefy: {error .reason }")from error 
+    try :
+        result =json .loads (body )
+    except json .JSONDecodeError as error :
+        raise RuntimeError ("Pastefy returned an invalid response.")from error 
+    paste =result .get ("paste")if isinstance (result ,dict )else None 
+    raw_url =paste .get ("raw_url")if isinstance (paste ,dict )else None 
+    if not raw_url or not isinstance (raw_url ,str ):
+        raise RuntimeError ("Pastefy did not return a raw URL.")
+    return raw_url 
 
 
-def find_java():
-    return resolve_executable(
-        JAVA_EXECUTABLE,
-        ["/usr/bin/java", "/usr/local/bin/java", "java"],
-    )
+@bot .command (name ="pastefy")
+async def pastefy_command (ctx :commands .Context ):
+    attachments =list (ctx .message .attachments )
+    if len (attachments )!=1 :
+        await ctx .send ("Upload exactly one `.lua` or `.txt` file with `.pastefy`.")
+        return 
+    attachment =attachments [0 ]
+    filename =os .path .basename (attachment .filename or "")
+    extension =os .path .splitext (filename )[1 ].lower ()
+    if extension not in {".lua",".txt"}:
+        await ctx .send ("Only `.lua` and `.txt` files are supported.")
+        return 
+    if not PASTEFY_API_TOKEN :
+        await ctx .send ("Pastefy is not configured. Set the `PASTEFY_API_TOKEN` environment variable.")
+        return 
+    if attachment .size is not None and attachment .size >PASTEFY_MAX_BYTES :
+        await ctx .send ("That file is too large. The maximum size is 5 MB.")
+        return 
+    status =await ctx .send ("⏳ Uploading your file to Pastefy...")
+    try :
+        raw =await attachment .read ()
+        if len (raw )>PASTEFY_MAX_BYTES :
+            await status .edit (content ="That file is too large. The maximum size is 5 MB.")
+            return 
+        try :
+            content =raw .decode ("utf-8-sig")
+        except UnicodeDecodeError :
+            await status .edit (content ="The uploaded file must be valid UTF-8 text.")
+            return 
+        if not content :
+            await status .edit (content ="The uploaded file is empty.")
+            return 
+        raw_url =await asyncio .to_thread (
+        create_pastefy_paste_sync ,
+        filename ,
+        content ,
+        PASTEFY_API_TOKEN ,
+        )
+        await status .edit (content =None ,view =PastefyResultView (filename ,raw_url ))
+    except Exception as error :
+        await status .edit (content =f"Pastefy upload failed: {error }")
 
 
-def is_lua_bytecode(data):
-    return data.startswith(b"\x1bLua")
+LUA_PROCESS_MAX_BYTES =2 *1024 *1024 
+LUA_TOOL_TIMEOUT =45 
+LUADEC_EXECUTABLE =os .getenv ("LUADEC_EXECUTABLE")
+UNLUAC_JAR =os .getenv ("UNLUAC_JAR")
+JAVA_EXECUTABLE =os .getenv ("JAVA_EXECUTABLE")
 
 
-def decode_lua_string_literal(value):
-    if len(value) < 2 or value[0] not in {'"', "'"} or value[-1] != value[0]:
-        return None
-    body = value[1:-1]
-    out = bytearray()
-    i = 0
-    while i < len(body):
-        ch = body[i]
-        if ch != "\\":
-            out.extend(ch.encode("utf-8"))
-            i += 1
-            continue
-        i += 1
-        if i >= len(body):
-            return None
-        esc = body[i]
-        simple = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, "\\": 92, '"': 34, "'": 39}
-        if esc in simple:
-            out.append(simple[esc])
-            i += 1
-            continue
-        if esc.isdigit():
-            j = i
-            while j < len(body) and j < i + 3 and body[j].isdigit():
-                j += 1
-            number = int(body[i:j], 10)
-            if number > 255:
-                return None
-            out.append(number)
-            i = j
-            continue
-        if esc == "z":
-            i += 1
-            while i < len(body) and body[i].isspace():
-                i += 1
-            continue
-        out.extend(esc.encode("utf-8"))
-        i += 1
-    return bytes(out)
+def resolve_executable (configured ,candidates ):
+    values =[]
+    if configured :
+        values .append (configured )
+    values .extend (candidates )
+    for value in values :
+        if not value :
+            continue 
+        if os .path .isabs (value )and os .path .isfile (value )and os .access (value ,os .X_OK ):
+            return value 
+        found =shutil .which (value )
+        if found :
+            return found 
+    return None 
 
 
-def lua_quote_bytes(value):
-    text = value.decode("utf-8", errors="replace")
-    text = text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
-    return f'"{text}"'
+def find_luadec ():
+    return resolve_executable (LUADEC_EXECUTABLE ,[
+    "/home/container/luadec",
+    "/home/container/bin/luadec",
+    "/home/container/bin/luadec51",
+    "/usr/local/bin/luadec",
+    "/usr/bin/luadec",
+    "luadec",
+    "luadec51",
+    ])
 
 
-def static_deobfuscate_lua(source):
-    result = source.lstrip("\ufeff")
-    for _ in range(5):
-        previous = result
-
-        def replace_string_char(match):
-            args = match.group(1)
-            parts = [part.strip() for part in args.split(",") if part.strip()]
-            if not parts or any(not re.fullmatch(r"-?\d+", part) for part in parts):
-                return match.group(0)
-            values = [int(part) for part in parts]
-            if any(value < 0 or value > 255 for value in values):
-                return match.group(0)
-            return lua_quote_bytes(bytes(values))
-
-        result = re.sub(r"string\.char\s*\(([^()]*?)\)", replace_string_char, result, flags=re.DOTALL)
-
-        def replace_reverse(match):
-            decoded = decode_lua_string_literal(match.group(1))
-            if decoded is None:
-                return match.group(0)
-            return lua_quote_bytes(decoded[::-1])
-
-        result = re.sub(r"string\.reverse\s*(([\"'][^\"']*[\"']))", replace_reverse, result)
-
-        def replace_rep(match):
-            literal = decode_lua_string_literal(match.group(1))
-            count = int(match.group(2))
-            if literal is None or count < 0 or count > 10000:
-                return match.group(0)
-            value = literal * count
-            if len(value) > 100000:
-                return match.group(0)
-            return lua_quote_bytes(value)
-
-        result = re.sub(r"string\.rep\s*(([\"'][^\"']*[\"']))\s*,\s*(\d+)", replace_rep, result)
-        if result == previous:
-            break
-
-    return result
+def find_java ():
+    return resolve_executable (JAVA_EXECUTABLE ,["/usr/bin/java","/usr/local/bin/java","java"])
 
 
-def printable_strings(data, minimum=4):
-    strings = []
-    current = bytearray()
-    for byte in data:
-        if 32 <= byte <= 126 or byte in (9,):
-            current.append(byte)
-        else:
-            if len(current) >= minimum:
-                strings.append(current.decode("ascii", errors="replace"))
-            current.clear()
-    if len(current) >= minimum:
-        strings.append(current.decode("ascii", errors="replace"))
-    return strings
+def is_lua_bytecode (data ):
+    return data .startswith (b"\x1bLua")
 
 
-def make_static_dump(filename, data):
-    digest = hashlib.sha256(data).hexdigest()
-    kind = "Lua 5.x bytecode" if is_lua_bytecode(data) else "Lua/source text"
-    strings = printable_strings(data)
-    lines = [
-        "LUA STATIC DUMP",
-        "================",
-        f"File: {filename}",
-        f"Size: {len(data):,} bytes",
-        f"Format: {kind}",
-        f"SHA-256: {digest}",
-        "",
-        f"Printable strings ({len(strings):,}):",
+def decode_lua_string_literal (value ):
+    if len (value )<2 or value [0 ]not in {'"',"'"}or value [-1 ]!=value [0 ]:
+        return None 
+    body =value [1 :-1 ]
+    out =bytearray ()
+    i =0 
+    simple ={"a":7 ,"b":8 ,"f":12 ,"n":10 ,"r":13 ,"t":9 ,"v":11 ,"\\":92 ,'"':34 ,"'":39 }
+    while i <len (body ):
+        ch =body [i ]
+        if ch !="\\":
+            out .extend (ch .encode ("utf-8"))
+            i +=1 
+            continue 
+        i +=1 
+        if i >=len (body ):
+            return None 
+        esc =body [i ]
+        if esc in simple :
+            out .append (simple [esc ])
+            i +=1 
+            continue 
+        if esc in {"x","X"}and i +2 <len (body ):
+            piece =body [i +1 :i +3 ]
+            if re .fullmatch (r"[0-9A-Fa-f]{2}",piece ):
+                out .append (int (piece ,16 ))
+                i +=3 
+                continue 
+        if esc .isdigit ():
+            j =i 
+            while j <len (body )and j <i +3 and body [j ].isdigit ():
+                j +=1 
+            number =int (body [i :j ])
+            if number >255 :
+                return None 
+            out .append (number )
+            i =j 
+            continue 
+        if esc =="z":
+            i +=1 
+            while i <len (body )and body [i ].isspace ():
+                i +=1 
+            continue 
+        if esc =="\n":
+            i +=1 
+            continue 
+        out .extend (esc .encode ("utf-8"))
+        i +=1 
+    return bytes (out )
+
+
+def lua_quote_bytes (value ):
+    text =value .decode ("utf-8",errors ="replace")
+    text =text .replace ("\\","\\\\").replace ('"','\\"').replace ("\r","\\r").replace ("\n","\\n")
+    return f'"{text }"'
+
+
+def static_deobfuscate_lua (source ):
+    result =source .lstrip ("\ufeff")
+    for _ in range (8 ):
+        previous =result 
+
+        def replace_string_char (match ):
+            args =match .group (1 )
+            parts =[part .strip ()for part in args .split (",")if part .strip ()]
+            if not parts or any (not re .fullmatch (r"-?\d+",part )for part in parts ):
+                return match .group (0 )
+            values =[int (part )for part in parts ]
+            if any (value <0 or value >255 for value in values ):
+                return match .group (0 )
+            return lua_quote_bytes (bytes (values ))
+
+        result =re .sub (r"string\.char\s*\(([^()]*)\)",replace_string_char ,result ,flags =re .DOTALL )
+
+        def replace_reverse (match ):
+            decoded =decode_lua_string_literal (match .group (1 ))
+            return lua_quote_bytes (decoded [::-1 ])if decoded is not None else match .group (0 )
+
+        result =re .sub (r"string\.reverse\s*\(\s*([\"'][^\"']*[\"'])\s*\)",replace_reverse ,result )
+
+        def replace_rep (match ):
+            literal =decode_lua_string_literal (match .group (1 ))
+            count =int (match .group (2 ))
+            if literal is None or count <0 or count >10000 :
+                return match .group (0 )
+            value =literal *count 
+            if len (value )>100000 :
+                return match .group (0 )
+            return lua_quote_bytes (value )
+
+        result =re .sub (r"string\.rep\s*\(\s*([\"'][^\"']*[\"'])\s*,\s*(\d+)\s*\)",replace_rep ,result )
+
+        def replace_concat (match ):
+            left =decode_lua_string_literal (match .group (1 ))
+            right =decode_lua_string_literal (match .group (2 ))
+            if left is None or right is None :
+                return match .group (0 )
+            return lua_quote_bytes (left +right )
+
+        result =re .sub (r"(\"[^\"]*\"|'[^']*')\s*\.\.\s*(\"[^\"]*\"|'[^']*')",replace_concat ,result )
+
+        def replace_simple_arithmetic (match ):
+            a =int (match .group (1 ))
+            op =match .group (2 )
+            b =int (match .group (3 ))
+            if op =="+":
+                value =a +b 
+            elif op =="-":
+                value =a -b 
+            elif op =="*":
+                value =a *b 
+            elif op =="/":
+                if b ==0 :
+                    return match .group (0 )
+                value =a /b 
+            else :
+                return match .group (0 )
+            if isinstance (value ,float )and value .is_integer ():
+                value =int (value )
+            return str (value )
+
+        result =re .sub (r"(?<![\w.])(-?\d+)\s*([+\-*/])\s*(-?\d+)(?![\w.])",replace_simple_arithmetic ,result )
+        if result ==previous :
+            break 
+    return result if result .strip ()else source 
+
+
+def printable_strings (data ,minimum =4 ):
+    strings =[]
+    current =bytearray ()
+    for byte in data :
+        if 32 <=byte <=126 or byte ==9 :
+            current .append (byte )
+        else :
+            if len (current )>=minimum :
+                strings .append (current .decode ("ascii",errors ="replace"))
+            current .clear ()
+    if len (current )>=minimum :
+        strings .append (current .decode ("ascii",errors ="replace"))
+    return strings 
+
+
+def make_static_dump (filename ,data ):
+    digest =hashlib .sha256 (data ).hexdigest ()
+    kind ="Lua bytecode"if is_lua_bytecode (data )else "Lua/TXT source"
+    strings =printable_strings (data )
+    lines =[
+    "LUA STATIC DUMP",
+    "================",
+    f"File: {filename }",
+    f"Size: {len (data ):,} bytes",
+    f"Format: {kind }",
+    f"SHA-256: {digest }",
+    "",
+    f"Printable strings ({len (strings ):,}):",
     ]
-    lines.extend(f"[{index:04d}] {value}" for index, value in enumerate(strings[:5000], 1))
-    if len(strings) > 5000:
-        lines.append(f"... {len(strings) - 5000:,} additional strings omitted ...")
-    return "\n".join(lines) + "\n"
+    lines .extend (f"[{index :04d}] {value }"for index ,value in enumerate (strings [:5000 ],1 ))
+    if len (strings )>5000 :
+        lines .append (f"... {len (strings )-5000 :,} additional strings omitted ...")
+    return "\n".join (lines )+"\n"
 
 
-def run_luadec(data, mode, workdir, filename):
-    luadec = find_luadec()
-    if not luadec:
-        return None, "LuaDec is not installed. Set LUADEC_EXECUTABLE to the LuaDec binary path."
-    input_path = os.path.join(workdir, filename)
-    with open(input_path, "wb") as handle:
-        handle.write(data)
-    command = [luadec]
-    if mode == "dump":
-        command.append("-dis")
-    command.append(input_path)
-    try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=LUA_TOOL_TIMEOUT,
-            check=False,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+def run_luadec (data ,mode ,workdir ,filename ):
+    luadec =find_luadec ()
+    if not luadec :
+        return None ,"LuaDec is not installed."
+    safe_name =os .path .basename (filename )or "input.lua"
+    input_path =os .path .join (workdir ,safe_name )
+    with open (input_path ,"wb")as handle :
+        handle .write (data )
+    command =[luadec ]
+    if mode =="dump":
+        command .append ("-dis")
+    command .append (input_path )
+    try :
+        completed =subprocess .run (
+        command ,
+        stdin =subprocess .DEVNULL ,
+        stdout =subprocess .PIPE ,
+        stderr =subprocess .STDOUT ,
+        timeout =LUA_TOOL_TIMEOUT ,
+        check =False ,
+        text =True ,
+        encoding ="utf-8",
+        errors ="replace",
         )
-    except subprocess.TimeoutExpired as error:
-        return None, f"LuaDec timed out after {LUA_TOOL_TIMEOUT} seconds."
-    except OSError as error:
-        return None, f"Could not start LuaDec: {error}"
-    output = completed.stdout or ""
-    if completed.returncode != 0:
-        return None, f"LuaDec exited with code {completed.returncode}.\n{output[-4000:]}"
-    if not output.strip():
-        return None, "LuaDec returned an empty result."
-    return output, None
+    except subprocess .TimeoutExpired :
+        return None ,f"LuaDec timed out after {LUA_TOOL_TIMEOUT } seconds."
+    except OSError as error :
+        return None ,f"Could not start LuaDec: {error }"
+    output =completed .stdout or ""
+    if completed .returncode !=0 :
+        return None ,f"LuaDec exited with code {completed .returncode }: {output [-1500 :]}"
+    if not output .strip ():
+        return None ,"LuaDec returned an empty result."
+    return output ,None 
 
 
-def run_unluac(data, workdir, filename):
-    jar = UNLUAC_JAR
-    if not jar or not os.path.isfile(jar):
-        return None, "unluac.jar is not configured. Set UNLUAC_JAR to a downloaded unluac JAR."
-    java = find_java()
-    if not java:
-        return None, "Java was not found for unluac."
-    input_path = os.path.join(workdir, filename)
-    with open(input_path, "wb") as handle:
-        handle.write(data)
-    try:
-        completed = subprocess.run(
-            [java, "-jar", jar, input_path],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=LUA_TOOL_TIMEOUT,
-            check=False,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+def run_unluac (data ,workdir ,filename ):
+    if not UNLUAC_JAR or not os .path .isfile (UNLUAC_JAR ):
+        return None ,"unluac.jar is not configured."
+    java =find_java ()
+    if not java :
+        return None ,"Java is not installed."
+    safe_name =os .path .basename (filename )or "input.luac"
+    input_path =os .path .join (workdir ,safe_name )
+    with open (input_path ,"wb")as handle :
+        handle .write (data )
+    try :
+        completed =subprocess .run (
+        [java ,"-jar",UNLUAC_JAR ,input_path ],
+        stdin =subprocess .DEVNULL ,
+        stdout =subprocess .PIPE ,
+        stderr =subprocess .STDOUT ,
+        timeout =LUA_TOOL_TIMEOUT ,
+        check =False ,
+        text =True ,
+        encoding ="utf-8",
+        errors ="replace",
         )
-    except subprocess.TimeoutExpired:
-        return None, f"unluac timed out after {LUA_TOOL_TIMEOUT} seconds."
-    except OSError as error:
-        return None, f"Could not start unluac: {error}"
-    output = completed.stdout or ""
-    if completed.returncode != 0:
-        return None, f"unluac exited with code {completed.returncode}.\n{output[-4000:]}"
-    if not output.strip():
-        return None, "unluac returned an empty result."
-    return output, None
+    except subprocess .TimeoutExpired :
+        return None ,f"unluac timed out after {LUA_TOOL_TIMEOUT } seconds."
+    except OSError as error :
+        return None ,f"Could not start unluac: {error }"
+    output =completed .stdout or ""
+    if completed .returncode !=0 :
+        return None ,f"unluac exited with code {completed .returncode }: {output [-1500 :]}"
+    if not output .strip ():
+        return None ,"unluac returned an empty result."
+    return output ,None 
 
 
-def process_lua_upload(filename, data, mode, workdir):
-    if mode == "dump":
-        if is_lua_bytecode(data):
-            result, error = run_luadec(data, "dump", workdir, filename)
-            if result is not None:
-                return result, "dump.txt", "LuaDec bytecode disassembly"
-        return make_static_dump(filename, data), "dump.txt", "Static Lua dump"
+def build_lua_results (filename ,data ,workdir ):
+    dump_result =None 
+    dump_method =None 
+    if is_lua_bytecode (data ):
+        dump_result ,dump_error =run_luadec (data ,"dump",workdir ,filename )
+    else :
+        dump_error =None 
+    if dump_result is None :
+        dump_result =make_static_dump (filename ,data )
+        dump_method ="Static Lua dump"if not dump_error else f"Static Lua dump; LuaDec unavailable: {dump_error }"
+    else :
+        dump_method ="LuaDec bytecode disassembly"
 
-    if is_lua_bytecode(data):
-        result, error = run_unluac(data, workdir, filename)
-        if result is None:
-            result, error = run_luadec(data, "deobf", workdir, filename)
-        if result is None:
-            raise RuntimeError(error or "No Lua bytecode decompiler is available. Set UNLUAC_JAR or LUADEC_EXECUTABLE.")
-        return result, "deobfuscated.lua", "Lua bytecode decompilation"
+    if is_lua_bytecode (data ):
+        deobf_result ,deobf_error =run_unluac (data ,workdir ,filename )
+        deobf_method ="unluac bytecode decompilation"
+        if deobf_result is None :
+            deobf_result ,deobf_error =run_luadec (data ,"deobf",workdir ,filename )
+            deobf_method ="LuaDec bytecode decompilation"
+        if deobf_result is None :
+            deobf_result =dump_result 
+            deobf_method =f"Static bytecode analysis; decompiler unavailable: {deobf_error or 'unknown error'}"
+            deobf_name ="deobfuscated.lua.txt"
+        else :
+            deobf_name ="deobfuscated.lua"
+    else :
+        deobf_result =static_deobfuscate_lua (data .decode ("utf-8-sig",errors ="replace"))
+        deobf_method ="Static Lua cleanup"
+        deobf_name ="deobfuscated.lua"
+    return dump_result ,dump_method ,deobf_result ,deobf_method ,deobf_name 
 
-    result = static_deobfuscate_lua(data.decode("utf-8-sig", errors="replace"))
-    return result, "deobfuscated.lua", "Static Lua deobfuscation"
+
+def cap_result (text ):
+    data =text .encode ("utf-8")
+    if len (data )<=PASTEFY_MAX_BYTES :
+        return text ,False 
+    return data [:PASTEFY_MAX_BYTES ].decode ("utf-8",errors ="ignore"),True 
 
 
-class LuaToolView(discord.ui.LayoutView):
-    def __init__(self, ctx, filename, data):
-        super().__init__(timeout=900)
-        self.ctx = ctx
-        self.filename = filename
-        self.data = data
-        self.busy = False
-        self.message = None
-        self.dump_button = discord.ui.Button(label="Dump Lua", style=discord.ButtonStyle.secondary, emoji="🔎")
-        self.deobf_button = discord.ui.Button(label="Deobfuscate Lua", style=discord.ButtonStyle.primary, emoji="🧹")
-        self.cancel_button = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✕")
-
-        async def run_dump(interaction):
-            await self.run(interaction, "dump")
-
-        async def run_deobf(interaction):
-            await self.run(interaction, "deobf")
-
-        async def cancel(interaction):
-            self.stop()
-            await interaction.response.edit_message(content="Lua processing cancelled.", view=None)
-            self.cleanup()
-
-        self.dump_button.callback = run_dump
-        self.deobf_button.callback = run_deobf
-        self.cancel_button.callback = cancel
-        self.add_item(
-            make_container(
-                make_text("## 🧰 Lua Toolkit"),
-                make_text(
-                    f"**File:** `{discord.utils.escape_markdown(self.filename)}`\n"
-                    f"**Size:** `{len(self.data):,} bytes`\n\n"
-                    "Choose a static dump or deobfuscation pass. Uploaded Lua is never executed by the bot."
-                ),
-                make_separator(),
-                discord.ui.ActionRow(self.dump_button, self.deobf_button, self.cancel_button),
-            )
+class LuaResultsView (discord .ui .LayoutView ):
+    def __init__ (self ,filename ,dump_result ,dump_method ,deobf_result ,deobf_method ,deobf_name ,dump_raw ,deobf_raw ):
+        super ().__init__ (timeout =900 )
+        self .dump_result =dump_result 
+        self .deobf_result =deobf_result 
+        self .deobf_name =deobf_name 
+        self .dump_raw =dump_raw 
+        self .deobf_raw =deobf_raw 
+        buttons =[]
+        if dump_raw :
+            buttons .append (discord .ui .Button (label ="Raw Dump",style =discord .ButtonStyle .link ,emoji ="🔎",url =dump_raw ))
+        if deobf_raw :
+            buttons .append (discord .ui .Button (label ="Raw Deobfuscated",style =discord .ButtonStyle .link ,emoji ="🔗",url =deobf_raw ))
+        self .dump_button =discord .ui .Button (label ="Download Dump",style =discord .ButtonStyle .secondary ,emoji ="📄")
+        self .deobf_button =discord .ui .Button (label ="Download Result",style =discord .ButtonStyle .success ,emoji ="⬇️")
+        self .dump_button .callback =self .download_dump 
+        self .deobf_button .callback =self .download_deobf 
+        buttons .extend ([self .dump_button ,self .deobf_button ])
+        self .add_item (
+        make_container (
+        make_text ("## ✅ Lua Toolkit Results"),
+        make_separator (),
+        make_text (
+        f"**Input:** `{discord .utils .escape_markdown (filename )}`\n"
+        f"**Dump:** `{discord .utils .escape_markdown (dump_method )}`\n"
+        f"**Deobfuscation:** `{discord .utils .escape_markdown (deobf_method )}`\n"
+        f"**Dump size:** `{len (dump_result .encode ('utf-8')):,} bytes`\n"
+        f"**Result size:** `{len (deobf_result .encode ('utf-8')):,} bytes`"
+        ),
+        make_separator (),
+        make_text (
+        (f"**Raw Dump:** {dump_raw }\n"if dump_raw else "**Raw Dump:** unavailable\n")
+        +(f"**Raw Deobfuscated:** {deobf_raw }"if deobf_raw else "**Raw Deobfuscated:** unavailable")
+        ),
+        make_separator (),
+        discord .ui .ActionRow (*buttons ),
         )
-
-    def cleanup(self):
-        try:
-            for name in os.listdir(self.workdir):
-                path = os.path.join(self.workdir, name)
-                if os.path.isfile(path):
-                    os.remove(path)
-        except Exception:
-            pass
-        try:
-            os.rmdir(self.workdir)
-        except Exception:
-            pass
-
-    async def run(self, interaction, mode):
-        if self.busy:
-            await interaction.response.send_message("A Lua job is already running for this upload.", ephemeral=True)
-            return
-        self.busy = True
-        self.dump_button.disabled = True
-        self.deobf_button.disabled = True
-        self.cancel_button.disabled = True
-        await interaction.response.edit_message(
-            content=None,
-            view=LuaProcessingView(self.filename, "Dumping and analyzing..." if mode == "dump" else "Deobfuscating and analyzing..."),
-        )
-        try:
-            result, output_name, method = await asyncio.to_thread(
-                process_lua_upload,
-                self.filename,
-                self.data,
-                mode,
-                self.workdir,
-            )
-            if len(result.encode("utf-8")) > PASTEFY_MAX_BYTES:
-                result = result[:PASTEFY_MAX_BYTES]
-                method += " · output truncated to 5 MB"
-            raw_url = None
-            if PASTEFY_API_TOKEN:
-                try:
-                    raw_url = await asyncio.to_thread(
-                        create_pastefy_paste_sync,
-                        output_name,
-                        result,
-                        PASTEFY_API_TOKEN,
-                    )
-                except Exception:
-                    raw_url = None
-            await interaction.edit_original_response(
-                content=None,
-                view=LuaResultView(self.filename, output_name, result, method, raw_url),
-                attachments=[discord.File(__import__("io").BytesIO(result.encode("utf-8")), filename=output_name)],
-            )
-            self.stop()
-            self.cleanup()
-        except Exception as error:
-            self.busy = False
-            self.dump_button.disabled = False
-            self.deobf_button.disabled = False
-            self.cancel_button.disabled = False
-            await interaction.edit_original_response(
-                content=f"Lua processing failed: {error}",
-                view=self,
-            )
-
-    async def on_timeout(self):
-        self.cleanup()
-        try:
-            if self.message is not None:
-                await self.message.edit(view=None)
-        except Exception:
-            pass
-
-
-class LuaProcessingView(discord.ui.LayoutView):
-    def __init__(self, filename, status):
-        super().__init__(timeout=None)
-        self.add_item(
-            make_container(
-                make_text("## ⚙️ Lua Toolkit"),
-                make_text(f"**File:** `{discord.utils.escape_markdown(filename)}`\n{status}"),
-            )
         )
 
-
-class LuaResultView(discord.ui.LayoutView):
-    def __init__(self, source_name, output_name, result, method, raw_url):
-        super().__init__(timeout=900)
-        self.source_name = source_name
-        self.output_name = output_name
-        self.result = result
-        self.raw_url = raw_url
-        self.download_button = discord.ui.Button(
-            label="Download",
-            style=discord.ButtonStyle.success,
-            emoji="⬇️",
-        )
-        self.download_button.callback = self.download_result
-        buttons = []
-        if self.raw_url:
-            buttons.append(
-                discord.ui.Button(
-                    label="View Raw",
-                    style=discord.ButtonStyle.link,
-                    emoji="🔗",
-                    url=self.raw_url,
-                )
+    async def download_dump (self ,interaction ):
+        try :
+            await interaction .response .send_message (
+            file =discord .File (io .BytesIO (self .dump_result .encode ("utf-8")),filename ="dump.txt"),
+            ephemeral =True ,
             )
-        buttons.append(self.download_button)
-        self.add_item(
-            make_container(
-                make_text("## ✅ Lua Result"),
-                make_text(
-                    f"**Input:** `{discord.utils.escape_markdown(source_name)}`\n"
-                    f"**Output:** `{discord.utils.escape_markdown(output_name)}`\n"
-                    f"**Method:** `{discord.utils.escape_markdown(method)}`\n"
-                    f"**Output size:** `{len(result.encode('utf-8')):,} bytes`"
-                ),
-                make_separator(),
-                make_text(
-                    f"**Raw result:** {raw_url}"
-                    if raw_url
-                    else "**Raw result:** Pastefy is not configured or the upload failed. Use Download below for the complete result."
-                ),
-                make_separator(),
-                discord.ui.ActionRow(*buttons),
+        except discord .HTTPException as error :
+            await interaction .response .send_message (f"Download failed: {error }",ephemeral =True )
+
+    async def download_deobf (self ,interaction ):
+        try :
+            await interaction .response .send_message (
+            file =discord .File (io .BytesIO (self .deobf_result .encode ("utf-8")),filename =self .deobf_name ),
+            ephemeral =True ,
             )
-        )
+        except discord .HTTPException as error :
+            await interaction .response .send_message (f"Download failed: {error }",ephemeral =True )
 
-    async def download_result(self, interaction):
-        self.download_button.disabled = True
-        await interaction.response.edit_message(view=self)
-        try:
-            await interaction.followup.send(
-                file=discord.File(io.BytesIO(self.result.encode("utf-8")), filename=self.output_name),
-                ephemeral=True,
-            )
-        except discord.HTTPException as error:
-            await interaction.followup.send(f"Download failed: {error}", ephemeral=True)
-        finally:
-            self.download_button.disabled = False
-            try:
-                await interaction.edit_original_response(view=self)
-            except discord.HTTPException:
-                pass
-
-    async def on_timeout(self):
-        self.stop()
+    async def on_timeout (self ):
+        self .stop ()
 
 
-def is_public_http_url(value):
-    try:
-        parsed = urlparse(value)
-    except ValueError:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-        return False
-    try:
-        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme.lower() == "https" else 80), type=socket.SOCK_STREAM)
-    except (socket.gaierror, OSError, ValueError):
-        return False
-    for address in addresses:
-        try:
-            ip = ipaddress.ip_address(address[4][0])
-        except ValueError:
-            return False
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-            return False
-    return True
+def is_public_http_url (value ):
+    try :
+        parsed =urlparse (value )
+    except ValueError :
+        return False 
+    if parsed .scheme .lower ()not in {"http","https"}or not parsed .hostname or parsed .username or parsed .password :
+        return False 
+    try :
+        addresses =socket .getaddrinfo (parsed .hostname ,parsed .port or (443 if parsed .scheme .lower ()=="https"else 80 ),type =socket .SOCK_STREAM )
+    except (socket .gaierror ,OSError ,ValueError ):
+        return False 
+    for address in addresses :
+        try :
+            ip =ipaddress .ip_address (address [4 ][0 ])
+        except ValueError :
+            return False 
+        if ip .is_private or ip .is_loopback or ip .is_link_local or ip .is_multicast or ip .is_reserved or ip .is_unspecified :
+            return False 
+    return True 
 
 
-class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not is_public_http_url(newurl):
-            raise urllib.error.URLError("Redirect target is not a public HTTP(S) URL.")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+class SafeRedirectHandler (urllib .request .HTTPRedirectHandler ):
+    def redirect_request (self ,req ,fp ,code ,msg ,headers ,newurl ):
+        if not is_public_http_url (newurl ):
+            raise urllib .error .URLError ("Redirect target is not a public HTTP(S) URL.")
+        return super ().redirect_request (req ,fp ,code ,msg ,headers ,newurl )
 
 
-def fetch_remote_lua_sync(url):
-    if not is_public_http_url(url):
-        raise RuntimeError("The raw link must be a public HTTP(S) URL.")
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "text/plain,text/*;q=0.9,*/*;q=0.1",
-            "User-Agent": "PanelBot/1.0",
-        },
-        method="GET",
+def fetch_remote_lua_sync (url ):
+    if not is_public_http_url (url ):
+        raise RuntimeError ("The raw link must be a public HTTP(S) URL.")
+    request =urllib .request .Request (
+    url ,
+    headers ={"Accept":"text/plain,text/*;q=0.9,*/*;q=0.1","User-Agent":"PanelBot/1.0"},
+    method ="GET",
     )
-    opener = urllib.request.build_opener(SafeRedirectHandler)
-    try:
-        with opener.open(request, timeout=20) as response:
-            content_length = response.headers.get("Content-Length")
-            if content_length:
-                try:
-                    if int(content_length) > LUA_PROCESS_MAX_BYTES:
-                        raise RuntimeError("That raw file is too large. The maximum size is 2 MB.")
-                except ValueError:
-                    pass
-            chunks = []
-            total = 0
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > LUA_PROCESS_MAX_BYTES:
-                    raise RuntimeError("That raw file is too large. The maximum size is 2 MB.")
-                chunks.append(chunk)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(f"The raw link returned HTTP {error.code}.") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"Could not fetch the raw link: {error.reason}") from error
-    data = b"".join(chunks)
-    if not data:
-        raise RuntimeError("The raw file is empty.")
-    try:
-        data.decode("utf-8-sig")
-    except UnicodeDecodeError as error:
-        raise RuntimeError("The raw link must contain a UTF-8 Lua or TXT file.") from error
-    path_name = os.path.basename(urlparse(url).path)
-    if path_name.lower().endswith((".lua", ".txt")):
-        filename = path_name
-    else:
-        filename = "remote.lua"
-    return filename, data
+    opener =urllib .request .build_opener (SafeRedirectHandler )
+    try :
+        with opener .open (request ,timeout =15 )as response :
+            content_length =response .headers .get ("Content-Length")
+            if content_length :
+                try :
+                    if int (content_length )>LUA_PROCESS_MAX_BYTES :
+                        raise RuntimeError ("That raw file is too large. The maximum size is 2 MB.")
+                except ValueError :
+                    pass 
+            chunks =[]
+            total =0 
+            while True :
+                chunk =response .read (65536 )
+                if not chunk :
+                    break 
+                total +=len (chunk )
+                if total >LUA_PROCESS_MAX_BYTES :
+                    raise RuntimeError ("That raw file is too large. The maximum size is 2 MB.")
+                chunks .append (chunk )
+    except urllib .error .HTTPError as error :
+        raise RuntimeError (f"The raw link returned HTTP {error .code }.")from error 
+    except urllib .error .URLError as error :
+        raise RuntimeError (f"Could not fetch the raw link: {error .reason }")from error 
+    data =b"".join (chunks )
+    if not data :
+        raise RuntimeError ("The raw file is empty.")
+    try :
+        data .decode ("utf-8-sig")
+    except UnicodeDecodeError as error :
+        raise RuntimeError ("The raw link must contain a UTF-8 Lua or TXT file.")from error 
+    path_name =os .path .basename (urlparse (url ).path )
+    filename =path_name if path_name .lower ().endswith ((".lua",".txt"))else "remote.lua"
+    return filename ,data 
 
 
-@bot.command(name="l")
-async def lua_tool_command(ctx: commands.Context, source: str = None):
-    attachments = list(ctx.message.attachments)
-    if len(attachments) > 1:
-        await ctx.send("Use exactly one `.lua` or `.txt` attachment, or provide one raw HTTP(S) link.")
-        return
-    if attachments and source:
-        await ctx.send("Use either one `.lua`/`.txt` attachment or one raw HTTP(S) link, not both.")
-        return
-    if not attachments and not source:
-        await ctx.send("Usage: `.l` with a `.lua` or `.txt` attachment, or `.l <raw link>`.")
-        return
-
-    filename = None
-    data = None
-    if source:
-        source = source.strip()
-        status = await ctx.send("⏳ Fetching the raw Lua/TXT file...")
-        try:
-            filename, data = await asyncio.to_thread(fetch_remote_lua_sync, source)
-        except Exception as error:
-            await status.edit(content=f"Could not fetch the raw link: {error}")
-            return
-        await status.delete()
-    else:
-        attachment = attachments[0]
-        filename = os.path.basename(attachment.filename or "lua_input.lua")
-        extension = os.path.splitext(filename)[1].lower()
-        if extension not in {".lua", ".txt"}:
-            await ctx.send("Only `.lua` and `.txt` files are supported.")
-            return
-        if attachment.size is not None and attachment.size > LUA_PROCESS_MAX_BYTES:
-            await ctx.send("That file is too large. The maximum size is 2 MB.")
-            return
-        try:
-            data = await attachment.read()
-        except discord.HTTPException as error:
-            await ctx.send(f"I could not read that file: {error}")
-            return
-        if len(data) > LUA_PROCESS_MAX_BYTES:
-            await ctx.send("That file is too large. The maximum size is 2 MB.")
-            return
-        if not data:
-            await ctx.send("The uploaded file is empty.")
-            return
-        try:
-            data.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            await ctx.send("The uploaded file must contain valid UTF-8 Lua or TXT text.")
-            return
-
-    view = LuaToolView(ctx, filename, data)
-    view.workdir = tempfile.mkdtemp(prefix="lua_tool_")
-    view.message = await ctx.send(content=None, view=view)
-
-
-class PurgeView(discord.ui.LayoutView):
-    def __init__(self, requested, deleted, channel):
-        super().__init__(timeout=None)
-        self.add_item(
-            make_container(
-                make_text("## 🧹 Purge Complete"),
-                make_separator(),
-                make_text("The cleanup finished successfully."),
-                make_separator(),
-                make_text(
-                    f"### 📋 Results\n"
-                    f"**Requested:** `{requested:,}`\n"
-                    f"**Deleted:** `{deleted:,}`\n"
-                    f"**Channel:** {channel.mention}"
-                ),
+async def process_l_command (ctx ,filename ,data ):
+    status =await ctx .send (f"⏳ **Lua Toolkit**\nProcessing `{discord .utils .escape_markdown (filename )}`...")
+    workdir =tempfile .mkdtemp (prefix ="lua_tool_")
+    try :
+        dump_result ,dump_method ,deobf_result ,deobf_method ,deobf_name =await asyncio .to_thread (
+        build_lua_results ,
+        filename ,
+        data ,
+        workdir ,
+        )
+        dump_result ,dump_truncated =cap_result (dump_result )
+        deobf_result ,deobf_truncated =cap_result (deobf_result )
+        if dump_truncated :
+            dump_method +=" · output capped at 5 MB"
+        if deobf_truncated :
+            deobf_method +=" · output capped at 5 MB"
+        dump_raw =None 
+        deobf_raw =None 
+        if PASTEFY_API_TOKEN :
+            results =await asyncio .gather (
+            asyncio .to_thread (create_pastefy_paste_sync ,"dump.txt",dump_result ,PASTEFY_API_TOKEN ),
+            asyncio .to_thread (create_pastefy_paste_sync ,deobf_name ,deobf_result ,PASTEFY_API_TOKEN ),
+            return_exceptions =True ,
             )
+            if isinstance (results [0 ],str ):
+                dump_raw =results [0 ]
+            if isinstance (results [1 ],str ):
+                deobf_raw =results [1 ]
+        view =LuaResultsView (
+        filename ,
+        dump_result ,
+        dump_method ,
+        deobf_result ,
+        deobf_method ,
+        deobf_name ,
+        dump_raw ,
+        deobf_raw ,
+        )
+        await status .edit (content =None ,view =view )
+    except Exception as error :
+        await status .edit (content =f"❌ **Lua processing failed**\n`{discord .utils .escape_markdown (str (error )[:1500 ])}`")
+    finally :
+        shutil .rmtree (workdir ,ignore_errors =True )
+
+
+@bot .command (name ="l")
+async def lua_tool_command (ctx :commands .Context ,source :str =None ):
+    attachments =list (ctx .message .attachments )
+    if len (attachments )>1 :
+        await ctx .send ("Use exactly one `.lua` or `.txt` attachment, or provide one raw HTTP(S) link.")
+        return 
+    if attachments and source :
+        await ctx .send ("Use either one `.lua`/`.txt` attachment or one raw HTTP(S) link, not both.")
+        return 
+    if not attachments and not source :
+        await ctx .send ("Usage: `.l` with one `.lua` or `.txt` attachment, or `.l <raw link>`.")
+        return 
+    if source :
+        status =await ctx .send ("⏳ **Lua Toolkit**\nFetching the raw Lua/TXT file...")
+        try :
+            filename ,data =await asyncio .to_thread (fetch_remote_lua_sync ,source .strip ())
+        except Exception as error :
+            await status .edit (content =f"❌ **Could not fetch the raw link**\n`{discord .utils .escape_markdown (str (error )[:1500 ])}`")
+            return 
+        await status .delete ()
+    else :
+        attachment =attachments [0 ]
+        filename =os .path .basename (attachment .filename or "lua_input.lua")
+        extension =os .path .splitext (filename )[1 ].lower ()
+        if extension not in {".lua",".txt"}:
+            await ctx .send ("Only `.lua` and `.txt` files are supported.")
+            return 
+        if attachment .size is not None and attachment .size >LUA_PROCESS_MAX_BYTES :
+            await ctx .send ("That file is too large. The maximum size is 2 MB.")
+            return 
+        try :
+            data =await attachment .read ()
+        except discord .HTTPException as error :
+            await ctx .send (f"I could not read that file: {error }")
+            return 
+        if len (data )>LUA_PROCESS_MAX_BYTES :
+            await ctx .send ("That file is too large. The maximum size is 2 MB.")
+            return 
+        if not data :
+            await ctx .send ("The uploaded file is empty.")
+            return 
+        try :
+            data .decode ("utf-8-sig")
+        except UnicodeDecodeError :
+            await ctx .send ("The uploaded file must be valid UTF-8 Lua or TXT text.")
+            return 
+    await process_l_command (ctx ,filename ,data )
+
+
+class PurgeView (discord .ui .LayoutView ):
+    def __init__ (self ,requested ,deleted ,channel ):
+        super ().__init__ (timeout =None )
+        self .add_item (
+        make_container (
+        make_text ("## 🧹 Purge Complete"),
+        make_separator (),
+        make_text ("The cleanup finished successfully."),
+        make_separator (),
+        make_text (
+        f"### 📋 Results\n"
+        f"**Requested:** `{requested :,}`\n"
+        f"**Deleted:** `{deleted :,}`\n"
+        f"**Channel:** {channel .mention }"
+        ),
+        )
         )
 
-class MessageIdModal(discord.ui.Modal, title="Set Target Message"):
-    message_id = discord.ui.TextInput(
-        label="Message ID",
-        placeholder="Paste the Discord message ID here",
-        required=True,
-        max_length=30,
+class MessageIdModal (discord .ui .Modal ,title ="Set Target Message"):
+    message_id =discord .ui .TextInput (
+    label ="Message ID",
+    placeholder ="Paste the Discord message ID here",
+    required =True ,
+    max_length =30 ,
     )
 
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
+    def __init__ (self ,parent_view ):
+        super ().__init__ ()
+        self .parent_view =parent_view 
 
-    async def on_submit(self, interaction):
-        value = str(self.message_id.value).strip()
-        if not value.isdigit():
-            await interaction.response.send_message("❌ That is not a valid Discord message ID.", ephemeral=True)
-            return
-        self.parent_view.message_id = int(value)
-        self.parent_view.refresh()
-        await interaction.response.send_message(f"✅ Target message set to `{value}`.", ephemeral=True)
+    async def on_submit (self ,interaction ):
+        value =str (self .message_id .value ).strip ()
+        if not value .isdigit ():
+            await interaction .response .send_message ("❌ That is not a valid Discord message ID.",ephemeral =True )
+            return 
+        self .parent_view .message_id =int (value )
+        self .parent_view .refresh ()
+        await interaction .response .send_message (f"✅ Target message set to `{value }`.",ephemeral =True )
 
 
-class EmojiModal(discord.ui.Modal, title="Set Reaction Emojis"):
-    emoji_1 = discord.ui.TextInput(label="Emoji 1", placeholder="⭐ or <:custom:123456789>", required=True, max_length=100)
-    emoji_2 = discord.ui.TextInput(label="Emoji 2", placeholder="Optional", required=False, max_length=100)
-    emoji_3 = discord.ui.TextInput(label="Emoji 3", placeholder="Optional", required=False, max_length=100)
-    emoji_4 = discord.ui.TextInput(label="Emoji 4", placeholder="Optional", required=False, max_length=100)
-    emoji_5 = discord.ui.TextInput(label="Emoji 5", placeholder="Optional", required=False, max_length=100)
+class EmojiModal (discord .ui .Modal ,title ="Set Reaction Emojis"):
+    emoji_1 =discord .ui .TextInput (label ="Emoji 1",placeholder ="⭐ or <:custom:123456789>",required =True ,max_length =100 )
+    emoji_2 =discord .ui .TextInput (label ="Emoji 2",placeholder ="Optional",required =False ,max_length =100 )
+    emoji_3 =discord .ui .TextInput (label ="Emoji 3",placeholder ="Optional",required =False ,max_length =100 )
+    emoji_4 =discord .ui .TextInput (label ="Emoji 4",placeholder ="Optional",required =False ,max_length =100 )
+    emoji_5 =discord .ui .TextInput (label ="Emoji 5",placeholder ="Optional",required =False ,max_length =100 )
 
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
+    def __init__ (self ,parent_view ):
+        super ().__init__ ()
+        self .parent_view =parent_view 
 
-    async def on_submit(self, interaction):
-        values = [
-            str(self.emoji_1.value).strip(),
-            str(self.emoji_2.value).strip(),
-            str(self.emoji_3.value).strip(),
-            str(self.emoji_4.value).strip(),
-            str(self.emoji_5.value).strip(),
+    async def on_submit (self ,interaction ):
+        values =[
+        str (self .emoji_1 .value ).strip (),
+        str (self .emoji_2 .value ).strip (),
+        str (self .emoji_3 .value ).strip (),
+        str (self .emoji_4 .value ).strip (),
+        str (self .emoji_5 .value ).strip (),
         ]
-        values = [value for value in values if value]
-        if not values:
-            await interaction.response.send_message("❌ Add at least one emoji.", ephemeral=True)
-            return
-        if len(values) > 5:
-            await interaction.response.send_message("❌ You can use a maximum of 5 emojis.", ephemeral=True)
-            return
-        self.parent_view.emojis = values
-        self.parent_view.refresh()
-        await interaction.response.send_message(
-            f"✅ {len(values)} reaction emoji{'s' if len(values) != 1 else ''} saved.",
-            ephemeral=True,
+        values =[value for value in values if value ]
+        if not values :
+            await interaction .response .send_message ("❌ Add at least one emoji.",ephemeral =True )
+            return 
+        if len (values )>5 :
+            await interaction .response .send_message ("❌ You can use a maximum of 5 emojis.",ephemeral =True )
+            return 
+        self .parent_view .emojis =values 
+        self .parent_view .refresh ()
+        await interaction .response .send_message (
+        f"✅ {len (values )} reaction emoji{'s'if len (values )!=1 else ''} saved.",
+        ephemeral =True ,
         )
 
-class RolePickerView(discord.ui.View):
-    def __init__(self, parent_view):
-        super().__init__(timeout=300)
-        self.parent_view = parent_view
+class RolePickerView (discord .ui .View ):
+    def __init__ (self ,parent_view ):
+        super ().__init__ (timeout =300 )
+        self .parent_view =parent_view 
 
-        self.select = discord.ui.RoleSelect(
-            placeholder="Select up to 5 roles",
-            min_values=1,
-            max_values=5,
+        self .select =discord .ui .RoleSelect (
+        placeholder ="Select up to 5 roles",
+        min_values =1 ,
+        max_values =5 ,
         )
-        self.select.callback = self.role_selected
-        self.add_item(self.select)
+        self .select .callback =self .role_selected 
+        self .add_item (self .select )
 
-    async def role_selected(self, interaction):
-        try:
-            if interaction.guild is None:
-                await interaction.response.send_message(
-                    "This selector can only be used inside a server.",
-                    ephemeral=True,
+    async def role_selected (self ,interaction ):
+        try :
+            if interaction .guild is None :
+                await interaction .response .send_message (
+                "This selector can only be used inside a server.",
+                ephemeral =True ,
                 )
-                return
+                return 
 
-            selected = interaction.data.get("values", []) if interaction.data else []
-            resolved = []
+            selected =interaction .data .get ("values",[])if interaction .data else []
+            resolved =[]
 
-            for role_id in selected[:5]:
-                role = interaction.guild.get_role(int(role_id))
-                if role is not None:
-                    resolved.append(role)
+            for role_id in selected [:5 ]:
+                role =interaction .guild .get_role (int (role_id ))
+                if role is not None :
+                    resolved .append (role )
 
-            if not resolved:
-                await interaction.response.send_message(
-                    "No valid roles were selected.",
-                    ephemeral=True,
+            if not resolved :
+                await interaction .response .send_message (
+                "No valid roles were selected.",
+                ephemeral =True ,
                 )
-                return
+                return 
 
-            self.parent_view.roles = resolved
-            self.parent_view.refresh()
+            self .parent_view .roles =resolved 
+            self .parent_view .refresh ()
 
-            await interaction.response.send_message(
-                "Selected: " + ", ".join(role.mention for role in resolved),
-                ephemeral=True,
+            await interaction .response .send_message (
+            "Selected: "+", ".join (role .mention for role in resolved ),
+            ephemeral =True ,
             )
-        except Exception as error:
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"Could not save the selected roles: {error}",
-                    ephemeral=True,
+        except Exception as error :
+            if interaction .response .is_done ():
+                await interaction .followup .send (
+                f"Could not save the selected roles: {error }",
+                ephemeral =True ,
                 )
-            else:
-                await interaction.response.send_message(
-                    f"Could not save the selected roles: {error}",
-                    ephemeral=True,
+            else :
+                await interaction .response .send_message (
+                f"Could not save the selected roles: {error }",
+                ephemeral =True ,
                 )
 
 
-class ReactionRoleSetupView(discord.ui.LayoutView):
-    def __init__(self, author_id):
-        super().__init__(timeout=900)
-        self.author_id = author_id
-        self.message_id = None
-        self.roles = []
-        self.emojis = []
+class ReactionRoleSetupView (discord .ui .LayoutView ):
+    def __init__ (self ,author_id ):
+        super ().__init__ (timeout =900 )
+        self .author_id =author_id 
+        self .message_id =None 
+        self .roles =[]
+        self .emojis =[]
 
-        self.message_button = discord.ui.Button(label="Message", style=discord.ButtonStyle.secondary, emoji="🆔")
-        self.message_button.callback = self.message_id_callback
-        self.role_button = discord.ui.Button(label="Roles", style=discord.ButtonStyle.secondary, emoji="🎭")
-        self.role_button.callback = self.role_callback
-        self.emoji_button = discord.ui.Button(label="Emojis", style=discord.ButtonStyle.secondary, emoji="✨")
-        self.emoji_button.callback = self.emoji_callback
-        self.save_button = discord.ui.Button(label="Save Setup", style=discord.ButtonStyle.success, emoji="✅")
-        self.save_button.callback = self.save_callback
+        self .message_button =discord .ui .Button (label ="Message",style =discord .ButtonStyle .secondary ,emoji ="🆔")
+        self .message_button .callback =self .message_id_callback 
+        self .role_button =discord .ui .Button (label ="Roles",style =discord .ButtonStyle .secondary ,emoji ="🎭")
+        self .role_button .callback =self .role_callback 
+        self .emoji_button =discord .ui .Button (label ="Emojis",style =discord .ButtonStyle .secondary ,emoji ="✨")
+        self .emoji_button .callback =self .emoji_callback 
+        self .save_button =discord .ui .Button (label ="Save Setup",style =discord .ButtonStyle .success ,emoji ="✅")
+        self .save_button .callback =self .save_callback 
 
-        row = discord.ui.ActionRow()
-        row.add_item(self.message_button)
-        row.add_item(self.role_button)
-        row.add_item(self.emoji_button)
-        row.add_item(self.save_button)
+        row =discord .ui .ActionRow ()
+        row .add_item (self .message_button )
+        row .add_item (self .role_button )
+        row .add_item (self .emoji_button )
+        row .add_item (self .save_button )
 
-        self.status = make_text(self.status_text())
-        self.add_item(
-            make_container(
-                make_text("## 🎭 Reaction Role Setup"),
-                make_separator(),
-                make_text(
-                    "Create a reaction-role message in a few simple steps.\n"
-                    "Set the message, choose up to 5 roles, then match each role with an emoji."
-                ),
-                make_separator(),
-                make_text("### ⚙️ Configuration"),
-                self.status,
-                make_separator(),
-                make_text("### 🔧 Controls"),
-                row,
-            )
+        self .status =make_text (self .status_text ())
+        self .add_item (
+        make_container (
+        make_text ("## 🎭 Reaction Role Setup"),
+        make_separator (),
+        make_text (
+        "Create a reaction-role message in a few simple steps.\n"
+        "Set the message, choose up to 5 roles, then match each role with an emoji."
+        ),
+        make_separator (),
+        make_text ("### ⚙️ Configuration"),
+        self .status ,
+        make_separator (),
+        make_text ("### 🔧 Controls"),
+        row ,
+        )
         )
 
-    def refresh(self):
-        self.status.content = self.status_text()
+    def refresh (self ):
+        self .status .content =self .status_text ()
 
-    def status_text(self):
-        message = f"`{self.message_id}`" if self.message_id else "`Not set`"
-        roles = ", ".join(role.mention for role in self.roles) if self.roles else "`Not set`"
-        emojis = "  ".join(self.emojis) if self.emojis else "`Not set`"
-        pair_count = min(len(self.roles), len(self.emojis))
+    def status_text (self ):
+        message =f"`{self .message_id }`"if self .message_id else "`Not set`"
+        roles =", ".join (role .mention for role in self .roles )if self .roles else "`Not set`"
+        emojis ="  ".join (self .emojis )if self .emojis else "`Not set`"
+        pair_count =min (len (self .roles ),len (self .emojis ))
         return (
-            f"**Target Message:** {message}\n"
-            f"**Roles:** {roles}\n"
-            f"**Emojis:** {emojis}\n"
-            f"**Pairs Ready:** `{pair_count}/5`"
+        f"**Target Message:** {message }\n"
+        f"**Roles:** {roles }\n"
+        f"**Emojis:** {emojis }\n"
+        f"**Pairs Ready:** `{pair_count }/5`"
         )
 
-    async def check_author(self, interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "❌ Only the person who started this setup can use these controls.",
-                ephemeral=True,
+    async def check_author (self ,interaction ):
+        if interaction .user .id !=self .author_id :
+            await interaction .response .send_message (
+            "❌ Only the person who started this setup can use these controls.",
+            ephemeral =True ,
             )
-            return False
-        return True
+            return False 
+        return True 
 
-    async def message_id_callback(self, interaction):
-        if not await self.check_author(interaction):
-            return
-        await interaction.response.send_modal(MessageIdModal(self))
+    async def message_id_callback (self ,interaction ):
+        if not await self .check_author (interaction ):
+            return 
+        await interaction .response .send_modal (MessageIdModal (self ))
 
-    async def role_callback(self, interaction):
-        if not await self.check_author(interaction):
-            return
-        picker = RolePickerView(self)
-        await interaction.response.send_message(
-            "🎭 **Select Roles**\nChoose up to 5 roles. Their order will be matched with the emoji order.",
-            view=picker,
-            ephemeral=True,
+    async def role_callback (self ,interaction ):
+        if not await self .check_author (interaction ):
+            return 
+        picker =RolePickerView (self )
+        await interaction .response .send_message (
+        "🎭 **Select Roles**\nChoose up to 5 roles. Their order will be matched with the emoji order.",
+        view =picker ,
+        ephemeral =True ,
         )
 
-    async def emoji_callback(self, interaction):
-        if not await self.check_author(interaction):
-            return
-        await interaction.response.send_modal(EmojiModal(self))
+    async def emoji_callback (self ,interaction ):
+        if not await self .check_author (interaction ):
+            return 
+        await interaction .response .send_modal (EmojiModal (self ))
 
 
-class ReactionRoleMessageView(discord.ui.LayoutView):
-    def __init__(self, pairs):
-        super().__init__(timeout=None)
-        lines = [f"`{index}`  {pair['emoji']}  **{pair['role_name']}**" for index, pair in enumerate(pairs, 1)]
-        self.add_item(
-            make_container(
-                make_text("## 🎭 Reaction Roles"),
-                make_separator(),
-                make_text(
-                    "React with the emoji beside a role to receive it.\n"
-                    "Remove your reaction to give the role back."
-                ),
-                make_separator(),
-                make_text("### Available Roles\n" + "\n".join(lines)),
-                make_separator(),
-                make_text("✨ **Automatic:** Role changes happen instantly after you react."),
-            )
+class ReactionRoleMessageView (discord .ui .LayoutView ):
+    def __init__ (self ,pairs ):
+        super ().__init__ (timeout =None )
+        lines =[f"`{index }`  {pair ['emoji']}  **{pair ['role_name']}**"for index ,pair in enumerate (pairs ,1 )]
+        self .add_item (
+        make_container (
+        make_text ("## 🎭 Reaction Roles"),
+        make_separator (),
+        make_text (
+        "React with the emoji beside a role to receive it.\n"
+        "Remove your reaction to give the role back."
+        ),
+        make_separator (),
+        make_text ("### Available Roles\n"+"\n".join (lines )),
+        make_separator (),
+        make_text ("✨ **Automatic:** Role changes happen instantly after you react."),
+        )
         )
 
-async def find_message_in_guild(guild, message_id):
-    message_id = int(message_id)
-
-    for channel in guild.text_channels:
-        try:
-            return await channel.fetch_message(message_id)
-        except discord.NotFound:
-            continue
-        except discord.Forbidden:
-            continue
-        except discord.HTTPException:
-            continue
-
-    return None
-
-
-async def restore_reaction_roles():
-    records = await mongo_call(list_reaction_roles_sync)
-    stale = []
-
-    for record in records:
-        try:
-            guild_id = int(record["guild_id"])
-            channel_id = int(record["channel_id"])
-            message_id = int(record["message_id"])
-            pairs = record["pairs"]
-        except (KeyError, TypeError, ValueError):
-            stale.append(record.get("_id"))
-            continue
-
-        guild = bot.get_guild(guild_id)
-        if guild is None:
-            continue
-
-        channel = guild.get_channel(channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            stale.append(message_id)
-            continue
-
-        try:
-            message = await channel.fetch_message(message_id)
-        except discord.NotFound:
-            stale.append(message_id)
-            continue
-        except discord.Forbidden:
-            continue
-        except discord.HTTPException:
-            continue
-
-        valid_pairs = []
-        for pair in pairs:
-            try:
-                emoji = str(pair["emoji"])
-                role_id = int(pair["role_id"])
-                role = guild.get_role(role_id)
-            except (KeyError, TypeError, ValueError):
-                continue
-
-            if role is None:
-                continue
-
-            valid_pairs.append(
-                {
-                    "emoji": emoji,
-                    "role_id": role.id,
-                    "role_name": role.name,
-                }
-            )
-
-            try:
-                await message.add_reaction(emoji)
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-
-        if not valid_pairs:
-            stale.append(message_id)
-            continue
-
-        record["pairs"] = valid_pairs
-        reaction_role_cache[message_id] = record
-
-        try:
-            await message.edit(
-                view=ReactionRoleMessageView(valid_pairs)
-            )
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            pass
-
-    for message_id in stale:
-        if message_id is not None:
-            await mongo_call(delete_reaction_role_sync, message_id)
-
-
-@bot.event
-async def on_raw_reaction_add(payload):
-    if payload.guild_id is None or payload.user_id == bot.user.id:
-        return
-
-    record = reaction_role_cache.get(payload.message_id)
-    if record is None:
-        record = await mongo_call(get_reaction_role_sync, payload.message_id)
-        if record:
-            reaction_role_cache[payload.message_id] = record
-
-    if not record:
-        return
-
-    emoji_value = str(payload.emoji)
-
-    for pair in record.get("pairs", []):
-        if str(pair.get("emoji")) != emoji_value:
-            continue
-
-        guild = bot.get_guild(payload.guild_id)
-        if guild is None:
-            return
-
-        role = guild.get_role(int(pair["role_id"]))
-        member = guild.get_member(payload.user_id)
-
-        if role is None or member is None:
-            return
-
-        if role.is_default() or role.managed:
-            return
-
-        me = guild.me
-        if me is None or role >= me.top_role:
-            return
-
-        try:
-            await member.add_roles(
-                role,
-                reason="Reaction role",
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        return
-
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-    if payload.guild_id is None or payload.user_id == bot.user.id:
-        return
-
-    record = reaction_role_cache.get(payload.message_id)
-    if record is None:
-        record = await mongo_call(get_reaction_role_sync, payload.message_id)
-        if record:
-            reaction_role_cache[payload.message_id] = record
-
-    if not record:
-        return
-
-    emoji_value = str(payload.emoji)
-
-    for pair in record.get("pairs", []):
-        if str(pair.get("emoji")) != emoji_value:
-            continue
-
-        guild = bot.get_guild(payload.guild_id)
-        if guild is None:
-            return
-
-        role = guild.get_role(int(pair["role_id"]))
-        member = guild.get_member(payload.user_id)
-
-        if role is None or member is None:
-            return
-
-        if role.is_default() or role.managed:
-            return
-
-        try:
-            await member.remove_roles(
-                role,
-                reason="Reaction role removed",
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        return
-
-
-create_group = app_commands.Group(
-    name="create",
-    description="Create server tools",
-)
-
-anti_group = app_commands.Group(
-    name="anti",
-    description="Anti moderation tools",
-    parent=create_group,
-)
-
-server_group = app_commands.Group(
-    name="server",
-    description="Server information and tools",
-)
-
-add_group = app_commands.Group(
-    name="add",
-    description="Add server tools",
-)
-
-update_group = app_commands.Group(
-    name="update",
-    description="Post update logs",
-)
-
-reaction_group = app_commands.Group(
-    name="reaction",
-    description="Reaction role tools",
-    parent=add_group,
-)
-
-
-@anti_group.command(
-    name="scam",
-    description="Create an anti-scam protection channel",
-)
-@app_commands.describe(name="The exact name of the channel to create")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def anti_scam(interaction: discord.Interaction, name: str):
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    me = interaction.guild.me
-
-    if me is None:
-        await interaction.followup.send(
-            "I could not verify my server permissions.",
-            ephemeral=True,
-        )
-        return
-
-    if not me.guild_permissions.manage_channels:
-        await interaction.followup.send(
-            "I need the Manage Channels permission.",
-            ephemeral=True,
-        )
-        return
-
-    if not me.guild_permissions.kick_members:
-        await interaction.followup.send(
-            "I need the Kick Members permission.",
-            ephemeral=True,
-        )
-        return
-
-    clean_name = name.strip()
-
-    if not clean_name:
-        await interaction.followup.send(
-            "The channel name cannot be empty.",
-            ephemeral=True,
-        )
-        return
-
-    try:
-        channel = await interaction.guild.create_text_channel(
-            clean_name,
-            reason=f"Anti-scam channel created by {interaction.user}",
-        )
-
-        view = AntiScamView()
-
-        message = await channel.send(view=view)
-
-        try:
-            await message.add_reaction("👍")
-        except discord.HTTPException:
-            pass
-
-        record = {
-            "channel_id": channel.id,
-            "guild_id": interaction.guild.id,
-            "message_id": message.id,
-            "kicks": 0,
-            "violations": 0,
-        }
-
-        await mongo_call(save_anti_scam_sync, record)
-
-        created_channels[channel.id] = {
-            "view": view,
-            "message": message,
-            "guild_id": interaction.guild.id,
-        }
-
-        await interaction.followup.send(
-            f"Created {channel.mention}.",
-            ephemeral=True,
-        )
-
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "I don't have permission to create or manage that channel.",
-            ephemeral=True,
-        )
-    except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"Discord returned an error: {error}",
-            ephemeral=True,
-        )
-    except PyMongoError as error:
-        try:
-            await channel.delete(reason="MongoDB persistence failed")
-        except Exception:
-            pass
-
-        await interaction.followup.send(
-            f"MongoDB error while saving the channel: {error}",
-            ephemeral=True,
-        )
-    except Exception as error:
-        await interaction.followup.send(
-            f"Unexpected error: {error}",
-            ephemeral=True,
-        )
-
-
-@server_group.command(
-    name="insights",
-    description="View member activity from the last 30 days",
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def server_insights(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer()
-
-    try:
-        current_member_ids = []
-        async for member in interaction.guild.fetch_members(limit=None):
-            current_member_ids.append(member.id)
-
-        joined, left, initialized = await mongo_call(
-            reconcile_member_snapshot_sync,
-            interaction.guild.id,
-            current_member_ids,
-        )
-
-        if not initialized:
-            for _ in joined:
-                await mongo_call(
-                    add_member_event_sync,
-                    interaction.guild.id,
-                    "join",
-                )
-            for _ in left:
-                await mongo_call(
-                    add_member_event_sync,
-                    interaction.guild.id,
-                    "leave",
-                )
-
-        document = await mongo_call(
-            get_guild_insights_sync,
-            interaction.guild.id,
-        )
-
-        view = InsightsView(
-            guild=interaction.guild,
-            document=document,
-        )
-
-        await interaction.followup.send(view=view)
-
-    except PyMongoError as error:
-        await interaction.followup.send(
-            f"MongoDB error: {error}",
-            ephemeral=True,
-        )
-    except Exception as error:
-        await interaction.followup.send(
-            f"Unexpected error: {error}",
-            ephemeral=True,
-        )
-
-
-async def find_guild_message(guild, message_id):
-    message_id = int(message_id)
-    channels = []
-    try:
-        channels = await guild.fetch_channels()
-    except (discord.Forbidden, discord.HTTPException):
-        channels = list(guild.channels)
-
-    checked = set()
-    for channel in channels:
-        channel_id = getattr(channel, "id", None)
-        if channel_id in checked:
-            continue
-        checked.add(channel_id)
-
-        if isinstance(channel, discord.TextChannel):
-            try:
-                return await channel.fetch_message(message_id)
-            except discord.NotFound:
-                continue
-            except (discord.Forbidden, discord.HTTPException):
-                continue
-
-        if isinstance(channel, discord.ForumChannel):
-            for thread in channel.threads:
-                try:
-                    return await thread.fetch_message(message_id)
-                except discord.NotFound:
-                    continue
-                except (discord.Forbidden, discord.HTTPException):
-                    continue
-
-    for channel in guild.text_channels:
-        if channel.id in checked:
-            continue
-        try:
-            return await channel.fetch_message(message_id)
-        except discord.NotFound:
-            continue
-        except (discord.Forbidden, discord.HTTPException):
-            continue
-
-    return None
-
-@update_group.command(
-    name="logs",
-    description="Post an update log",
-)
-@app_commands.describe(
-    title="Update title",
-    version="Update version, such as 2.6",
-    change_logs="Message ID containing the change logs",
-    message="Optional small update message",
-    channel="Channel where the update will be posted",
-)
-async def update_logs(
-    interaction: discord.Interaction,
-    title: str,
-    version: str,
-    change_logs: str,
-    channel: discord.TextChannel,
-    message: str | None = None,
-):
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True,
-        )
-        return
-
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(
-            "You need the Manage Server permission to use this command.",
-            ephemeral=True,
-        )
-        return
-
-    me = interaction.guild.me
-    if me is None:
-        await interaction.response.send_message(
-            "I could not verify my server permissions.",
-            ephemeral=True,
-        )
-        return
-
-    permissions = channel.permissions_for(me)
-    if not permissions.view_channel or not permissions.send_messages:
-        await interaction.response.send_message(
-            "I need View Channel and Send Messages permissions in the selected channel.",
-            ephemeral=True,
-        )
-        return
-
-    if not permissions.mention_everyone:
-        await interaction.response.send_message(
-            "I need the Mention @everyone permission in the selected channel.",
-            ephemeral=True,
-        )
-        return
-
-    clean_title = title.strip()
-    clean_version = version.strip()
-    clean_message_id = change_logs.strip()
-    clean_message = message.strip() if message else None
-
-    if not clean_title:
-        await interaction.response.send_message(
-            "The title cannot be empty.",
-            ephemeral=True,
-        )
-        return
-
-    version_match = re.fullmatch(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", clean_version)
-    if not version_match:
-        await interaction.response.send_message(
-            "The version must contain numbers such as 2, 2.6, or 2.6.0.",
-            ephemeral=True,
-        )
-        return
-
-    major = version_match.group(1)
-    minor = version_match.group(2) or "0"
-    patch = version_match.group(3) or "0"
-    normalized_version = f"{major}.{minor}.{patch}"
-
-    if not re.fullmatch(r"\d{15,22}", clean_message_id):
-        await interaction.response.send_message(
-            "The change logs value must be a Discord message ID.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        source_message = await find_guild_message(
-            interaction.guild,
-            int(clean_message_id),
-        )
-
-        if source_message is None:
-            await interaction.followup.send(
-                "I could not find that message in a channel I can access.",
-                ephemeral=True,
-            )
-            return
-
-        change_content = source_message.content.strip()
-        if not change_content:
-            await interaction.followup.send(
-                "The selected message does not contain any text to use as the change logs.",
-                ephemeral=True,
-            )
-            return
-
-        change_content = change_content.replace("```", "`\u200b``")
-
-        container = make_container(
-            make_text(f"## {clean_title}"),
-            make_text(f"-# {normalized_version}"),
-            make_separator(),
-            make_text(
-                f"### CHANGE LOGS\n```diff\n{change_content}```"
-            ),
-            *(
-                [make_text(clean_message)]
-                if clean_message
-                else []
-            ),
-        )
-
-        view = discord.ui.LayoutView(timeout=None)
-        view.add_item(make_text("@everyone"))
-        view.add_item(container)
-
-        sent_message = await channel.send(
-            view=view,
-            allowed_mentions=discord.AllowedMentions(everyone=True),
-        )
-
-        await interaction.followup.send(
-            f"Update log posted in {channel.mention}. Message ID: `{sent_message.id}`",
-            ephemeral=True,
-        )
-
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "I do not have permission to access the selected message or post the update in that channel.",
-            ephemeral=True,
-        )
-    except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"Discord returned an error while posting the update: {error}",
-            ephemeral=True,
-        )
-    except ValueError:
-        await interaction.followup.send(
-            "The change logs message ID is invalid.",
-            ephemeral=True,
-        )
-    except Exception as error:
-        await interaction.followup.send(
-            f"Unexpected error while posting the update: {error}",
-            ephemeral=True,
-        )
-
-
-@reaction_group.command(
-    name="role",
-    description="Create reaction roles on an existing message",
-)
-async def add_reaction_role(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True,
-        )
-        return
-
-    if not interaction.user.guild_permissions.manage_roles:
-        await interaction.response.send_message(
-            "You need the Manage Roles permission to use this command.",
-            ephemeral=True,
-        )
-        return
-
-    me = interaction.guild.me
-
-    if me is None or not me.guild_permissions.manage_roles:
-        await interaction.response.send_message(
-            "I need the Manage Roles permission.",
-            ephemeral=True,
-        )
-        return
-
-    view = ReactionRoleSetupView(interaction.user.id)
-
-    await interaction.response.send_message(
-        view=view,
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(
-    name="purge",
-    description="Delete recent messages from the current channel",
-)
-@app_commands.describe(count="Number of messages to delete (1-1000)")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def purge(
-    interaction: discord.Interaction,
-    count: app_commands.Range[int, 1, 1000],
-):
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "This command can only be used in a text channel.",
-            ephemeral=True,
-        )
-        return
-
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True,
-        )
-        return
-
-    me = interaction.guild.me
-
-    if me is None:
-        await interaction.response.send_message(
-            "I could not verify my permissions.",
-            ephemeral=True,
-        )
-        return
-
-    permissions = interaction.channel.permissions_for(me)
-
-    if not permissions.manage_messages:
-        await interaction.response.send_message(
-            "I need the Manage Messages permission in this channel.",
-            ephemeral=True,
-        )
-        return
-
-    if not permissions.read_message_history:
-        await interaction.response.send_message(
-            "I need the Read Message History permission in this channel.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        deleted = await interaction.channel.purge(
-            limit=int(count),
-            bulk=True,
-            reason=f"Purge requested by {interaction.user}",
-        )
-
-        view = PurgeView(
-            requested=int(count),
-            deleted=len(deleted),
-            channel=interaction.channel,
-        )
-
-        await interaction.followup.send(
-            view=view,
-            ephemeral=True,
-        )
-
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "I don't have permission to delete messages in this channel.",
-            ephemeral=True,
-        )
-    except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"Discord returned an error while purging messages: {error}",
-            ephemeral=True,
-        )
-
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    try:
-        await mongo_call(
-            add_member_event_sync,
-            member.guild.id,
-            "join",
-        )
-        await mongo_call(add_member_to_snapshot_sync, member.guild.id, member.id)
-    except PyMongoError as error:
-        print(f"MongoDB join tracking error for guild {member.guild.id}: {error}")
-
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    try:
-        await mongo_call(
-            add_member_event_sync,
-            member.guild.id,
-            "leave",
-        )
-        await mongo_call(remove_member_from_snapshot_sync, member.guild.id, member.id)
-    except PyMongoError as error:
-        print(f"MongoDB leave tracking error for guild {member.guild.id}: {error}")
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    data = created_channels.get(message.channel.id)
-    if data is not None:
-        member = message.author
-        if isinstance(member, discord.Member) and not member.guild_permissions.administrator:
-            try:
-                await message.delete()
-            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-                pass
-
-            me = message.guild.me
-            kicked = False
-            if me is not None and me.guild_permissions.kick_members and member.top_role < me.top_role:
-                try:
-                    await member.kick(reason="Message sent in anti-scam channel")
-                    kicked = True
-                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-                    pass
-
-            try:
-                record = await mongo_call(
-                    increment_anti_scam_sync,
-                    message.channel.id,
-                    kicked,
-                )
-                if record:
-                    data["view"].update_stats(
-                        kicks=int(record.get("kicks", 0)),
-                        violations=int(record.get("violations", 0)),
-                    )
-                    if data.get("message") is not None:
-                        try:
-                            await data["message"].edit(view=data["view"])
-                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                            pass
-            except PyMongoError as error:
-                print(f"MongoDB anti-scam update error for channel {message.channel.id}: {error}")
-
-    await bot.process_commands(message)
-
-
-async def restore_anti_scam_channels():
-    records = await mongo_call(list_anti_scam_sync)
-    stale = []
-
-    for record in records:
-        try:
-            channel_id = int(record["channel_id"])
-            message_id = int(record["message_id"])
-            guild_id = int(record["guild_id"])
-            kicks = int(record.get("kicks", 0))
-            violations = int(record.get("violations", kicks))
-        except (KeyError, TypeError, ValueError):
-            stale.append(record.get("_id"))
-            continue
-
-        guild = bot.get_guild(guild_id)
-
-        if guild is None:
-            continue
-
-        channel = guild.get_channel(channel_id)
-
-        if not isinstance(channel, discord.TextChannel):
-            stale.append(channel_id)
-            continue
-
-        view = AntiScamView(kicks, violations)
-
-        try:
-            message = await channel.fetch_message(message_id)
-        except discord.NotFound:
-            stale.append(channel_id)
-            continue
-        except discord.Forbidden:
-            created_channels[channel_id] = {
-                "view": view,
-                "message": None,
-                "guild_id": guild_id,
+async def find_message_in_guild (guild ,message_id ):
+    message_id =int (message_id )
+
+    for channel in guild .text_channels :
+        try :
+            return await channel .fetch_message (message_id )
+        except discord .NotFound :
+            continue 
+        except discord .Forbidden :
+            continue 
+        except discord .HTTPException :
+            continue 
+
+    return None 
+
+
+async def restore_reaction_roles ():
+    records =await mongo_call (list_reaction_roles_sync )
+    stale =[]
+
+    for record in records :
+        try :
+            guild_id =int (record ["guild_id"])
+            channel_id =int (record ["channel_id"])
+            message_id =int (record ["message_id"])
+            pairs =record ["pairs"]
+        except (KeyError ,TypeError ,ValueError ):
+            stale .append (record .get ("_id"))
+            continue 
+
+        guild =bot .get_guild (guild_id )
+        if guild is None :
+            continue 
+
+        channel =guild .get_channel (channel_id )
+        if not isinstance (channel ,discord .TextChannel ):
+            stale .append (message_id )
+            continue 
+
+        try :
+            message =await channel .fetch_message (message_id )
+        except discord .NotFound :
+            stale .append (message_id )
+            continue 
+        except discord .Forbidden :
+            continue 
+        except discord .HTTPException :
+            continue 
+
+        valid_pairs =[]
+        for pair in pairs :
+            try :
+                emoji =str (pair ["emoji"])
+                role_id =int (pair ["role_id"])
+                role =guild .get_role (role_id )
+            except (KeyError ,TypeError ,ValueError ):
+                continue 
+
+            if role is None :
+                continue 
+
+            valid_pairs .append (
+            {
+            "emoji":emoji ,
+            "role_id":role .id ,
+            "role_name":role .name ,
             }
-            continue
-        except discord.HTTPException:
-            continue
+            )
 
-        try:
-            await message.edit(view=view)
-        except (
-            discord.Forbidden,
-            discord.NotFound,
-            discord.HTTPException,
-        ):
-            pass
+            try :
+                await message .add_reaction (emoji )
+            except (discord .Forbidden ,discord .HTTPException ):
+                pass 
 
-        created_channels[channel_id] = {
-            "view": view,
-            "message": message,
-            "guild_id": guild_id,
+        if not valid_pairs :
+            stale .append (message_id )
+            continue 
+
+        record ["pairs"]=valid_pairs 
+        reaction_role_cache [message_id ]=record 
+
+        try :
+            await message .edit (
+            view =ReactionRoleMessageView (valid_pairs )
+            )
+        except (discord .Forbidden ,discord .NotFound ,discord .HTTPException ):
+            pass 
+
+    for message_id in stale :
+        if message_id is not None :
+            await mongo_call (delete_reaction_role_sync ,message_id )
+
+
+@bot .event 
+async def on_raw_reaction_add (payload ):
+    if payload .guild_id is None or payload .user_id ==bot .user .id :
+        return 
+
+    record =reaction_role_cache .get (payload .message_id )
+    if record is None :
+        record =await mongo_call (get_reaction_role_sync ,payload .message_id )
+        if record :
+            reaction_role_cache [payload .message_id ]=record 
+
+    if not record :
+        return 
+
+    emoji_value =str (payload .emoji )
+
+    for pair in record .get ("pairs",[]):
+        if str (pair .get ("emoji"))!=emoji_value :
+            continue 
+
+        guild =bot .get_guild (payload .guild_id )
+        if guild is None :
+            return 
+
+        role =guild .get_role (int (pair ["role_id"]))
+        member =guild .get_member (payload .user_id )
+
+        if role is None or member is None :
+            return 
+
+        if role .is_default ()or role .managed :
+            return 
+
+        me =guild .me 
+        if me is None or role >=me .top_role :
+            return 
+
+        try :
+            await member .add_roles (
+            role ,
+            reason ="Reaction role",
+            )
+        except (discord .Forbidden ,discord .HTTPException ):
+            pass 
+        return 
+
+
+@bot .event 
+async def on_raw_reaction_remove (payload ):
+    if payload .guild_id is None or payload .user_id ==bot .user .id :
+        return 
+
+    record =reaction_role_cache .get (payload .message_id )
+    if record is None :
+        record =await mongo_call (get_reaction_role_sync ,payload .message_id )
+        if record :
+            reaction_role_cache [payload .message_id ]=record 
+
+    if not record :
+        return 
+
+    emoji_value =str (payload .emoji )
+
+    for pair in record .get ("pairs",[]):
+        if str (pair .get ("emoji"))!=emoji_value :
+            continue 
+
+        guild =bot .get_guild (payload .guild_id )
+        if guild is None :
+            return 
+
+        role =guild .get_role (int (pair ["role_id"]))
+        member =guild .get_member (payload .user_id )
+
+        if role is None or member is None :
+            return 
+
+        if role .is_default ()or role .managed :
+            return 
+
+        try :
+            await member .remove_roles (
+            role ,
+            reason ="Reaction role removed",
+            )
+        except (discord .Forbidden ,discord .HTTPException ):
+            pass 
+        return 
+
+
+create_group =app_commands .Group (
+name ="create",
+description ="Create server tools",
+)
+
+anti_group =app_commands .Group (
+name ="anti",
+description ="Anti moderation tools",
+parent =create_group ,
+)
+
+server_group =app_commands .Group (
+name ="server",
+description ="Server information and tools",
+)
+
+add_group =app_commands .Group (
+name ="add",
+description ="Add server tools",
+)
+
+update_group =app_commands .Group (
+name ="update",
+description ="Post update logs",
+)
+
+reaction_group =app_commands .Group (
+name ="reaction",
+description ="Reaction role tools",
+parent =add_group ,
+)
+
+
+@anti_group .command (
+name ="scam",
+description ="Create an anti-scam protection channel",
+)
+@app_commands .describe (name ="The exact name of the channel to create")
+@app_commands .checks .has_permissions (manage_channels =True )
+async def anti_scam (interaction :discord .Interaction ,name :str ):
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return 
+
+    await interaction .response .defer (ephemeral =True )
+
+    me =interaction .guild .me 
+
+    if me is None :
+        await interaction .followup .send (
+        "I could not verify my server permissions.",
+        ephemeral =True ,
+        )
+        return 
+
+    if not me .guild_permissions .manage_channels :
+        await interaction .followup .send (
+        "I need the Manage Channels permission.",
+        ephemeral =True ,
+        )
+        return 
+
+    if not me .guild_permissions .kick_members :
+        await interaction .followup .send (
+        "I need the Kick Members permission.",
+        ephemeral =True ,
+        )
+        return 
+
+    clean_name =name .strip ()
+
+    if not clean_name :
+        await interaction .followup .send (
+        "The channel name cannot be empty.",
+        ephemeral =True ,
+        )
+        return 
+
+    try :
+        channel =await interaction .guild .create_text_channel (
+        clean_name ,
+        reason =f"Anti-scam channel created by {interaction .user }",
+        )
+
+        view =AntiScamView ()
+
+        message =await channel .send (view =view )
+
+        try :
+            await message .add_reaction ("👍")
+        except discord .HTTPException :
+            pass 
+
+        record ={
+        "channel_id":channel .id ,
+        "guild_id":interaction .guild .id ,
+        "message_id":message .id ,
+        "kicks":0 ,
+        "violations":0 ,
         }
 
-    for channel_id in stale:
-        if channel_id is not None:
-            await mongo_call(
-                delete_anti_scam_sync,
-                channel_id,
+        await mongo_call (save_anti_scam_sync ,record )
+
+        created_channels [channel .id ]={
+        "view":view ,
+        "message":message ,
+        "guild_id":interaction .guild .id ,
+        }
+
+        await interaction .followup .send (
+        f"Created {channel .mention }.",
+        ephemeral =True ,
+        )
+
+    except discord .Forbidden :
+        await interaction .followup .send (
+        "I don't have permission to create or manage that channel.",
+        ephemeral =True ,
+        )
+    except discord .HTTPException as error :
+        await interaction .followup .send (
+        f"Discord returned an error: {error }",
+        ephemeral =True ,
+        )
+    except PyMongoError as error :
+        try :
+            await channel .delete (reason ="MongoDB persistence failed")
+        except Exception :
+            pass 
+
+        await interaction .followup .send (
+        f"MongoDB error while saving the channel: {error }",
+        ephemeral =True ,
+        )
+    except Exception as error :
+        await interaction .followup .send (
+        f"Unexpected error: {error }",
+        ephemeral =True ,
+        )
+
+
+@server_group .command (
+name ="insights",
+description ="View member activity from the last 30 days",
+)
+@app_commands .checks .has_permissions (manage_guild =True )
+async def server_insights (interaction :discord .Interaction ):
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return 
+
+    await interaction .response .defer ()
+
+    try :
+        current_member_ids =[]
+        async for member in interaction .guild .fetch_members (limit =None ):
+            current_member_ids .append (member .id )
+
+        joined ,left ,initialized =await mongo_call (
+        reconcile_member_snapshot_sync ,
+        interaction .guild .id ,
+        current_member_ids ,
+        )
+
+        if not initialized :
+            for _ in joined :
+                await mongo_call (
+                add_member_event_sync ,
+                interaction .guild .id ,
+                "join",
+                )
+            for _ in left :
+                await mongo_call (
+                add_member_event_sync ,
+                interaction .guild .id ,
+                "leave",
+                )
+
+        document =await mongo_call (
+        get_guild_insights_sync ,
+        interaction .guild .id ,
+        )
+
+        view =InsightsView (
+        guild =interaction .guild ,
+        document =document ,
+        )
+
+        await interaction .followup .send (view =view )
+
+    except PyMongoError as error :
+        await interaction .followup .send (
+        f"MongoDB error: {error }",
+        ephemeral =True ,
+        )
+    except Exception as error :
+        await interaction .followup .send (
+        f"Unexpected error: {error }",
+        ephemeral =True ,
+        )
+
+
+async def find_guild_message (guild ,message_id ):
+    message_id =int (message_id )
+    channels =[]
+    try :
+        channels =await guild .fetch_channels ()
+    except (discord .Forbidden ,discord .HTTPException ):
+        channels =list (guild .channels )
+
+    checked =set ()
+    for channel in channels :
+        channel_id =getattr (channel ,"id",None )
+        if channel_id in checked :
+            continue 
+        checked .add (channel_id )
+
+        if isinstance (channel ,discord .TextChannel ):
+            try :
+                return await channel .fetch_message (message_id )
+            except discord .NotFound :
+                continue 
+            except (discord .Forbidden ,discord .HTTPException ):
+                continue 
+
+        if isinstance (channel ,discord .ForumChannel ):
+            for thread in channel .threads :
+                try :
+                    return await thread .fetch_message (message_id )
+                except discord .NotFound :
+                    continue 
+                except (discord .Forbidden ,discord .HTTPException ):
+                    continue 
+
+    for channel in guild .text_channels :
+        if channel .id in checked :
+            continue 
+        try :
+            return await channel .fetch_message (message_id )
+        except discord .NotFound :
+            continue 
+        except (discord .Forbidden ,discord .HTTPException ):
+            continue 
+
+    return None 
+
+@update_group .command (
+name ="logs",
+description ="Post an update log",
+)
+@app_commands .describe (
+title ="Update title",
+version ="Update version, such as 2.6",
+change_logs ="Message ID containing the change logs",
+message ="Optional small update message",
+channel ="Channel where the update will be posted",
+)
+async def update_logs (
+interaction :discord .Interaction ,
+title :str ,
+version :str ,
+change_logs :str ,
+channel :discord .TextChannel ,
+message :str |None =None ,
+):
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return 
+
+    if not interaction .user .guild_permissions .manage_guild :
+        await interaction .response .send_message (
+        "You need the Manage Server permission to use this command.",
+        ephemeral =True ,
+        )
+        return 
+
+    me =interaction .guild .me 
+    if me is None :
+        await interaction .response .send_message (
+        "I could not verify my server permissions.",
+        ephemeral =True ,
+        )
+        return 
+
+    permissions =channel .permissions_for (me )
+    if not permissions .view_channel or not permissions .send_messages :
+        await interaction .response .send_message (
+        "I need View Channel and Send Messages permissions in the selected channel.",
+        ephemeral =True ,
+        )
+        return 
+
+    if not permissions .mention_everyone :
+        await interaction .response .send_message (
+        "I need the Mention @everyone permission in the selected channel.",
+        ephemeral =True ,
+        )
+        return 
+
+    clean_title =title .strip ()
+    clean_version =version .strip ()
+    clean_message_id =change_logs .strip ()
+    clean_message =message .strip ()if message else None 
+
+    if not clean_title :
+        await interaction .response .send_message (
+        "The title cannot be empty.",
+        ephemeral =True ,
+        )
+        return 
+
+    version_match =re .fullmatch (r"(\d+)(?:\.(\d+))?(?:\.(\d+))?",clean_version )
+    if not version_match :
+        await interaction .response .send_message (
+        "The version must contain numbers such as 2, 2.6, or 2.6.0.",
+        ephemeral =True ,
+        )
+        return 
+
+    major =version_match .group (1 )
+    minor =version_match .group (2 )or "0"
+    patch =version_match .group (3 )or "0"
+    normalized_version =f"{major }.{minor }.{patch }"
+
+    if not re .fullmatch (r"\d{15,22}",clean_message_id ):
+        await interaction .response .send_message (
+        "The change logs value must be a Discord message ID.",
+        ephemeral =True ,
+        )
+        return 
+
+    await interaction .response .defer (ephemeral =True )
+
+    try :
+        source_message =await find_guild_message (
+        interaction .guild ,
+        int (clean_message_id ),
+        )
+
+        if source_message is None :
+            await interaction .followup .send (
+            "I could not find that message in a channel I can access.",
+            ephemeral =True ,
+            )
+            return 
+
+        change_content =source_message .content .strip ()
+        if not change_content :
+            await interaction .followup .send (
+            "The selected message does not contain any text to use as the change logs.",
+            ephemeral =True ,
+            )
+            return 
+
+        change_content =change_content .replace ("```","`\u200b``")
+
+        container =make_container (
+        make_text (f"## {clean_title }"),
+        make_text (f"-# {normalized_version }"),
+        make_separator (),
+        make_text (
+        f"### CHANGE LOGS\n```diff\n{change_content }```"
+        ),
+        *(
+        [make_text (clean_message )]
+        if clean_message 
+        else []
+        ),
+        )
+
+        view =discord .ui .LayoutView (timeout =None )
+        view .add_item (make_text ("@everyone"))
+        view .add_item (container )
+
+        sent_message =await channel .send (
+        view =view ,
+        allowed_mentions =discord .AllowedMentions (everyone =True ),
+        )
+
+        await interaction .followup .send (
+        f"Update log posted in {channel .mention }. Message ID: `{sent_message .id }`",
+        ephemeral =True ,
+        )
+
+    except discord .Forbidden :
+        await interaction .followup .send (
+        "I do not have permission to access the selected message or post the update in that channel.",
+        ephemeral =True ,
+        )
+    except discord .HTTPException as error :
+        await interaction .followup .send (
+        f"Discord returned an error while posting the update: {error }",
+        ephemeral =True ,
+        )
+    except ValueError :
+        await interaction .followup .send (
+        "The change logs message ID is invalid.",
+        ephemeral =True ,
+        )
+    except Exception as error :
+        await interaction .followup .send (
+        f"Unexpected error while posting the update: {error }",
+        ephemeral =True ,
+        )
+
+
+@reaction_group .command (
+name ="role",
+description ="Create reaction roles on an existing message",
+)
+async def add_reaction_role (interaction :discord .Interaction ):
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return 
+
+    if not interaction .user .guild_permissions .manage_roles :
+        await interaction .response .send_message (
+        "You need the Manage Roles permission to use this command.",
+        ephemeral =True ,
+        )
+        return 
+
+    me =interaction .guild .me 
+
+    if me is None or not me .guild_permissions .manage_roles :
+        await interaction .response .send_message (
+        "I need the Manage Roles permission.",
+        ephemeral =True ,
+        )
+        return 
+
+    view =ReactionRoleSetupView (interaction .user .id )
+
+    await interaction .response .send_message (
+    view =view ,
+    ephemeral =True ,
+    )
+
+
+@bot .tree .command (
+name ="purge",
+description ="Delete recent messages from the current channel",
+)
+@app_commands .describe (count ="Number of messages to delete (1-1000)")
+@app_commands .checks .has_permissions (manage_messages =True )
+async def purge (
+interaction :discord .Interaction ,
+count :app_commands .Range [int ,1 ,1000 ],
+):
+    if not isinstance (interaction .channel ,discord .TextChannel ):
+        await interaction .response .send_message (
+        "This command can only be used in a text channel.",
+        ephemeral =True ,
+        )
+        return 
+
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return 
+
+    me =interaction .guild .me 
+
+    if me is None :
+        await interaction .response .send_message (
+        "I could not verify my permissions.",
+        ephemeral =True ,
+        )
+        return 
+
+    permissions =interaction .channel .permissions_for (me )
+
+    if not permissions .manage_messages :
+        await interaction .response .send_message (
+        "I need the Manage Messages permission in this channel.",
+        ephemeral =True ,
+        )
+        return 
+
+    if not permissions .read_message_history :
+        await interaction .response .send_message (
+        "I need the Read Message History permission in this channel.",
+        ephemeral =True ,
+        )
+        return 
+
+    await interaction .response .defer (ephemeral =True )
+
+    try :
+        deleted =await interaction .channel .purge (
+        limit =int (count ),
+        bulk =True ,
+        reason =f"Purge requested by {interaction .user }",
+        )
+
+        view =PurgeView (
+        requested =int (count ),
+        deleted =len (deleted ),
+        channel =interaction .channel ,
+        )
+
+        await interaction .followup .send (
+        view =view ,
+        ephemeral =True ,
+        )
+
+    except discord .Forbidden :
+        await interaction .followup .send (
+        "I don't have permission to delete messages in this channel.",
+        ephemeral =True ,
+        )
+    except discord .HTTPException as error :
+        await interaction .followup .send (
+        f"Discord returned an error while purging messages: {error }",
+        ephemeral =True ,
+        )
+
+
+@bot .event 
+async def on_member_join (member :discord .Member ):
+    try :
+        await mongo_call (
+        add_member_event_sync ,
+        member .guild .id ,
+        "join",
+        )
+        await mongo_call (add_member_to_snapshot_sync ,member .guild .id ,member .id )
+    except PyMongoError as error :
+        print (f"MongoDB join tracking error for guild {member .guild .id }: {error }")
+
+
+@bot .event 
+async def on_member_remove (member :discord .Member ):
+    try :
+        await mongo_call (
+        add_member_event_sync ,
+        member .guild .id ,
+        "leave",
+        )
+        await mongo_call (remove_member_from_snapshot_sync ,member .guild .id ,member .id )
+    except PyMongoError as error :
+        print (f"MongoDB leave tracking error for guild {member .guild .id }: {error }")
+
+
+@bot .event 
+async def on_message (message :discord .Message ):
+    if message .author .bot :
+        return 
+
+    data =created_channels .get (message .channel .id )
+    if data is not None :
+        member =message .author 
+        if isinstance (member ,discord .Member )and not member .guild_permissions .administrator :
+            try :
+                await message .delete ()
+            except (discord .Forbidden ,discord .NotFound ,discord .HTTPException ):
+                pass 
+
+            me =message .guild .me 
+            kicked =False 
+            if me is not None and me .guild_permissions .kick_members and member .top_role <me .top_role :
+                try :
+                    await member .kick (reason ="Message sent in anti-scam channel")
+                    kicked =True 
+                except (discord .Forbidden ,discord .NotFound ,discord .HTTPException ):
+                    pass 
+
+            try :
+                record =await mongo_call (
+                increment_anti_scam_sync ,
+                message .channel .id ,
+                kicked ,
+                )
+                if record :
+                    data ["view"].update_stats (
+                    kicks =int (record .get ("kicks",0 )),
+                    violations =int (record .get ("violations",0 )),
+                    )
+                    if data .get ("message")is not None :
+                        try :
+                            await data ["message"].edit (view =data ["view"])
+                        except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ):
+                            pass 
+            except PyMongoError as error :
+                print (f"MongoDB anti-scam update error for channel {message .channel .id }: {error }")
+
+    await bot .process_commands (message )
+
+
+async def restore_anti_scam_channels ():
+    records =await mongo_call (list_anti_scam_sync )
+    stale =[]
+
+    for record in records :
+        try :
+            channel_id =int (record ["channel_id"])
+            message_id =int (record ["message_id"])
+            guild_id =int (record ["guild_id"])
+            kicks =int (record .get ("kicks",0 ))
+            violations =int (record .get ("violations",kicks ))
+        except (KeyError ,TypeError ,ValueError ):
+            stale .append (record .get ("_id"))
+            continue 
+
+        guild =bot .get_guild (guild_id )
+
+        if guild is None :
+            continue 
+
+        channel =guild .get_channel (channel_id )
+
+        if not isinstance (channel ,discord .TextChannel ):
+            stale .append (channel_id )
+            continue 
+
+        view =AntiScamView (kicks ,violations )
+
+        try :
+            message =await channel .fetch_message (message_id )
+        except discord .NotFound :
+            stale .append (channel_id )
+            continue 
+        except discord .Forbidden :
+            created_channels [channel_id ]={
+            "view":view ,
+            "message":None ,
+            "guild_id":guild_id ,
+            }
+            continue 
+        except discord .HTTPException :
+            continue 
+
+        try :
+            await message .edit (view =view )
+        except (
+        discord .Forbidden ,
+        discord .NotFound ,
+        discord .HTTPException ,
+        ):
+            pass 
+
+        created_channels [channel_id ]={
+        "view":view ,
+        "message":message ,
+        "guild_id":guild_id ,
+        }
+
+    for channel_id in stale :
+        if channel_id is not None :
+            await mongo_call (
+            delete_anti_scam_sync ,
+            channel_id ,
             )
 
 
-@bot.event
-async def on_ready():
-    global ready_once
+@bot .event 
+async def on_ready ():
+    global ready_once 
 
-    if ready_once:
-        return
+    if ready_once :
+        return 
 
-    try:
-        await mongo_call(
-            mongo_client.admin.command,
-            "ping",
+    try :
+        await mongo_call (
+        mongo_client .admin .command ,
+        "ping",
         )
 
-        for guild in bot.guilds:
-            try:
-                member_ids = [member.id for member in guild.members]
-                joined, left, initialized = await mongo_call(
-                    reconcile_member_snapshot_sync,
-                    guild.id,
-                    member_ids,
+        for guild in bot .guilds :
+            try :
+                member_ids =[member .id for member in guild .members ]
+                joined ,left ,initialized =await mongo_call (
+                reconcile_member_snapshot_sync ,
+                guild .id ,
+                member_ids ,
                 )
-                if not initialized:
-                    for _ in joined:
-                        await mongo_call(
-                            add_member_event_sync,
-                            guild.id,
-                            "join",
+                if not initialized :
+                    for _ in joined :
+                        await mongo_call (
+                        add_member_event_sync ,
+                        guild .id ,
+                        "join",
                         )
-                    for _ in left:
-                        await mongo_call(
-                            add_member_event_sync,
-                            guild.id,
-                            "leave",
+                    for _ in left :
+                        await mongo_call (
+                        add_member_event_sync ,
+                        guild .id ,
+                        "leave",
                         )
-                    if joined or left:
-                        print(
-                            f"Reconciled {guild.name}: {len(joined)} missed joins, {len(left)} missed departures"
+                    if joined or left :
+                        print (
+                        f"Reconciled {guild .name }: {len (joined )} missed joins, {len (left )} missed departures"
                         )
-                await mongo_call(get_guild_insights_sync, guild.id)
-            except PyMongoError as error:
-                print(f"MongoDB member reconciliation error for guild {guild.id}: {error}")
+                await mongo_call (get_guild_insights_sync ,guild .id )
+            except PyMongoError as error :
+                print (f"MongoDB member reconciliation error for guild {guild .id }: {error }")
 
-        synced = await bot.tree.sync()
+        synced =await bot .tree .sync ()
 
-        await restore_anti_scam_channels()
-        await restore_reaction_roles()
+        await restore_anti_scam_channels ()
+        await restore_reaction_roles ()
 
-        ready_once = True
+        ready_once =True 
 
-        print(
-            f"Logged in as {bot.user} ({bot.user.id})"
+        print (
+        f"Logged in as {bot .user } ({bot .user .id })"
         )
-        print(
-            f"Connected to MongoDB database: {MONGODB_DATABASE}"
+        print (
+        f"Connected to MongoDB database: {MONGODB_DATABASE }"
         )
-        print(
-            f"Synced {len(synced)} command(s)"
+        print (
+        f"Synced {len (synced )} command(s)"
         )
-        print(
-            f"Restored {len(created_channels)} anti-scam channel(s)"
+        print (
+        f"Restored {len (created_channels )} anti-scam channel(s)"
         )
-        print(
-            f"Restored {len(reaction_role_cache)} reaction-role message(s)"
+        print (
+        f"Restored {len (reaction_role_cache )} reaction-role message(s)"
         )
 
-    except PyMongoError as error:
-        print(f"MongoDB startup error: {error}")
-    except Exception as error:
-        print(f"Startup error: {error}")
+    except PyMongoError as error :
+        print (f"MongoDB startup error: {error }")
+    except Exception as error :
+        print (f"Startup error: {error }")
 
 
-@anti_scam.error
-async def anti_scam_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
+@anti_scam .error 
+async def anti_scam_error (
+interaction :discord .Interaction ,
+error :app_commands .AppCommandError ,
 ):
-    message = (
-        "You need the Manage Channels permission to use this command."
-        if isinstance(error, app_commands.MissingPermissions)
-        else f"Command error: {error}"
+    message =(
+    "You need the Manage Channels permission to use this command."
+    if isinstance (error ,app_commands .MissingPermissions )
+    else f"Command error: {error }"
     )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
+    if interaction .response .is_done ():
+        await interaction .followup .send (
+        message ,
+        ephemeral =True ,
         )
-    else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True,
+    else :
+        await interaction .response .send_message (
+        message ,
+        ephemeral =True ,
         )
 
 
-@server_insights.error
-async def server_insights_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
+@server_insights .error 
+async def server_insights_error (
+interaction :discord .Interaction ,
+error :app_commands .AppCommandError ,
 ):
-    message = (
-        "You need the Manage Server permission to use this command."
-        if isinstance(error, app_commands.MissingPermissions)
-        else f"Command error: {error}"
+    message =(
+    "You need the Manage Server permission to use this command."
+    if isinstance (error ,app_commands .MissingPermissions )
+    else f"Command error: {error }"
     )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
+    if interaction .response .is_done ():
+        await interaction .followup .send (
+        message ,
+        ephemeral =True ,
         )
-    else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True,
+    else :
+        await interaction .response .send_message (
+        message ,
+        ephemeral =True ,
         )
 
 
-@add_reaction_role.error
-async def add_reaction_role_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
+@add_reaction_role .error 
+async def add_reaction_role_error (
+interaction :discord .Interaction ,
+error :app_commands .AppCommandError ,
 ):
-    message = f"Command error: {error}"
+    message =f"Command error: {error }"
 
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
+    if interaction .response .is_done ():
+        await interaction .followup .send (
+        message ,
+        ephemeral =True ,
         )
-    else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True,
+    else :
+        await interaction .response .send_message (
+        message ,
+        ephemeral =True ,
         )
 
 
-@purge.error
-async def purge_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
+@purge .error 
+async def purge_error (
+interaction :discord .Interaction ,
+error :app_commands .AppCommandError ,
 ):
-    message = (
-        "You need the Manage Messages permission to use this command."
-        if isinstance(error, app_commands.MissingPermissions)
-        else f"Command error: {error}"
+    message =(
+    "You need the Manage Messages permission to use this command."
+    if isinstance (error ,app_commands .MissingPermissions )
+    else f"Command error: {error }"
     )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
+    if interaction .response .is_done ():
+        await interaction .followup .send (
+        message ,
+        ephemeral =True ,
         )
-    else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True,
+    else :
+        await interaction .response .send_message (
+        message ,
+        ephemeral =True ,
         )
 
 
-bot.tree.add_command(create_group)
-bot.tree.add_command(server_group)
-bot.tree.add_command(add_group)
-bot.tree.add_command(update_group)
+bot .tree .add_command (create_group )
+bot .tree .add_command (server_group )
+bot .tree .add_command (add_group )
+bot .tree .add_command (update_group )
 
 
-async def start_bot():
-    global ready_once
+async def start_bot ():
+    global ready_once 
 
-    while True:
-        try:
-            await bot.start(TOKEN)
-            break
-        except discord.LoginFailure:
-            print("Invalid Discord bot token.")
-            break
-        except discord.HTTPException as error:
-            retry_after = getattr(error, "retry_after", 30)
-            print(f"Discord connection error: {error}")
-            print(f"Retrying in {retry_after:.1f} seconds...")
-            await asyncio.sleep(retry_after)
-        except Exception as error:
-            print(f"Bot error: {error}")
-            await asyncio.sleep(30)
-        finally:
-            ready_once = False
+    while True :
+        try :
+            await bot .start (TOKEN )
+            break 
+        except discord .LoginFailure :
+            print ("Invalid Discord bot token.")
+            break 
+        except discord .HTTPException as error :
+            retry_after =getattr (error ,"retry_after",30 )
+            print (f"Discord connection error: {error }")
+            print (f"Retrying in {retry_after :.1f} seconds...")
+            await asyncio .sleep (retry_after )
+        except Exception as error :
+            print (f"Bot error: {error }")
+            await asyncio .sleep (30 )
+        finally :
+            ready_once =False 
 
 
-asyncio.run(start_bot())
+asyncio .run (start_bot ())
