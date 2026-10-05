@@ -24,6 +24,7 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "PanelBot")
 MOON_EXECUTABLE = os.getenv("MOON_EXECUTABLE")
 DECOM_SCRIPT = os.getenv("DECOM_SCRIPT", "decom.lua")
+LUA5_1_EXECUTABLE = os.getenv("LUA5_1_EXECUTABLE")
 PASTEFY_API_TOKEN = os.getenv("PASTEFY_API_TOKEN")
 
 if not TOKEN:
@@ -56,7 +57,6 @@ created_channels = {}
 reaction_role_cache = {}
 ready_once = False
 BASE_DIR = Path(__file__).resolve().parent
-DECOM_PATH = BASE_DIR / DECOM_SCRIPT
 
 
 def random_name(length=16):
@@ -64,31 +64,166 @@ def random_name(length=16):
     return "".join(secrets.choice(characters) for _ in range(length))
 
 
+def _existing_path_candidates(value, names):
+    candidates = []
+    if value:
+        configured = Path(value).expanduser()
+        candidates.append(configured)
+        if not configured.is_absolute():
+            candidates.extend(
+                [
+                    BASE_DIR / configured,
+                    Path.cwd() / configured,
+                    BASE_DIR / "bin" / configured,
+                    BASE_DIR / "scripts" / configured,
+                ]
+            )
+    roots = [
+        BASE_DIR,
+        Path.cwd(),
+        BASE_DIR / "bin",
+        BASE_DIR / "scripts",
+        Path("/home/container"),
+        Path("/app"),
+        Path("/workspace"),
+    ]
+    for root in roots:
+        for name in names:
+            candidates.append(root / name)
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def _recursive_find(names, max_depth=3):
+    name_set = {name.lower() for name in names}
+    roots = [BASE_DIR, Path.cwd(), Path("/home/container"), Path("/app"), Path("/workspace")]
+    seen_roots = set()
+    for root in roots:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        if str(root) in seen_roots or not root.is_dir():
+            continue
+        seen_roots.add(str(root))
+        try:
+            for current, dirs, files in os.walk(root):
+                current_path = Path(current)
+                try:
+                    depth = len(current_path.relative_to(root).parts)
+                except ValueError:
+                    continue
+                if depth >= max_depth:
+                    dirs[:] = []
+                for filename in files:
+                    if filename.lower() in name_set:
+                        return str(current_path / filename)
+        except OSError:
+            continue
+    return None
+
+
+def get_moon_executable():
+    configured = MOON_EXECUTABLE
+    names = [
+        "moonsec",
+        "moonsec.exe",
+        "MoonSec",
+        "MoonSec.exe",
+        "MoonSecCLI",
+        "MoonSecCLI.exe",
+        "moonsec-cli",
+        "moonsec-cli.exe",
+    ]
+    for candidate in _existing_path_candidates(configured, names):
+        if candidate.is_file():
+            try:
+                candidate.chmod(candidate.stat().st_mode | 0o111)
+            except OSError:
+                pass
+            return str(candidate)
+    if configured:
+        found = shutil.which(configured)
+        if found:
+            return found
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return _recursive_find(names)
+
+
+def get_decompiler_script():
+    configured = DECOM_SCRIPT
+    names = [Path(configured).name if configured else "decom.lua", "decom.lua", "decompiler.lua"]
+    names = list(dict.fromkeys(name for name in names if name))
+    for candidate in _existing_path_candidates(configured, names):
+        if candidate.is_file():
+            return str(candidate)
+    return _recursive_find(names)
+
+
+def _is_lua_51(path):
+    try:
+        result = subprocess.run(
+            [str(path), "-v"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        version = (result.stdout + " " + result.stderr).lower()
+        return "lua 5.1" in version
+    except Exception:
+        return False
+
+
 def get_lua_binary():
     system = platform.system()
+    configured = LUA5_1_EXECUTABLE
     if system == "Windows":
-        path = BASE_DIR / "bin" / "lua5.1.exe"
-    elif system == "Linux":
-        path = BASE_DIR / "bin" / "lua5.1"
-        if path.exists():
-            path.chmod(path.stat().st_mode | 0o111)
+        names = ["lua5.1.exe", "lua51.exe"]
     else:
-        return shutil.which("lua5.1")
-    return str(path) if path.exists() else None
+        names = ["lua5.1", "lua51"]
+    for candidate in _existing_path_candidates(configured, names):
+        if candidate.is_file() and _is_lua_51(candidate):
+            try:
+                candidate.chmod(candidate.stat().st_mode | 0o111)
+            except OSError:
+                pass
+            return str(candidate)
+    if configured:
+        found = shutil.which(configured)
+        if found and _is_lua_51(found):
+            return found
+    for name in names:
+        found = shutil.which(name)
+        if found and _is_lua_51(found):
+            return found
+    for name in ("lua", "lua.exe"):
+        found = shutil.which(name)
+        if found and _is_lua_51(found):
+            return found
+    return _recursive_find(names)
 
 
 def validate_deobf_configuration():
     errors = []
-    if not MOON_EXECUTABLE:
-        errors.append("MOON_EXECUTABLE is not configured.")
-    elif not Path(MOON_EXECUTABLE).exists():
-        errors.append("MOON_EXECUTABLE was not found.")
-    if not DECOM_PATH.exists():
-        errors.append(f"Decompiler script was not found: {DECOM_PATH}")
+    if not get_moon_executable():
+        errors.append("MoonSec executable was not found. Set MOON_EXECUTABLE or place the executable in the bot folder or bin folder.")
+    if not get_decompiler_script():
+        errors.append("Decompiler script was not found. Set DECOM_SCRIPT or place decom.lua in the bot folder, bin folder, or scripts folder.")
     if not get_lua_binary():
-        errors.append("Lua 5.1 executable was not found.")
-    if not PASTEFY_API_TOKEN:
-        errors.append("PASTEFY_API_TOKEN is not configured.")
+        errors.append("Lua 5.1 executable was not found. Set LUA5_1_EXECUTABLE, install Lua 5.1, or place it in the bot folder or bin folder.")
     return errors
 
 
@@ -101,9 +236,19 @@ def download_url_sync(url, destination):
         content_type = response.headers.get("Content-Type", "").lower()
         if "text/html" in content_type:
             raise ValueError("The supplied URL returned an HTML page instead of a Lua file.")
-        data = response.read()
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                length = int(content_length)
+            except (TypeError, ValueError):
+                length = None
+            if length is not None and length > 20 * 1024 * 1024:
+                raise ValueError("The supplied file is larger than 20 MB.")
+        data = response.read(20 * 1024 * 1024 + 1)
         if not data:
             raise ValueError("The supplied URL returned an empty file.")
+        if len(data) > 20 * 1024 * 1024:
+            raise ValueError("The supplied file is larger than 20 MB.")
         destination.write_bytes(data)
 
 
@@ -132,48 +277,53 @@ def run_deobf_process(command, timeout=180):
 async def process_deobf_file(input_path):
     work_dir = Path(tempfile.mkdtemp(prefix="moonsec_"))
     try:
+        moon_executable = get_moon_executable()
+        decompiler_script = get_decompiler_script()
+        lua_binary = get_lua_binary()
+        if not moon_executable:
+            return None, "MoonSec executable was not found."
+        if not decompiler_script:
+            return None, "Decompiler script was not found."
+        if not lua_binary:
+            return None, "Lua 5.1 executable was not found."
         source_path = work_dir / input_path.name
         luac_path = work_dir / f"{random_name()}.luac"
         output_path = work_dir / "decompiled.lua"
         shutil.copy2(input_path, source_path)
         moon_command = [
-            str(MOON_EXECUTABLE),
+            str(moon_executable),
             "-dev",
             "-i",
             str(source_path),
             "-o",
             str(luac_path),
         ]
-        moon_code, moon_stdout, moon_stderr = await asyncio.to_thread(
-            run_deobf_process,
-            moon_command,
-        )
+        moon_code, moon_stdout, moon_stderr = await asyncio.to_thread(run_deobf_process, moon_command)
         if moon_code != 0:
             error = moon_stderr.strip() or moon_stdout.strip() or "MoonSec processing failed."
-            return None, None, f"MoonSec error:\n{error}"
+            return None, f"MoonSec error:\n{error}"
         if not luac_path.exists():
-            return None, None, "MoonSec finished without producing a .luac file."
-        lua_binary = get_lua_binary()
-        if not lua_binary:
-            return luac_path, None, "Lua 5.1 executable was not found."
+            return None, "MoonSec finished without producing a .luac file."
         decom_command = [
             str(lua_binary),
-            str(DECOM_PATH),
+            str(decompiler_script),
             str(luac_path),
             str(output_path),
         ]
-        decom_code, decom_stdout, decom_stderr = await asyncio.to_thread(
-            run_deobf_process,
-            decom_command,
-        )
+        decom_code, decom_stdout, decom_stderr = await asyncio.to_thread(run_deobf_process, decom_command)
         if decom_code != 0 and not output_path.exists():
             error = decom_stderr.strip() or decom_stdout.strip() or "Decompiler failed."
-            return luac_path, None, f"Decompiler error:\n{error}"
+            return None, f"Decompiler error:\n{error}"
         if not output_path.exists():
-            return luac_path, None, "Decompiler did not produce an output file."
-        return luac_path, output_path, None
+            return None, "Decompiler did not produce an output file."
+        output_content = output_path.read_text(encoding="utf-8", errors="replace")
+        if not output_content.strip():
+            return None, "The decompiler produced an empty result."
+        return output_content, None
     except Exception as error:
-        return None, None, str(error)
+        return None, str(error)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def create_pastefy_sync(title, content):
@@ -186,32 +336,41 @@ def create_pastefy_sync(title, content):
         "encrypted": False,
         "type": "PASTE",
     }
-    request = urllib.request.Request(
-        "https://pastefy.app/api/v2/paste",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": PASTEFY_API_TOKEN,
-            "Content-Type": "application/json",
-            "User-Agent": "DiscordBot/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Pastefy returned HTTP {error.code}: {detail[:500]}")
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"Pastefy connection failed: {error.reason}")
-    paste = result.get("paste", result)
-    raw_url = paste.get("raw_url")
-    paste_id = paste.get("id")
-    if not raw_url and paste_id:
-        raw_url = f"https://pastefy.app/{paste_id}/raw"
-    if not raw_url:
-        raise RuntimeError("Pastefy did not return a raw URL.")
-    return raw_url
+    body = json.dumps(payload).encode("utf-8")
+    authorizations = [PASTEFY_API_TOKEN]
+    if not PASTEFY_API_TOKEN.lower().startswith(("bearer ", "token ")):
+        authorizations.extend([f"Token {PASTEFY_API_TOKEN}", f"Bearer {PASTEFY_API_TOKEN}"])
+    last_error = None
+    for authorization in authorizations:
+        request = urllib.request.Request(
+            "https://pastefy.app/api/v2/paste",
+            data=body,
+            headers={
+                "Authorization": authorization,
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            paste = result.get("paste", result)
+            raw_url = paste.get("raw_url")
+            paste_id = paste.get("id")
+            if not raw_url and paste_id:
+                raw_url = f"https://pastefy.app/{paste_id}/raw"
+            if not raw_url:
+                raise RuntimeError("Pastefy did not return a raw URL.")
+            return raw_url
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"Pastefy returned HTTP {error.code}: {detail[:500]}")
+            if error.code != 401:
+                raise last_error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Pastefy connection failed: {error.reason}")
+    raise last_error or RuntimeError("Pastefy upload failed.")
 
 
 class DeobfResultView(discord.ui.LayoutView):
@@ -1025,9 +1184,7 @@ reaction_group = app_commands.Group(
 async def deobf(ctx, url=None):
     configuration_errors = validate_deobf_configuration()
     if configuration_errors:
-        await ctx.send(
-            "```text\n" + "\n".join(configuration_errors)[:1900] + "\n```"
-        )
+        await ctx.send("```text\n" + "\n".join(configuration_errors)[:1900] + "\n```")
         return
 
     attachment = ctx.message.attachments[0] if ctx.message.attachments else None
@@ -1035,15 +1192,18 @@ async def deobf(ctx, url=None):
         await ctx.send("Usage: `.deobf` with a `.lua` or `.txt` attachment, or `.deobf <direct-file-url>`.")
         return
 
-    work_dir = Path(tempfile.mkdtemp(prefix="moonsec_input_"))
-    input_path = None
+    work_dir = Path(tempfile.mkdtemp(prefix="deobf_input_"))
     status = None
+    result_path = work_dir / "decompiled.lua"
     try:
         if attachment:
-            source_name = Path(attachment.filename).name
+            source_name = Path(attachment.filename).name or "input.lua"
             extension = Path(source_name).suffix.lower()
             if extension not in {".lua", ".txt"}:
                 await ctx.send("Only `.lua` and `.txt` files are supported.")
+                return
+            if attachment.size > 20 * 1024 * 1024:
+                await ctx.send("The attached file is larger than 20 MB.")
                 return
             input_path = work_dir / source_name
         else:
@@ -1067,33 +1227,44 @@ async def deobf(ctx, url=None):
                 await status.edit(content=f"❌ Unable to download the supplied file: {error}")
                 return
 
-        _, output_path, error = await process_deobf_file(input_path)
+        output_content, error = await process_deobf_file(input_path)
         if error:
             await status.edit(content="❌ Deobfuscation failed.")
             await ctx.send("```text\n" + error[:1900] + "\n```")
             return
 
-        output_content = output_path.read_text(encoding="utf-8", errors="replace")
-        if not output_content.strip():
-            await status.edit(content="❌ The decompiler produced an empty result.")
-            return
+        result_path.write_text(output_content, encoding="utf-8")
+        paste_url = None
+        paste_error = None
+        if PASTEFY_API_TOKEN:
+            try:
+                paste_url = await asyncio.to_thread(create_pastefy_sync, "Decompiled Lua", output_content)
+            except Exception as error:
+                paste_error = str(error)
+        else:
+            paste_error = "PASTEFY_API_TOKEN is not configured."
 
         try:
-            paste_url = await asyncio.to_thread(
-                create_pastefy_sync,
-                "Decompiled Lua",
-                output_content,
+            await status.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+        if paste_url:
+            view = DeobfResultView("decompiled.lua", paste_url)
+            await ctx.send(view=view, file=discord.File(str(result_path), filename="decompiled.lua"))
+        else:
+            view = discord.ui.LayoutView(timeout=None)
+            view.add_item(
+                make_container(
+                    make_text("## Deobfuscation Complete"),
+                    make_separator(),
+                    make_text("**File:** `decompiled.lua`\nThe decompiled Lua file is attached below."),
+                    make_separator(),
+                    make_text(f"Pastefy upload unavailable: `{paste_error}`"),
+                    accent_color=0x5865F2,
+                )
             )
-        except Exception as error:
-            await status.edit(content="❌ Deobfuscation completed, but the Pastefy upload failed.")
-            await ctx.send("```text\n" + str(error)[:1900] + "\n```")
-            return
-
-        await status.delete()
-        result_file = discord.File(str(output_path), filename="decompiled.lua")
-        view = DeobfResultView("decompiled.lua", paste_url)
-        await ctx.send(view=view, file=result_file)
-
+            await ctx.send(view=view, file=discord.File(str(result_path), filename="decompiled.lua"))
     except discord.HTTPException as error:
         try:
             await ctx.send(f"❌ Discord error: {error}")
@@ -1108,7 +1279,7 @@ async def deobf(ctx, url=None):
         if status is not None:
             try:
                 await status.delete()
-            except Exception:
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1119,7 +1290,6 @@ async def deobf_error(ctx, error):
         await ctx.send(f"Please wait {error.retry_after:.1f} seconds before using `.deobf` again.")
         return
     await ctx.send(f"Command error: {error}")
-
 
 @anti_group.command(
     name="scam",
