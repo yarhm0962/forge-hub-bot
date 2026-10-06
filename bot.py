@@ -49,6 +49,7 @@ insights_collection =mongo_db ["server_insights"]
 anti_scam_collection =mongo_db ["anti_scam_channels"]
 reaction_roles_collection =mongo_db ["reaction_roles"]
 member_snapshots_collection =mongo_db ["member_snapshots"]
+uploaded_scripts_collection =mongo_db ["uploaded_scripts"]
 
 intents =discord .Intents .default ()
 intents .guilds =True 
@@ -263,6 +264,28 @@ def save_reaction_role_sync (record ):
 
 def get_reaction_role_sync (message_id ):
     return reaction_roles_collection .find_one ({"_id":int (message_id )})
+
+
+def save_uploaded_script_sync (record ):
+    data =dict (record )
+    data ["_id"]=str (data ["_id"])
+    uploaded_scripts_collection .replace_one (
+    {"_id":data ["_id"]},
+    data ,
+    upsert =True ,
+    )
+
+
+def get_uploaded_script_sync (script_id ):
+    return uploaded_scripts_collection .find_one ({"_id":str (script_id )})
+
+
+def list_uploaded_scripts_sync ():
+    return list (uploaded_scripts_collection .find ({}))
+
+
+def delete_uploaded_script_sync (script_id ):
+    uploaded_scripts_collection .delete_one ({"_id":str (script_id )})
 
 
 def delete_reaction_role_sync (message_id ):
@@ -1268,14 +1291,16 @@ class ObfuscationResultView(discord.ui.LayoutView):
 
 
 class ScriptUploadView(discord.ui.LayoutView):
-    def __init__(self, title, script):
-        super().__init__(timeout=1800)
+    def __init__(self,title,script,script_id):
+        super().__init__(timeout=None)
         self.title_text=title
         self.script=script
+        self.script_id=str(script_id)
         self.copy_button=discord.ui.Button(
             label="Copy Script",
             style=discord.ButtonStyle.primary,
             emoji="📋",
+            custom_id=f"upload_script_copy:{self.script_id}",
         )
         self.copy_button.callback=self.copy_script
         safe_title=discord.utils.escape_markdown(title)
@@ -1294,23 +1319,26 @@ class ScriptUploadView(discord.ui.LayoutView):
             )
         )
 
-    def _preview(self, script):
+    def _preview(self,script):
         limit=3300
         if len(script)<=limit:
             return script
         return script[:limit]+"\n\n… preview truncated …"
 
-    async def copy_script(self, interaction):
-        if len(self.script)>3900:
+    async def copy_script(self,interaction):
+        try:
+            script=self.script
+            if len(script)>3900:
+                script=script[:3890]+"\n… script truncated for Discord response …"
             await interaction.response.send_message(
-                f"```\n{self.script[:3890]}\n```",
+                f"```\n{script}\n```",
                 ephemeral=True,
             )
-            return
-        await interaction.response.send_message(
-            f"```\n{self.script}\n```",
-            ephemeral=True,
-        )
+        except discord.HTTPException as error:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"Copy failed: {error}",ephemeral=True)
+            else:
+                await interaction.response.send_message(f"Copy failed: {error}",ephemeral=True)
 
 
 class CmdsView(discord.ui.LayoutView):
@@ -2640,14 +2668,67 @@ script :str ,
         await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
         return
 
+    script_id=secrets.token_hex(16)
+    record={
+        "_id":script_id,
+        "title":clean_title,
+        "script":clean_script,
+        "guild_id":interaction.guild.id if interaction.guild else None,
+        "channel_id":interaction.channel.id if interaction.channel else None,
+        "message_id":None,
+        "created_at":iso_now(),
+    }
+
     try:
-        await interaction.response.send_message(view=ScriptUploadView(clean_title,clean_script))
-    except discord.HTTPException as error:
+        await mongo_call(save_uploaded_script_sync,record)
+        await interaction.response.send_message(
+            view=ScriptUploadView(clean_title,clean_script,script_id)
+        )
+        message=await interaction.original_response()
+        record["message_id"]=message.id
+        await mongo_call(save_uploaded_script_sync,record)
+    except (discord.HTTPException,PyMongoError) as error:
+        try:
+            await mongo_call(delete_uploaded_script_sync,script_id)
+        except PyMongoError:
+            pass
         message=f"Could not post the script preview: {error}"
         if interaction.response.is_done():
             await interaction.followup.send(message,ephemeral=True)
         else:
             await interaction.response.send_message(message,ephemeral=True)
+
+
+async def restore_uploaded_script_views ():
+    try:
+        records=await mongo_call(list_uploaded_scripts_sync)
+    except PyMongoError as error:
+        print(f"MongoDB uploaded-script restore error: {error}")
+        return
+
+    restored=0
+    stale=[]
+    for record in records:
+        try:
+            script_id=str(record.get("_id",""))
+            title=str(record.get("title","")).strip()
+            script=str(record.get("script","")).strip("\n")
+            if not script_id or not title or not script:
+                stale.append(script_id)
+                continue
+            view=ScriptUploadView(title,script,script_id)
+            bot.add_view(view,message_id=int(record["message_id"]) if record.get("message_id") else None)
+            restored+=1
+        except (KeyError,TypeError,ValueError,discord.ClientException) as error:
+            if record.get("_id"):
+                stale.append(str(record["_id"]))
+            print(f"Uploaded-script restore warning: {error}")
+
+    for script_id in stale:
+        if script_id:
+            await mongo_call(delete_uploaded_script_sync,script_id)
+
+    print(f"Restored {restored} persistent upload-script button(s)")
 
 
 @reaction_group .command (
@@ -2950,6 +3031,7 @@ async def on_ready ():
 
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
+        await restore_uploaded_script_views ()
 
         ready_once =True 
 
