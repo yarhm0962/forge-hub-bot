@@ -6,6 +6,7 @@ import re
 import io
 import ipaddress
 import time
+import uuid
 import urllib .error
 import urllib .request
 from datetime import datetime ,timedelta ,timezone
@@ -41,6 +42,7 @@ insights_collection =mongo_db ["server_insights"]
 anti_scam_collection =mongo_db ["anti_scam_channels"]
 reaction_roles_collection =mongo_db ["reaction_roles"]
 member_snapshots_collection =mongo_db ["member_snapshots"]
+script_uploads_collection =mongo_db ["script_uploads"]
 
 intents =discord .Intents .default ()
 intents .guilds =True
@@ -100,41 +102,11 @@ def cleanup_events_sync (document ):
     document ["leaves"]=leaves
     document .setdefault ("total_joins",0 )
     document .setdefault ("total_leaves",0 )
-    if document ["total_joins"]==0 and joins :
-        document ["total_joins"]=len (joins )
-    if document ["total_leaves"]==0 and leaves :
-        document ["total_leaves"]=len (leaves )
     return document
 
 
-def get_guild_insights_sync (guild_id ):
+def ensure_insights_document_sync (guild_id ):
     guild_id =int (guild_id )
-    document =insights_collection .find_one ({"_id":guild_id })
-    if not document :
-        document ={
-        "_id":guild_id ,
-        "joins":[],
-        "leaves":[],
-        "total_joins":0 ,
-        "total_leaves":0 ,
-        }
-    document .setdefault ("joins",[])
-    document .setdefault ("leaves",[])
-    document .setdefault ("total_joins",0 )
-    document .setdefault ("total_leaves",0 )
-    if document ["total_joins"]==0 and document ["joins"]:
-        document ["total_joins"]=len (document ["joins"])
-    if document ["total_leaves"]==0 and document ["leaves"]:
-        document ["total_leaves"]=len (document ["leaves"])
-    cleanup_events_sync (document )
-    insights_collection .replace_one ({"_id":guild_id },document ,upsert =True )
-    return document
-
-
-def add_member_event_sync (guild_id ,event_type ):
-    guild_id =int (guild_id )
-    field ="joins"if event_type =="join"else "leaves"
-    total_field ="total_joins"if event_type =="join"else "total_leaves"
     insights_collection .update_one (
     {"_id":guild_id },
     {
@@ -143,21 +115,74 @@ def add_member_event_sync (guild_id ,event_type ):
     "leaves":[],
     "total_joins":0 ,
     "total_leaves":0 ,
+    "created_at":iso_now (),
     }
     },
     upsert =True ,
     )
-    document =insights_collection .find_one_and_update (
+
+
+def cleanup_insights_sync (guild_id ):
+    guild_id =int (guild_id )
+    ensure_insights_document_sync (guild_id )
+    cutoff =(
+    utc_now ()-timedelta (days =30 )
+    ).isoformat ()
+    insights_collection .update_one (
     {"_id":guild_id },
     {
-    "$push":{field :iso_now ()},
-    "$inc":{total_field :1 },
+    "$pull":{
+    "joins":{"$lt":cutoff },
+    "leaves":{"$lt":cutoff },
+    }
     },
-    return_document =ReturnDocument .AFTER ,
     )
-    cleanup_events_sync (document )
-    insights_collection .replace_one ({"_id":guild_id },document ,upsert =True )
-    return document
+
+
+def get_guild_insights_sync (guild_id ):
+    guild_id =int (guild_id )
+    cleanup_insights_sync (guild_id )
+    document =insights_collection .find_one ({"_id":guild_id })
+    if not document :
+        ensure_insights_document_sync (guild_id )
+        document =insights_collection .find_one ({"_id":guild_id })
+    return cleanup_events_sync (document or {
+    "_id":guild_id ,
+    "joins":[],
+    "leaves":[],
+    "total_joins":0 ,
+    "total_leaves":0 ,
+    })
+
+
+def record_member_events_sync (guild_id ,join_count =0 ,leave_count =0 ):
+    guild_id =int (guild_id )
+    join_count =max (0 ,int (join_count ))
+    leave_count =max (0 ,int (leave_count ))
+    if join_count ==0 and leave_count ==0 :
+        return get_guild_insights_sync (guild_id )
+    ensure_insights_document_sync (guild_id )
+    now =iso_now ()
+    update ={
+    "$inc":{
+    "total_joins":join_count ,
+    "total_leaves":leave_count ,
+    },
+    "$push":{},
+    }
+    if join_count :
+        update ["$push"]["joins"]={"$each":[now ]*join_count }
+    if leave_count :
+        update ["$push"]["leaves"]={"$each":[now ]*leave_count }
+    insights_collection .update_one ({"_id":guild_id },update )
+    cleanup_insights_sync (guild_id )
+    return insights_collection .find_one ({"_id":guild_id })
+
+
+def add_member_event_sync (guild_id ,event_type ):
+    if event_type =="join":
+        return record_member_events_sync (guild_id ,join_count =1 )
+    return record_member_events_sync (guild_id ,leave_count =1 )
 
 
 def get_member_snapshot_sync (guild_id ):
@@ -206,11 +231,21 @@ def reconcile_member_snapshot_sync (guild_id ,current_member_ids ):
     previous =get_member_snapshot_sync (guild_id )
     if previous is None :
         save_member_snapshot_sync (guild_id ,current )
-        return 0 ,0 ,True
+        return set(),set(),True
+
     joined =current -previous
     left =previous -current
+
+    if joined or left :
+        record_member_events_sync (
+        guild_id ,
+        join_count =len (joined ),
+        leave_count =len (left ),
+        )
+
     save_member_snapshot_sync (guild_id ,current )
     return joined ,left ,False
+
 
 def list_anti_scam_sync ():
     return list (anti_scam_collection .find ({}))
@@ -231,13 +266,24 @@ def delete_anti_scam_sync (channel_id ):
     anti_scam_collection .delete_one ({"_id":int (channel_id )})
 
 
-def increment_anti_scam_sync (channel_id ,kicked ):
+def increment_anti_scam_sync (channel_id ,kicked ,guild_id =None ):
     increments ={"violations":1 }
     if kicked :
         increments ["kicks"]=1
+    set_on_insert ={
+    "channel_id":int (channel_id ),
+    "kicks":0 ,
+    "violations":0 ,
+    }
+    if guild_id is not None :
+        set_on_insert ["guild_id"]=int (guild_id )
     return anti_scam_collection .find_one_and_update (
     {"_id":int (channel_id )},
-    {"$inc":increments },
+    {
+    "$inc":increments ,
+    "$setOnInsert":set_on_insert ,
+    },
+    upsert =True ,
     return_document =ReturnDocument .AFTER ,
     )
 
@@ -263,6 +309,30 @@ def delete_reaction_role_sync (message_id ):
 
 def list_reaction_roles_sync ():
     return list (reaction_roles_collection .find ({}))
+
+
+def save_script_upload_sync (record ):
+    message_id =int (record ["message_id"])
+    data =dict (record )
+    data ["_id"]=message_id
+    data ["message_id"]=message_id
+    script_uploads_collection .replace_one (
+    {"_id":message_id },
+    data ,
+    upsert =True ,
+    )
+
+
+def list_script_uploads_sync ():
+    return list (script_uploads_collection .find ({}))
+
+
+def get_script_upload_sync (message_id ):
+    return script_uploads_collection .find_one ({"_id":int (message_id )})
+
+
+def delete_script_upload_sync (message_id ):
+    script_uploads_collection .delete_one ({"_id":int (message_id )})
 
 
 async def mongo_call (function ,*args ):
@@ -615,24 +685,27 @@ def set_guild_bot_avatar_sync(guild_id,image_data_uri):
 
 
 class ScriptUploadView(discord.ui.LayoutView):
-    def __init__(self, title, script):
-        super().__init__(timeout=1800)
+    def __init__(self, title, script, custom_id=None):
+        super().__init__(timeout=None)
         self.title_text=title
         self.script=script
+        self.custom_id=custom_id or f"script_copy:{uuid.uuid4().hex}"
         self.copy_button=discord.ui.Button(
             label="Copy Script",
             style=discord.ButtonStyle.primary,
             emoji="📋",
+            custom_id=self.custom_id,
         )
         self.copy_button.callback=self.copy_script
         safe_title=discord.utils.escape_markdown(title)
         preview=self._preview(script)
+        safe_preview=preview.replace("```","`\u200b``")
         self.add_item(
             make_container(
                 make_text(f"## {safe_title}"),
                 make_text("-# 📜 Script Preview"),
                 make_separator(),
-                make_text(f"```\n{preview}\n```"),
+                make_text(f"```\n{safe_preview}\n```"),
                 make_separator(),
                 discord.ui.ActionRow(self.copy_button),
                 make_separator(),
@@ -647,17 +720,45 @@ class ScriptUploadView(discord.ui.LayoutView):
             return script
         return script[:limit]+"\n\n… preview truncated …"
 
+    def _copy_view(self, chunk, part, total):
+        view=discord.ui.LayoutView(timeout=60)
+        safe_chunk=chunk.replace("```","`\u200b``")
+        view.add_item(
+            make_container(
+                make_text(f"## 📋 {discord.utils.escape_markdown(self.title_text)}"),
+                make_text(f"-# Part {part}/{total}"),
+                make_separator(),
+                make_text(f"````\n{safe_chunk}\n````"),
+                accent_color=0x5865F2,
+            )
+        )
+        return view
+
     async def copy_script(self, interaction):
-        if len(self.script)>3900:
+        script=self.script
+        chunks=[script[index:index+3800] for index in range(0,len(script),3800)] or [""]
+        total=len(chunks)
+        try:
             await interaction.response.send_message(
-                f"```\n{self.script[:3890]}\n```",
+                view=self._copy_view(chunks[0],1,total),
                 ephemeral=True,
             )
-            return
-        await interaction.response.send_message(
-            f"```\n{self.script}\n```",
-            ephemeral=True,
-        )
+            for index,chunk in enumerate(chunks[1:],2):
+                await interaction.followup.send(
+                    view=self._copy_view(chunk,index,total),
+                    ephemeral=True,
+                )
+        except discord.HTTPException as error:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"Could not open the script: {error}",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"Could not open the script: {error}",
+                    ephemeral=True,
+                )
 
 
 class CmdsView(discord.ui.LayoutView):
@@ -964,6 +1065,118 @@ class ReactionRoleSetupView (discord .ui .LayoutView ):
             return
         await interaction .response .send_modal (EmojiModal (self ))
 
+    async def save_callback (self ,interaction ):
+        if not await self .check_author (interaction ):
+            return
+
+        if interaction .guild is None :
+            await interaction .response .send_message (
+            "This setup can only be saved inside a server.",
+            ephemeral =True ,
+            )
+            return
+
+        if self .message_id is None :
+            await interaction .response .send_message (
+            "Set the target message first.",
+            ephemeral =True ,
+            )
+            return
+
+        if not self .roles :
+            await interaction .response .send_message (
+            "Select at least one role.",
+            ephemeral =True ,
+            )
+            return
+
+        if not self .emojis :
+            await interaction .response .send_message (
+            "Set at least one emoji.",
+            ephemeral =True ,
+            )
+            return
+
+        if len (self .roles )!=len (self .emojis ):
+            await interaction .response .send_message (
+            "The number of roles and emojis must match.",
+            ephemeral =True ,
+            )
+            return
+
+        await interaction .response .defer (ephemeral =True ,thinking =True )
+
+        try :
+            message =await find_message_in_guild (interaction .guild ,self .message_id )
+            if message is None :
+                await interaction .followup .send (
+                "I could not find that message in this server.",
+                ephemeral =True ,
+                )
+                return
+
+            me =interaction .guild .me
+            if me is None or not me .guild_permissions .manage_roles or not me .guild_permissions .add_reactions :
+                await interaction .followup .send (
+                "I need Manage Roles and Add Reactions permissions.",
+                ephemeral =True ,
+                )
+                return
+
+            pairs =[]
+            for role ,emoji in zip (self .roles ,self .emojis ):
+                if role .is_default ()or role .managed :
+                    raise RuntimeError (f"The role {role .name} cannot be assigned by the bot.")
+                if role >=me .top_role :
+                    raise RuntimeError (f"The role {role .name} is higher than or equal to my highest role.")
+                if not str (emoji ).strip ():
+                    raise RuntimeError ("Every selected role must have an emoji.")
+                pairs .append ({
+                "emoji":str (emoji ).strip (),
+                "role_id":role .id ,
+                "role_name":role .name ,
+                })
+
+            record={
+            "message_id":message .id ,
+            "channel_id":message .channel.id ,
+            "guild_id":interaction .guild.id ,
+            "pairs":pairs ,
+            "updated_at":iso_now (),
+            }
+
+            await mongo_call (save_reaction_role_sync,record )
+            reaction_role_cache [message .id ]=record
+
+            failed=[]
+            for pair in pairs :
+                try :
+                    await message .add_reaction (pair ["emoji"])
+                except (discord .Forbidden ,discord .HTTPException ):
+                    failed .append (pair ["emoji"])
+
+            await message .edit (view =ReactionRoleMessageView (pairs ))
+
+            result="✅ Reaction roles saved and will remain active after bot restarts."
+            if failed :
+                result +="\n⚠️ Could not add: "+", ".join (failed )
+            await interaction .followup .send (result ,ephemeral =True )
+        except PyMongoError as error :
+            await interaction .followup .send (
+            f"MongoDB error while saving reaction roles: {error }",
+            ephemeral =True ,
+            )
+        except (discord .Forbidden ,discord .HTTPException )as error :
+            await interaction .followup .send (
+            f"Discord error while creating reaction roles: {error }",
+            ephemeral =True ,
+            )
+        except Exception as error :
+            await interaction .followup .send (
+            f"Could not save reaction roles: {error }",
+            ephemeral =True ,
+            )
+
 
 class ReactionRoleMessageView (discord .ui .LayoutView ):
     def __init__ (self ,pairs ):
@@ -998,6 +1211,42 @@ async def find_message_in_guild (guild ,message_id ):
             continue
 
     return None
+
+
+async def restore_script_uploads ():
+    records =await mongo_call (list_script_uploads_sync )
+    restored=0
+    stale=[]
+
+    for record in records :
+        try :
+            message_id=int (record ["message_id"])
+            title=str (record ["title"])
+            script=str (record ["script"])
+            custom_id=str (record ["custom_id"])
+        except (KeyError ,TypeError ,ValueError ):
+            stale.append (record.get ("_id"))
+            continue
+
+        if not custom_id or len (custom_id )>100 :
+            stale.append (message_id )
+            continue
+
+        try :
+            view=ScriptUploadView (title ,script ,custom_id )
+            bot.add_view (view ,message_id=message_id )
+            restored+=1
+        except (ValueError ,TypeError ):
+            stale.append (message_id )
+
+    for message_id in stale :
+        if message_id is not None :
+            try :
+                await mongo_call (delete_script_upload_sync,message_id )
+            except PyMongoError :
+                pass
+
+    return restored
 
 
 async def restore_reaction_roles ():
@@ -1377,20 +1626,6 @@ async def server_insights (interaction :discord .Interaction ):
         current_member_ids ,
         )
 
-        if not initialized :
-            for _ in joined :
-                await mongo_call (
-                add_member_event_sync ,
-                interaction .guild .id ,
-                "join",
-                )
-            for _ in left :
-                await mongo_call (
-                add_member_event_sync ,
-                interaction .guild .id ,
-                "leave",
-                )
-
         document =await mongo_call (
         get_guild_insights_sync ,
         interaction .guild .id ,
@@ -1651,14 +1886,29 @@ script :str ,
         await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
         return
 
+    view=ScriptUploadView(clean_title,clean_script)
     try:
-        await interaction.response.send_message(view=ScriptUploadView(clean_title,clean_script))
+        await interaction.response.send_message(view=view)
+        sent_message=await interaction.original_response()
+        bot.add_view(view,message_id=sent_message.id)
+        record={
+        "message_id":sent_message.id ,
+        "channel_id":getattr(interaction.channel,"id",0),
+        "guild_id":interaction.guild.id if interaction.guild else 0 ,
+        "title":clean_title ,
+        "script":clean_script ,
+        "custom_id":view.custom_id ,
+        "created_at":iso_now (),
+        }
+        await mongo_call (save_script_upload_sync,record )
     except discord.HTTPException as error:
         message=f"Could not post the script preview: {error}"
         if interaction.response.is_done():
             await interaction.followup.send(message,ephemeral=True)
         else:
             await interaction.response.send_message(message,ephemeral=True)
+    except PyMongoError as error:
+        print(f"MongoDB script persistence error: {error}")
 
 
 @custom_group .command (
@@ -1929,6 +2179,7 @@ async def on_message (message :discord .Message ):
                 increment_anti_scam_sync ,
                 message .channel .id ,
                 kicked ,
+                message .guild .id ,
                 )
                 if record :
                     data ["view"].update_stats (
@@ -2033,29 +2284,17 @@ async def on_ready ():
                 guild .id ,
                 member_ids ,
                 )
-                if not initialized :
-                    for _ in joined :
-                        await mongo_call (
-                        add_member_event_sync ,
-                        guild .id ,
-                        "join",
-                        )
-                    for _ in left :
-                        await mongo_call (
-                        add_member_event_sync ,
-                        guild .id ,
-                        "leave",
-                        )
-                    if joined or left :
-                        print (
-                        f"Reconciled {guild .name }: {len (joined )} missed joins, {len (left )} missed departures"
-                        )
+                if joined or left :
+                    print (
+                    f"Reconciled {guild .name }: {len (joined )} missed joins, {len (left )} missed departures"
+                    )
                 await mongo_call (get_guild_insights_sync ,guild .id )
             except PyMongoError as error :
                 print (f"MongoDB member reconciliation error for guild {guild .id }: {error }")
 
         synced =await bot .tree .sync ()
 
+        restored_scripts =await restore_script_uploads ()
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
 
@@ -2069,6 +2308,9 @@ async def on_ready ():
         )
         print (
         f"Synced {len (synced )} command(s)"
+        )
+        print (
+        f"Restored {restored_scripts} persistent script button(s)"
         )
         print (
         f"Restored {len (created_channels )} anti-scam channel(s)"
