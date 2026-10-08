@@ -6,7 +6,6 @@ import re
 import io
 import ipaddress
 import time
-import uuid
 import urllib .error
 import urllib .request
 from datetime import datetime ,timedelta ,timezone
@@ -42,7 +41,6 @@ insights_collection =mongo_db ["server_insights"]
 anti_scam_collection =mongo_db ["anti_scam_channels"]
 reaction_roles_collection =mongo_db ["reaction_roles"]
 member_snapshots_collection =mongo_db ["member_snapshots"]
-script_uploads_collection =mongo_db ["script_uploads"]
 
 intents =discord .Intents .default ()
 intents .guilds =True
@@ -310,29 +308,6 @@ def delete_reaction_role_sync (message_id ):
 def list_reaction_roles_sync ():
     return list (reaction_roles_collection .find ({}))
 
-
-def save_script_upload_sync (record ):
-    message_id =int (record ["message_id"])
-    data =dict (record )
-    data ["_id"]=message_id
-    data ["message_id"]=message_id
-    script_uploads_collection .replace_one (
-    {"_id":message_id },
-    data ,
-    upsert =True ,
-    )
-
-
-def list_script_uploads_sync ():
-    return list (script_uploads_collection .find ({}))
-
-
-def get_script_upload_sync (message_id ):
-    return script_uploads_collection .find_one ({"_id":int (message_id )})
-
-
-def delete_script_upload_sync (message_id ):
-    script_uploads_collection .delete_one ({"_id":int (message_id )})
 
 
 async def mongo_call (function ,*args ):
@@ -682,83 +657,6 @@ def set_guild_bot_avatar_sync(guild_id,image_data_uri):
         raise RuntimeError(f"Discord API returned HTTP {error.code}: {detail[:700]}") from error
     except urllib.error.URLError as error:
         raise RuntimeError(f"Could not connect to Discord: {error.reason}") from error
-
-
-class ScriptUploadView(discord.ui.LayoutView):
-    def __init__(self, title, script, custom_id=None):
-        super().__init__(timeout=None)
-        self.title_text=title
-        self.script=script
-        self.custom_id=custom_id or f"script_copy:{uuid.uuid4().hex}"
-        self.copy_button=discord.ui.Button(
-            label="Copy Script",
-            style=discord.ButtonStyle.primary,
-            emoji="📋",
-            custom_id=self.custom_id,
-        )
-        self.copy_button.callback=self.copy_script
-        safe_title=discord.utils.escape_markdown(title)
-        preview=self._preview(script)
-        safe_preview=preview.replace("```","`\u200b``")
-        self.add_item(
-            make_container(
-                make_text(f"## {safe_title}"),
-                make_text("-# 📜 Script Preview"),
-                make_separator(),
-                make_text(f"```\n{safe_preview}\n```"),
-                make_separator(),
-                discord.ui.ActionRow(self.copy_button),
-                make_separator(),
-                make_text("📋 **Copy Script** to open a clean, copy-ready version."),
-                accent_color=0x5865F2,
-            )
-        )
-
-    def _preview(self, script):
-        limit=3300
-        if len(script)<=limit:
-            return script
-        return script[:limit]+"\n\n… preview truncated …"
-
-    def _copy_view(self, chunk, part, total):
-        view=discord.ui.LayoutView(timeout=60)
-        safe_chunk=chunk.replace("```","`\u200b``")
-        view.add_item(
-            make_container(
-                make_text(f"## 📋 {discord.utils.escape_markdown(self.title_text)}"),
-                make_text(f"-# Part {part}/{total}"),
-                make_separator(),
-                make_text(f"````\n{safe_chunk}\n````"),
-                accent_color=0x5865F2,
-            )
-        )
-        return view
-
-    async def copy_script(self, interaction):
-        script=self.script
-        chunks=[script[index:index+3800] for index in range(0,len(script),3800)] or [""]
-        total=len(chunks)
-        try:
-            await interaction.response.send_message(
-                view=self._copy_view(chunks[0],1,total),
-                ephemeral=True,
-            )
-            for index,chunk in enumerate(chunks[1:],2):
-                await interaction.followup.send(
-                    view=self._copy_view(chunk,index,total),
-                    ephemeral=True,
-                )
-        except discord.HTTPException as error:
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"Could not open the script: {error}",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(
-                    f"Could not open the script: {error}",
-                    ephemeral=True,
-                )
 
 
 class CmdsView(discord.ui.LayoutView):
@@ -1211,42 +1109,6 @@ async def find_message_in_guild (guild ,message_id ):
             continue
 
     return None
-
-
-async def restore_script_uploads ():
-    records =await mongo_call (list_script_uploads_sync )
-    restored=0
-    stale=[]
-
-    for record in records :
-        try :
-            message_id=int (record ["message_id"])
-            title=str (record ["title"])
-            script=str (record ["script"])
-            custom_id=str (record ["custom_id"])
-        except (KeyError ,TypeError ,ValueError ):
-            stale.append (record.get ("_id"))
-            continue
-
-        if not custom_id or len (custom_id )>100 :
-            stale.append (message_id )
-            continue
-
-        try :
-            view=ScriptUploadView (title ,script ,custom_id )
-            bot.add_view (view ,message_id=message_id )
-            restored+=1
-        except (ValueError ,TypeError ):
-            stale.append (message_id )
-
-    for message_id in stale :
-        if message_id is not None :
-            try :
-                await mongo_call (delete_script_upload_sync,message_id )
-            except PyMongoError :
-                pass
-
-    return restored
 
 
 async def restore_reaction_roles ():
@@ -1703,6 +1565,7 @@ title ="Update title",
 version ="Update version, such as 2.6",
 change_logs ="Message ID containing the change logs",
 message ="Optional small update message",
+script_channel ="Optional Discord channel link for the script",
 channel ="Channel where the update will be posted",
 )
 async def update_logs (
@@ -1712,6 +1575,7 @@ version :str ,
 change_logs :str ,
 channel :discord .TextChannel ,
 message :str |None =None ,
+script_channel :str |None =None ,
 ):
     if interaction .guild is None :
         await interaction .response .send_message (
@@ -1754,6 +1618,7 @@ message :str |None =None ,
     clean_version =version .strip ()
     clean_message_id =change_logs .strip ()
     clean_message =message .strip ()if message else None
+    clean_script_channel =script_channel .strip ()if script_channel else None
 
     if not clean_title :
         await interaction .response .send_message (
@@ -1778,6 +1643,43 @@ message :str |None =None ,
         ephemeral =True ,
         )
         return
+
+    script_channel_id =None
+    if clean_script_channel :
+        script_link_match =re .fullmatch (
+        r"https://(?:discord\.com|discordapp\.com)/channels/(\d{15,22})/(\d{15,22})",
+        clean_script_channel ,
+        )
+        if not script_link_match :
+            await interaction .response .send_message (
+            "The script channel must be a valid Discord channel link.",
+            ephemeral =True ,
+            )
+            return
+
+        script_guild_id ,script_channel_id =map (int ,script_link_match .groups ())
+        if script_guild_id != interaction .guild .id :
+            await interaction .response .send_message (
+            "The script channel link must point to a channel in this server.",
+            ephemeral =True ,
+            )
+            return
+
+        script_channel_obj =interaction .guild .get_channel (script_channel_id )
+        if script_channel_obj is None :
+            try :
+                script_channel_obj =await interaction .guild .fetch_channel (script_channel_id )
+            except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ):
+                script_channel_obj =None
+
+        if script_channel_obj is None :
+            await interaction .response .send_message (
+            "The script channel link points to a channel that could not be found in this server.",
+            ephemeral =True ,
+            )
+            return
+
+        script_channel_id =script_channel_obj .id
 
     await interaction .response .defer (ephemeral =True )
 
@@ -1804,6 +1706,19 @@ message :str |None =None ,
 
         change_content =change_content .replace ("```","`\u200b``")
 
+        script_components =[
+        make_separator (),
+        make_text ("⛓️‍💥 **Check for the script here**"),
+        discord .ui .ActionRow (
+            discord .ui .Button (
+            label ="Check Script",
+            emoji ="📜",
+            style =discord .ButtonStyle .link ,
+            url =clean_script_channel ,
+            )
+        ),
+        ]if clean_script_channel else []
+
         container =make_container (
         make_text (f"## {clean_title }"),
         make_text (f"-# {version_text }"),
@@ -1812,10 +1727,12 @@ message :str |None =None ,
         f"### CHANGE LOGS\n```diff\n{change_content }```"
         ),
         *(
-        [make_text (clean_message )]
+        [make_text (clean_message ),make_separator ()]
         if clean_message
         else []
         ),
+        *script_components ,
+        accent_color =0x5865F2 ,
         )
 
         view =discord .ui .LayoutView (timeout =None )
@@ -1856,7 +1773,7 @@ message :str |None =None ,
 
 @upload_group .command (
 name ="script",
-description ="Post a clean Components V2 script preview",
+description ="Post a Lua/Luau script as a normal code block",
 )
 @app_commands .describe (
 title ="Required title for the script post",
@@ -1886,29 +1803,51 @@ script :str ,
         await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
         return
 
-    view=ScriptUploadView(clean_title,clean_script)
+    def split_code_parts(value,max_length=1600):
+        lines=value.splitlines() or [""]
+        parts=[]
+        current=[]
+        current_length=0
+        for line in lines:
+            added=len(line)+1
+            if current and current_length+added>max_length:
+                parts.append("\n".join(current))
+                current=[]
+                current_length=0
+            if len(line)>max_length:
+                if current:
+                    parts.append("\n".join(current))
+                    current=[]
+                    current_length=0
+                for index in range(0,len(line),max_length):
+                    parts.append(line[index:index+max_length])
+                continue
+            current.append(line)
+            current_length+=added
+        if current or not parts:
+            parts.append("\n".join(current))
+        return parts
+
+    parts=split_code_parts(clean_script)
+    total=len(parts)
+
     try:
-        await interaction.response.send_message(view=view)
-        sent_message=await interaction.original_response()
-        bot.add_view(view,message_id=sent_message.id)
-        record={
-        "message_id":sent_message.id ,
-        "channel_id":getattr(interaction.channel,"id",0),
-        "guild_id":interaction.guild.id if interaction.guild else 0 ,
-        "title":clean_title ,
-        "script":clean_script ,
-        "custom_id":view.custom_id ,
-        "created_at":iso_now (),
-        }
-        await mongo_call (save_script_upload_sync,record )
+        for index,part in enumerate(parts,1):
+            heading=f"## {discord.utils.escape_markdown(clean_title)}"
+            if total>1:
+                heading+=f" · Part {index}/{total}"
+            safe_part=part.replace("```","`\u200b``")
+            content=f"{heading}\n```lua\n{safe_part}\n```"
+            if index==1:
+                await interaction.response.send_message(content=content)
+            else:
+                await interaction.followup.send(content)
     except discord.HTTPException as error:
-        message=f"Could not post the script preview: {error}"
+        message=f"Could not post the script: {error}"
         if interaction.response.is_done():
             await interaction.followup.send(message,ephemeral=True)
         else:
             await interaction.response.send_message(message,ephemeral=True)
-    except PyMongoError as error:
-        print(f"MongoDB script persistence error: {error}")
 
 
 @custom_group .command (
@@ -2294,7 +2233,6 @@ async def on_ready ():
 
         synced =await bot .tree .sync ()
 
-        restored_scripts =await restore_script_uploads ()
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
 
@@ -2308,9 +2246,6 @@ async def on_ready ():
         )
         print (
         f"Synced {len (synced )} command(s)"
-        )
-        print (
-        f"Restored {restored_scripts} persistent script button(s)"
         )
         print (
         f"Restored {len (created_channels )} anti-scam channel(s)"
