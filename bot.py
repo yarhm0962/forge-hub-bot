@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import io
+import hashlib
 import ipaddress
 import time
 import urllib .error
@@ -14,8 +15,8 @@ from pathlib import Path
 import discord
 from discord import app_commands
 from discord .ext import commands
-from pymongo import MongoClient ,ReturnDocument ,WriteConcern
-from pymongo .errors import AutoReconnect ,NetworkTimeout ,PyMongoError ,ServerSelectionTimeoutError
+from pymongo import MongoClient ,ReturnDocument
+from pymongo .errors import PyMongoError
 
 TOKEN =os .getenv ("DISCORD_TOKEN")
 MONGODB_URI =os .getenv ("MONGODB_URI")
@@ -34,17 +35,17 @@ MONGODB_URI ,
 serverSelectionTimeoutMS =10000 ,
 connectTimeoutMS =10000 ,
 socketTimeoutMS =10000 ,
-retryReads =True ,
 retryWrites =True ,
+retryReads =True ,
 )
 
 mongo_db =mongo_client [MONGODB_DATABASE ]
-MONGO_WRITE_CONCERN =WriteConcern (w ="majority",j =True )
-insights_collection =mongo_db ["server_insights"].with_options (write_concern =MONGO_WRITE_CONCERN )
-anti_scam_collection =mongo_db ["anti_scam_channels"].with_options (write_concern =MONGO_WRITE_CONCERN )
-reaction_roles_collection =mongo_db ["reaction_roles"].with_options (write_concern =MONGO_WRITE_CONCERN )
-member_snapshots_collection =mongo_db ["member_snapshots"].with_options (write_concern =MONGO_WRITE_CONCERN )
-script_uploads_collection =mongo_db ["script_uploads"].with_options (write_concern =MONGO_WRITE_CONCERN )
+insights_collection =mongo_db ["server_insights"]
+anti_scam_collection =mongo_db ["anti_scam_channels"]
+reaction_roles_collection =mongo_db ["reaction_roles"]
+member_snapshots_collection =mongo_db ["member_snapshots"]
+sticky_triggers_collection =mongo_db ["sticky_triggers"]
+script_uploads_collection =mongo_db ["script_uploads"]
 
 intents =discord .Intents .default ()
 intents .guilds =True
@@ -55,6 +56,8 @@ bot =commands .Bot (command_prefix =("!","."),intents =intents )
 
 created_channels ={}
 reaction_role_cache ={}
+sticky_trigger_cache ={}
+script_views_restored=False
 ready_once =False
 
 
@@ -313,47 +316,66 @@ def list_reaction_roles_sync ():
     return list (reaction_roles_collection .find ({}))
 
 
-def save_script_upload_sync (record ):
-    script_id =str (record ["script_id"])
+def sticky_trigger_id (guild_id ,channel_id ,match_text ):
+    normalized =re.sub (r"\s+"," ",match_text .strip ()).casefold ()
+    digest =hashlib .sha256 (f"{int (guild_id )}:{int (channel_id )}:{normalized }".encode ("utf-8")).hexdigest ()
+    return f"{int (guild_id )}:{int (channel_id )}:{digest }"
+
+
+def save_sticky_trigger_sync (record ):
+    match_text =str (record ["match_text"]).strip ()
+    guild_id =int (record ["guild_id"])
+    channel_id =int (record ["channel_id"])
     data =dict (record )
-    data ["_id"] =script_id
-    script_uploads_collection .replace_one ({"_id":script_id },data ,upsert =True )
+    data ["_id"]=sticky_trigger_id (guild_id ,channel_id ,match_text )
+    data ["guild_id"]=guild_id
+    data ["channel_id"]=channel_id
+    data ["match_text"]=match_text
+    data ["match_normalized"]=re.sub (r"\s+"," ",match_text).casefold ()
+    data ["response_text"]=str (record ["response_text"])
+    data ["updated_at"]=iso_now ()
+    sticky_triggers_collection .replace_one (
+    {"_id":data ["_id"]},
+    data ,
+    upsert =True ,
+    )
+    return data
 
 
-def get_script_upload_sync (script_id ):
-    return script_uploads_collection .find_one ({"_id":str (script_id )})
+def list_sticky_triggers_sync ():
+    return list (sticky_triggers_collection .find ({}))
+
+
+def save_script_upload_sync (record ):
+    data =dict (record )
+    data ["_id"]=str (data ["script_id"])
+    data ["guild_id"]=int (data ["guild_id"])
+    data ["channel_id"]=int (data ["channel_id"])
+    data ["title"]=str (data ["title"])
+    data ["script"]=str (data ["script"])
+    data ["created_at"]=str (data .get ("created_at") or iso_now ())
+    script_uploads_collection .replace_one (
+    {"_id":data ["_id"]},
+    data ,
+    upsert =True ,
+    )
+    return data
+
+
+def update_script_upload_message_sync (script_id ,message_id ):
+    script_uploads_collection .update_one (
+    {"_id":str (script_id )},
+    {"$set":{"message_id":int (message_id ),"updated_at":iso_now ()}},
+    )
 
 
 def list_script_uploads_sync ():
-    return list (script_uploads_collection .find ({"message_id":{"$exists":True,"$ne":None }}))
-
-
-def ensure_mongo_indexes_sync ():
-    script_uploads_collection .create_index ("message_id")
-    script_uploads_collection .create_index ("guild_id")
-    script_uploads_collection .create_index ("channel_id")
-    reaction_roles_collection .create_index ("guild_id")
-    reaction_roles_collection .create_index ("channel_id")
-    anti_scam_collection .create_index ("guild_id")
-    anti_scam_collection .create_index ("channel_id")
-    member_snapshots_collection .create_index ("updated_at")
+    return list (script_uploads_collection .find ({"script": {"$type":"string"}}))
 
 
 
 async def mongo_call (function ,*args ):
     return await asyncio .to_thread (function ,*args )
-
-
-async def mongo_safe_call (function ,*args ,retries =3 ):
-    delay =0.75
-    for attempt in range (retries ):
-        try :
-            return await asyncio .to_thread (function ,*args )
-        except (AutoReconnect ,NetworkTimeout ,ServerSelectionTimeoutError ):
-            if attempt >=retries -1 :
-                raise
-            await asyncio .sleep (delay )
-            delay =min (delay *2 ,3 )
 
 
 def make_container (*items ,accent_color =None ):
@@ -1085,7 +1107,7 @@ class ReactionRoleSetupView (discord .ui .LayoutView ):
             "updated_at":iso_now (),
             }
 
-            await mongo_safe_call (save_reaction_role_sync,record )
+            await mongo_call (save_reaction_role_sync,record )
             reaction_role_cache [message .id ]=record
 
             failed=[]
@@ -1154,7 +1176,8 @@ async def find_message_in_guild (guild ,message_id ):
 
 
 async def restore_reaction_roles ():
-    records =await mongo_safe_call (list_reaction_roles_sync )
+    records =await mongo_call (list_reaction_roles_sync )
+
     for record in records :
         try :
             guild_id =int (record ["guild_id"])
@@ -1162,6 +1185,7 @@ async def restore_reaction_roles ():
             message_id =int (record ["message_id"])
             pairs =record ["pairs"]
         except (KeyError ,TypeError ,ValueError ):
+            print (f"Skipping invalid persisted reaction-role record: {record.get('_id')}")
             continue
 
         guild =bot .get_guild (guild_id )
@@ -1207,6 +1231,7 @@ async def restore_reaction_roles ():
                 pass
 
         if not valid_pairs :
+            reaction_role_cache[message_id]=record
             continue
 
         record ["pairs"]=valid_pairs
@@ -1228,11 +1253,7 @@ async def on_raw_reaction_add (payload ):
 
     record =reaction_role_cache .get (payload .message_id )
     if record is None :
-        try :
-            record =await mongo_safe_call (get_reaction_role_sync ,payload .message_id )
-        except PyMongoError as error :
-            print (f"MongoDB reaction-role lookup error: {error }")
-            return
+        record =await mongo_call (get_reaction_role_sync ,payload .message_id )
         if record :
             reaction_role_cache [payload .message_id ]=record
 
@@ -1279,11 +1300,7 @@ async def on_raw_reaction_remove (payload ):
 
     record =reaction_role_cache .get (payload .message_id )
     if record is None :
-        try :
-            record =await mongo_safe_call (get_reaction_role_sync ,payload .message_id )
-        except PyMongoError as error :
-            print (f"MongoDB reaction-role lookup error: {error }")
-            return
+        record =await mongo_call (get_reaction_role_sync ,payload .message_id )
         if record :
             reaction_role_cache [payload .message_id ]=record
 
@@ -1391,6 +1408,11 @@ description ="Reaction role tools",
 parent =add_group ,
 )
 
+sticky_group =app_commands .Group (
+name ="sticky",
+description ="Automatic message triggers",
+)
+
 
 @anti_group .command (
 name ="scam",
@@ -1463,7 +1485,7 @@ async def anti_scam (interaction :discord .Interaction ,name :str ):
         "violations":0 ,
         }
 
-        await mongo_safe_call (save_anti_scam_sync ,record )
+        await mongo_call (save_anti_scam_sync ,record )
 
         created_channels [channel .id ]={
         "view":view ,
@@ -1529,7 +1551,7 @@ async def server_insights (interaction :discord .Interaction ):
         current_member_ids ,
         )
 
-        document =await mongo_safe_call (
+        document =await mongo_call (
         get_guild_insights_sync ,
         interaction .guild .id ,
         )
@@ -1813,136 +1835,105 @@ script_channel :str |None =None ,
 
 
 class ScriptUploadView(discord.ui.LayoutView):
-    def __init__(self ,script_id ,title ,script ):
-        super().__init__ (timeout =None )
-        self.script_id =str (script_id )
-        self.title_text =title
-        self.script =script
-        self.copy_button =discord.ui.Button (
-        label ="Copy Script",
-        style =discord.ButtonStyle.primary,
-        emoji ="📋",
-        custom_id =f"script_upload_copy:{self.script_id}",
+    def __init__(self,title,script,script_id):
+        super().__init__(timeout=None)
+        self.title_text=title
+        self.script=script
+        self.script_id=str(script_id)
+        self.copy_button=discord.ui.Button(
+            label="Copy Script",
+            style=discord.ButtonStyle.primary,
+            emoji="📋",
+            custom_id=f"upload_script_copy:{self.script_id}",
         )
-        self.copy_button.callback =self.copy_script
-        parts =self._display_parts (script )
-        if len(parts) ==1:
-            self.add_item (
-            make_container (
-            make_text (f"## 📜 {discord.utils.escape_markdown(title)}"),
-            make_text ("-# Lua / Luau • Script Upload"),
-            make_separator (),
-            make_text (self._code_block (parts[0])),
-            make_separator (),
-            make_text ("📋 Click **Copy Script** to receive the complete script in a normal Discord code block."),
-            discord.ui.ActionRow (self.copy_button),
-            accent_color =0x5865F2,
-            )
-            )
-            return
+        self.copy_button.callback=self.copy_script
+        parts=self._parts_for_display(script)
+        children=[
+            make_text(f"## 📜 {discord.utils.escape_markdown(title)}"),
+            make_text("-# Lua / Luau · Script Upload"),
+            make_separator(),
+        ]
+        for index,part in enumerate(parts,1):
+            if len(parts)>1:
+                children.append(make_text(f"### Part {index}/{len(parts)}"))
+            children.append(make_text(f"```lua\n{part}\n```"))
+            if index<len(parts):
+                children.append(make_separator())
+        children.extend([make_separator(),discord.ui.ActionRow(self.copy_button)])
+        self.add_item(make_container(*children,accent_color=0x5865F2))
 
-        self.add_item (
-        make_container (
-        make_text (f"## 📜 {discord.utils.escape_markdown(title)}"),
-        make_text (f"-# Lua / Luau • Script Upload • {len(parts)} parts"),
-        make_separator (),
-        make_text ("The script is split only because of Discord's message limits. **Copy Script** sends every part as a normal Lua code block."),
-        accent_color =0x5865F2,
-        )
-        )
-        for index ,part in enumerate(parts ,1 ):
-            self.add_item (
-            make_container (
-            make_text (f"-# Part {index}/{len(parts)}"),
-            make_text (self._code_block (part)),
-            accent_color =0x5865F2,
-            )
-            )
-        self.add_item (
-        make_container (
-        make_text ("📋 **Copy Script** sends the complete script as normal Discord code blocks."),
-        discord.ui.ActionRow (self.copy_button),
-        accent_color =0x5865F2,
-        )
-        )
-
-    def _code_block (self ,text ):
-        longest =max ((len(run.group (0 )) for run in re.finditer (r"`+",text )),default =0 )
-        fence ="`" *max (3 ,longest +1 )
-        return f"{fence}lua\n{text}\n{fence}"
-
-    def _split_parts (self ,script ,limit ):
-        lines =script.splitlines ()or [""]
+    def _split(self,script,limit):
+        lines=script.splitlines() or [""]
         parts=[]
         current=[]
-        current_length=0
+        length=0
         for line in lines:
-            pieces=[line[index:index+limit] for index in range (0,len(line),limit)]or [""]
+            pieces=[line[index:index+limit] for index in range(0,len(line),limit)] or [""]
             for piece in pieces:
                 added=len(piece)+1
-                if current and current_length + added > limit:
-                    parts.append ("\n".join(current ))
+                if current and length+added>limit:
+                    parts.append("\n".join(current))
                     current=[]
-                    current_length=0
-                current.append (piece )
-                current_length +=added
-                if current_length >=limit:
-                    parts.append ("\n".join(current ))
+                    length=0
+                current.append(piece)
+                length+=added
+                if length>=limit:
+                    parts.append("\n".join(current))
                     current=[]
-                    current_length=0
+                    length=0
         if current or not parts:
-            parts.append ("\n".join(current ))
-        return parts
+            parts.append("\n".join(current))
+        return [part.replace("```","`\u200b``") for part in parts]
 
-    def _display_parts (self ,script ):
-        return self._split_parts (script ,3000 )
+    def _parts_for_display(self,script):
+        return self._split(script,3300)
 
-    def _copy_parts (self ,script ):
-        return self._split_parts (script ,1800 )
+    def _copy_parts(self):
+        return self._split(self.script,1900)
 
-    async def copy_script (self ,interaction ):
-        try :
-            await interaction.response.defer (ephemeral =True ,thinking =True )
-            record =None
-            try :
-                record =await mongo_safe_call (get_script_upload_sync ,self.script_id )
-            except PyMongoError :
-                record =None
-            script =record.get ("script")if isinstance (record,dict )else self.script
-            title =record.get ("title",self.title_text )if isinstance (record,dict )else self.title_text
-            if not isinstance (script ,str )or not script.strip ():
-                await interaction.followup.send ("This script is no longer available.",ephemeral =True )
+    async def copy_script(self,interaction):
+        parts=self._copy_parts()
+        try:
+            if len(parts)==1:
+                await interaction.response.send_message(f"```lua\n{parts[0]}\n```",ephemeral=True)
                 return
-
-            parts=self._copy_parts (script.strip ("\n"))
-            if len(parts) ==1:
-                await interaction.followup.send (self._code_block(parts[0]),ephemeral=True)
-                return
-
-            await interaction.followup.send (
-            f"**{discord.utils.escape_markdown(title)}** · Part 1/{len(parts)}\n{self._code_block(parts[0])}",
-            ephemeral =True,
+            await interaction.response.send_message(
+                f"**{discord.utils.escape_markdown(self.title_text)}** · Part 1/{len(parts)}\n```lua\n{parts[0]}\n```",
+                ephemeral=True,
             )
-            for index ,part in enumerate(parts[1:],2 ):
-                await interaction.followup.send (
-                f"**{discord.utils.escape_markdown(title)}** · Part {index}/{len(parts)}\n{self._code_block(part)}",
-                ephemeral =True,
+            for index,part in enumerate(parts[1:],2):
+                await interaction.followup.send(
+                    f"**{discord.utils.escape_markdown(self.title_text)}** · Part {index}/{len(parts)}\n```lua\n{part}\n```",
+                    ephemeral=True,
                 )
-        except (AutoReconnect ,NetworkTimeout ,ServerSelectionTimeoutError ):
-            try :
-                await interaction.followup.send (self._code_block(self.script),ephemeral=True)
-            except Exception :
-                pass
-        except discord.HTTPException as error :
-            try :
-                await interaction.followup.send (f"Could not send the script: {error}",ephemeral=True)
-            except Exception :
-                pass
-        except Exception as error :
-            try :
-                await interaction.followup.send (f"Could not send the script: {error}",ephemeral=True)
-            except Exception :
-                pass
+        except discord.HTTPException as error:
+            message=f"Could not send the script: {error}"
+            if interaction.response.is_done():
+                await interaction.followup.send(message,ephemeral=True)
+            else:
+                await interaction.response.send_message(message,ephemeral=True)
+
+
+async def restore_script_uploads ():
+    global script_views_restored
+    if script_views_restored:
+        return 0
+    records=await mongo_call(list_script_uploads_sync)
+    restored=0
+    for record in records:
+        try:
+            script_id=str(record["script_id"])
+            title=str(record["title"])
+            script=str(record["script"])
+            if not script_id or not title or not script:
+                continue
+            bot.add_view(ScriptUploadView(title,script,script_id))
+            restored+=1
+        except (KeyError,TypeError,ValueError,discord.ClientException):
+            continue
+    script_views_restored=True
+    return restored
+
 
 @upload_group .command (
 name ="script",
@@ -1959,59 +1950,47 @@ script :str ,
 ):
     clean_title=re.sub(r"^#+\s*", "", title.strip())
     clean_script=script.strip("\n")
-
     if not clean_title:
         await interaction.response.send_message("The title cannot be empty.",ephemeral=True)
         return
-
     if not clean_script:
         await interaction.response.send_message("The script cannot be empty.",ephemeral=True)
         return
-
     if len(clean_title)>256:
         await interaction.response.send_message("The title is too long. Keep it under 256 characters.",ephemeral=True)
         return
-
     if len(clean_script)>6000:
         await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
         return
-
-    await interaction.response.defer ()
-    script_id=base64.urlsafe_b64encode (os.urandom (18 )).decode ("ascii").rstrip ("=")
-    now=iso_now ()
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server.",ephemeral=True)
+        return
+    script_id=hashlib.sha256(
+        f"{interaction.guild.id}:{interaction.channel.id if interaction.channel else 0}:{time.time_ns()}:{clean_title}".encode("utf-8")
+    ).hexdigest()[:24]
     record={
-    "script_id":script_id,
-    "guild_id":interaction.guild.id if interaction.guild else None,
-    "channel_id":interaction.channel.id if interaction.channel else None,
-    "message_id":None,
-    "title":clean_title,
-    "script":clean_script,
-    "created_at":now,
-    "updated_at":now,
+        "script_id":script_id,
+        "guild_id":interaction.guild.id,
+        "channel_id":interaction.channel.id if interaction.channel else 0,
+        "message_id":0,
+        "title":clean_title,
+        "script":clean_script,
+        "created_at":iso_now(),
+        "updated_at":iso_now(),
     }
-
-    try :
-        await mongo_safe_call (save_script_upload_sync ,record )
-        view=ScriptUploadView (script_id ,clean_title ,clean_script )
-        sent_message=await interaction.followup.send (view=view ,wait=True )
-        record["message_id"]=sent_message.id
-        record["updated_at"]=iso_now ()
-        await mongo_safe_call (save_script_upload_sync ,record )
-    except (AutoReconnect ,NetworkTimeout ,ServerSelectionTimeoutError ) as error :
-        try :
-            await interaction.followup.send (f"MongoDB is temporarily unavailable: {error}",ephemeral=True)
-        except Exception :
-            pass
-    except PyMongoError as error :
-        try :
-            await interaction.followup.send (f"MongoDB could not save the script: {error}",ephemeral=True)
-        except Exception :
-            pass
-    except discord.HTTPException as error :
-        try :
-            await interaction.followup.send (f"Could not post the script: {error}",ephemeral=True)
-        except Exception :
-            pass
+    await interaction.response.defer(thinking=True)
+    try:
+        await mongo_call(save_script_upload_sync,record)
+        view=ScriptUploadView(clean_title,clean_script,script_id)
+        sent=await interaction.followup.send(view=view,wait=True)
+        await mongo_call(update_script_upload_message_sync,script_id,sent.id)
+    except PyMongoError as error:
+        await interaction.followup.send(
+            f"MongoDB could not permanently save the script upload.\n`{str(error)[:1200]}`",
+            ephemeral=True,
+        )
+    except discord.HTTPException as error:
+        await interaction.followup.send(f"Could not post the script preview: {error}",ephemeral=True)
 
 
 @custom_group .command (
@@ -2147,6 +2126,81 @@ async def add_reaction_role (interaction :discord .Interaction ):
     )
 
 
+@sticky_group .command (
+name ="trigger",
+description ="Create or update a persistent message trigger",
+)
+@app_commands .describe (
+channel ="Channel where the trigger will watch for messages",
+message ="Text or phrase to match",
+trigger ="Message the bot will automatically send",
+)
+@app_commands .checks .has_permissions (manage_guild =True )
+async def sticky_trigger (
+interaction :discord .Interaction ,
+channel :discord .TextChannel ,
+message :str ,
+trigger :str ,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server.",ephemeral=True)
+        return
+    match_text=re.sub(r"\s+"," ",message.strip())
+    response_text=trigger.strip()
+    if not match_text:
+        await interaction.response.send_message("The message to match cannot be empty.",ephemeral=True)
+        return
+    if not response_text:
+        await interaction.response.send_message("The trigger response cannot be empty.",ephemeral=True)
+        return
+    if len(match_text)>200:
+        await interaction.response.send_message("The message to match must be 200 characters or fewer.",ephemeral=True)
+        return
+    if len(response_text)>2000:
+        await interaction.response.send_message("The trigger response must be 2,000 characters or fewer.",ephemeral=True)
+        return
+    me=interaction.guild.me
+    if me is None:
+        await interaction.response.send_message("I could not verify my server permissions.",ephemeral=True)
+        return
+    permissions=channel.permissions_for(me)
+    if not permissions.view_channel or not permissions.send_messages:
+        await interaction.response.send_message(
+            f"I need View Channel and Send Messages permissions in {channel.mention}.",
+            ephemeral=True,
+        )
+        return
+    record={
+        "guild_id":interaction.guild.id,
+        "channel_id":channel.id,
+        "match_text":match_text,
+        "response_text":response_text,
+        "created_by":interaction.user.id,
+        "updated_at":iso_now(),
+    }
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    try:
+        saved=await mongo_call(save_sticky_trigger_sync,record)
+        items=sticky_trigger_cache.setdefault(channel.id,[])
+        items[:]=[item for item in items if str(item.get("_id"))!=str(saved.get("_id"))]
+        items.append(saved)
+        items.sort(key=lambda item:len(str(item.get("match_normalized",item.get("match_text","")))),reverse=True)
+        await interaction.followup.send(
+            f"✅ Sticky trigger saved permanently in {channel.mention}.\n\n**Match:** `{discord.utils.escape_markdown(match_text)}`\n**Response:**\n{response_text}",
+            ephemeral=True,
+        )
+    except PyMongoError as error:
+        await interaction.followup.send(
+            f"MongoDB could not save the sticky trigger.\n`{str(error)[:1200]}`",
+            ephemeral=True,
+        )
+    except Exception as error:
+        await interaction.followup.send(
+            f"Could not create the sticky trigger.\n`{str(error)[:1200]}`",
+            ephemeral=True,
+        )
+
+
 @bot .tree .command (
 name ="purge",
 description ="Delete recent messages from the current channel",
@@ -2236,7 +2290,7 @@ async def on_member_join (member :discord .Member ):
         member .guild .id ,
         "join",
         )
-        await mongo_safe_call (add_member_to_snapshot_sync ,member .guild .id ,member .id )
+        await mongo_call (add_member_to_snapshot_sync ,member .guild .id ,member .id )
     except PyMongoError as error :
         print (f"MongoDB join tracking error for guild {member .guild .id }: {error }")
 
@@ -2249,7 +2303,7 @@ async def on_member_remove (member :discord .Member ):
         member .guild .id ,
         "leave",
         )
-        await mongo_safe_call (remove_member_from_snapshot_sync ,member .guild .id ,member .id )
+        await mongo_call (remove_member_from_snapshot_sync ,member .guild .id ,member .id )
     except PyMongoError as error :
         print (f"MongoDB leave tracking error for guild {member .guild .id }: {error }")
 
@@ -2297,11 +2351,60 @@ async def on_message (message :discord .Message ):
             except PyMongoError as error :
                 print (f"MongoDB anti-scam update error for channel {message .channel .id }: {error }")
 
+    if message.guild is not None and message.content and message.channel.id not in created_channels:
+        content_normalized=re.sub(r"\s+"," ",message.content.casefold()).strip()
+        for item in sticky_trigger_cache.get(message.channel.id,[]):
+            candidate=str(item.get("match_normalized",item.get("match_text",""))).strip().casefold()
+            if not candidate:
+                continue
+            if re.search(r"(?<!\w)"+re.escape(candidate)+r"(?!\w)",content_normalized,re.IGNORECASE):
+                try:
+                    await message.channel.send(
+                        str(item.get("response_text","")),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (discord.Forbidden,discord.HTTPException):
+                    pass
+                break
+
     await bot .process_commands (message )
 
 
+def ensure_persistence_indexes_sync ():
+    sticky_triggers_collection.create_index(
+        [("guild_id",1),("channel_id",1)],
+        name="guild_channel_idx",
+    )
+    script_uploads_collection.create_index(
+        [("guild_id",1),("channel_id",1)],
+        name="guild_channel_idx",
+    )
+
+
+async def restore_sticky_triggers ():
+    records=await mongo_call(list_sticky_triggers_sync)
+    sticky_trigger_cache.clear()
+    for record in records:
+        try:
+            channel_id=int(record["channel_id"])
+            match_text=str(record["match_text"]).strip()
+            response_text=str(record["response_text"])
+            if not match_text or not response_text:
+                continue
+        except (KeyError,TypeError,ValueError):
+            continue
+        item=dict(record)
+        item["channel_id"]=channel_id
+        item["match_normalized"]=re.sub(r"\s+"," ",match_text).casefold()
+        sticky_trigger_cache.setdefault(channel_id,[]).append(item)
+    for channel_id,items in sticky_trigger_cache.items():
+        items.sort(key=lambda item:len(str(item.get("match_normalized",item.get("match_text","")))),reverse=True)
+    return sum(len(items) for items in sticky_trigger_cache.values())
+
+
 async def restore_anti_scam_channels ():
-    records =await mongo_safe_call (list_anti_scam_sync )
+    records =await mongo_call (list_anti_scam_sync )
+
     for record in records :
         try :
             channel_id =int (record ["channel_id"])
@@ -2310,6 +2413,7 @@ async def restore_anti_scam_channels ():
             kicks =int (record .get ("kicks",0 ))
             violations =int (record .get ("violations",kicks ))
         except (KeyError ,TypeError ,ValueError ):
+            print (f"Skipping invalid persisted anti-scam record: {record.get('_id')}")
             continue
 
         guild =bot .get_guild (guild_id )
@@ -2355,50 +2459,6 @@ async def restore_anti_scam_channels ():
 
 
 
-async def restore_script_uploads ():
-    records=await mongo_safe_call (list_script_uploads_sync )
-    restored=0
-
-    for record in records :
-        try :
-            script_id=str (record ["script_id"])
-            guild_id=int (record ["guild_id"])
-            channel_id=int (record ["channel_id"])
-            message_id=int (record ["message_id"])
-            title=str (record ["title"])
-            script=str (record ["script"])
-        except (KeyError ,TypeError ,ValueError ):
-            continue
-
-        guild=bot.get_guild (guild_id )
-        if guild is None :
-            continue
-
-        channel=guild.get_channel (channel_id )
-        if not isinstance (channel ,(discord.TextChannel ,discord.Thread)):
-            continue
-
-        try :
-            message=await channel.fetch_message (message_id )
-        except (discord.NotFound ,discord.Forbidden ,discord.HTTPException ):
-            continue
-
-        view=ScriptUploadView (script_id ,title ,script )
-        try :
-            bot.add_view (view ,message_id=message.id )
-        except (ValueError ,RuntimeError ):
-            pass
-
-        try :
-            await message.edit (view=view )
-        except (discord.Forbidden ,discord.NotFound ,discord.HTTPException ):
-            pass
-        else :
-            restored +=1
-
-    return restored
-
-
 @bot .event
 async def on_ready ():
     global ready_once
@@ -2411,15 +2471,10 @@ async def on_ready ():
         mongo_client .admin .command ,
         "ping",
         )
-        try :
-            await mongo_safe_call (ensure_mongo_indexes_sync )
-        except PyMongoError as error :
-            print (f"MongoDB index setup warning: {error }")
+        await mongo_call (ensure_persistence_indexes_sync)
 
         for guild in bot .guilds :
             try :
-                if not guild.chunked :
-                    await guild.chunk (cache =True )
                 member_ids =[member .id for member in guild .members ]
                 joined ,left ,initialized =await mongo_call (
                 reconcile_member_snapshot_sync ,
@@ -2430,15 +2485,16 @@ async def on_ready ():
                     print (
                     f"Reconciled {guild .name }: {len (joined )} missed joins, {len (left )} missed departures"
                     )
-                await mongo_safe_call (get_guild_insights_sync ,guild .id )
+                await mongo_call (get_guild_insights_sync ,guild .id )
             except PyMongoError as error :
                 print (f"MongoDB member reconciliation error for guild {guild .id }: {error }")
 
         synced =await bot .tree .sync ()
 
+        sticky_restored=await restore_sticky_triggers ()
+        script_restored=await restore_script_uploads ()
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
-        restored_scripts=await restore_script_uploads ()
 
         ready_once =True
 
@@ -2458,7 +2514,10 @@ async def on_ready ():
         f"Restored {len (reaction_role_cache )} reaction-role message(s)"
         )
         print (
-        f"Restored {restored_scripts} script upload(s)"
+        f"Restored {sticky_restored} sticky trigger(s)"
+        )
+        print (
+        f"Restored {script_restored} persistent script upload button(s)"
         )
 
     except PyMongoError as error :
@@ -2532,6 +2591,29 @@ error :app_commands .AppCommandError ,
         )
 
 
+@sticky_trigger.error
+async def sticky_trigger_error (
+interaction :discord .Interaction ,
+error :app_commands .AppCommandError ,
+):
+    message=(
+    "You need the Manage Server permission to use this command."
+    if isinstance (error ,app_commands .MissingPermissions )
+    else f"Command error: {error }"
+    )
+
+    if interaction .response .is_done ():
+        await interaction .followup .send (
+        message ,
+        ephemeral =True ,
+        )
+    else :
+        await interaction .response .send_message (
+        message ,
+        ephemeral =True ,
+        )
+
+
 @purge .error
 async def purge_error (
 interaction :discord .Interaction ,
@@ -2561,6 +2643,7 @@ bot .tree .add_command (add_group )
 bot .tree .add_command (update_group )
 bot .tree .add_command (upload_group )
 bot .tree .add_command (custom_group )
+bot .tree .add_command (sticky_group )
 
 
 async def start_bot ():
