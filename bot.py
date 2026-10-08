@@ -1771,9 +1771,110 @@ script_channel :str |None =None ,
         )
 
 
+class ScriptUploadView(discord.ui.LayoutView):
+    def __init__(self,title,script):
+        super().__init__(timeout=1800)
+        self.title_text=title
+        self.script=script
+        self.copy_button=discord.ui.Button(
+            label="Copy Script",
+            style=discord.ButtonStyle.primary,
+            emoji="📋",
+        )
+        self.copy_button.callback=self.copy_script
+        parts=self._preview_parts(script)
+        children=[
+            make_text(f"## 📜 {discord.utils.escape_markdown(title)}"),
+            make_text("-# Lua / Luau · Script Upload"),
+            make_separator(),
+        ]
+        if len(parts)==1:
+            children.append(make_text(f"```lua\n{parts[0]}\n```"))
+        else:
+            for index,part in enumerate(parts,1):
+                children.append(make_text(f"```lua\n{part}\n```"))
+                if index<len(parts):
+                    children.append(make_separator())
+        children.extend([
+            make_separator(),
+            discord.ui.ActionRow(self.copy_button),
+        ])
+        self.add_item(make_container(*children,accent_color=0x5865F2))
+
+    def _preview_parts(self,script):
+        limit=3300
+        lines=script.splitlines() or [""]
+        parts=[]
+        current=[]
+        current_length=0
+        for line in lines:
+            pieces=[line[index:index+limit] for index in range(0,len(line),limit)] or [""]
+            for piece in pieces:
+                added=len(piece)+1
+                if current and current_length+added>limit:
+                    parts.append("\n".join(current))
+                    current=[]
+                    current_length=0
+                current.append(piece)
+                current_length+=added
+                if current_length>=limit:
+                    parts.append("\n".join(current))
+                    current=[]
+                    current_length=0
+        if current or not parts:
+            parts.append("\n".join(current))
+        return [part.replace("```","`\u200b``") for part in parts]
+
+    def _copy_parts(self):
+        limit=1900
+        lines=self.script.splitlines() or [""]
+        parts=[]
+        current=[]
+        current_length=0
+        for line in lines:
+            pieces=[line[index:index+limit] for index in range(0,len(line),limit)] or [""]
+            for piece in pieces:
+                added=len(piece)+1
+                if current and current_length+added>limit:
+                    parts.append("\n".join(current))
+                    current=[]
+                    current_length=0
+                current.append(piece)
+                current_length+=added
+                if current_length>=limit:
+                    parts.append("\n".join(current))
+                    current=[]
+                    current_length=0
+        if current or not parts:
+            parts.append("\n".join(current))
+        return [part.replace("```","`\u200b``") for part in parts]
+
+    async def copy_script(self,interaction):
+        parts=self._copy_parts()
+        try:
+            if len(parts)==1:
+                await interaction.response.send_message(f"```lua\n{parts[0]}\n```",ephemeral=True)
+                return
+            await interaction.response.send_message(
+                f"**{discord.utils.escape_markdown(self.title_text)}** · Part 1/{len(parts)}\n```lua\n{parts[0]}\n```",
+                ephemeral=True,
+            )
+            for index,part in enumerate(parts[1:],2):
+                await interaction.followup.send(
+                    f"**{discord.utils.escape_markdown(self.title_text)}** · Part {index}/{len(parts)}\n```lua\n{part}\n```",
+                    ephemeral=True,
+                )
+        except discord.HTTPException as error:
+            message=f"Could not send the script: {error}"
+            if interaction.response.is_done():
+                await interaction.followup.send(message,ephemeral=True)
+            else:
+                await interaction.response.send_message(message,ephemeral=True)
+
+
 @upload_group .command (
 name ="script",
-description ="Post a Lua/Luau script as a normal code block",
+description ="Post a clean Components V2 Lua/Luau script preview",
 )
 @app_commands .describe (
 title ="Required title for the script post",
@@ -1803,47 +1904,10 @@ script :str ,
         await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
         return
 
-    def split_code_parts(value,max_length=1600):
-        lines=value.splitlines() or [""]
-        parts=[]
-        current=[]
-        current_length=0
-        for line in lines:
-            added=len(line)+1
-            if current and current_length+added>max_length:
-                parts.append("\n".join(current))
-                current=[]
-                current_length=0
-            if len(line)>max_length:
-                if current:
-                    parts.append("\n".join(current))
-                    current=[]
-                    current_length=0
-                for index in range(0,len(line),max_length):
-                    parts.append(line[index:index+max_length])
-                continue
-            current.append(line)
-            current_length+=added
-        if current or not parts:
-            parts.append("\n".join(current))
-        return parts
-
-    parts=split_code_parts(clean_script)
-    total=len(parts)
-
     try:
-        for index,part in enumerate(parts,1):
-            heading=f"## {discord.utils.escape_markdown(clean_title)}"
-            if total>1:
-                heading+=f" · Part {index}/{total}"
-            safe_part=part.replace("```","`\u200b``")
-            content=f"{heading}\n```lua\n{safe_part}\n```"
-            if index==1:
-                await interaction.response.send_message(content=content)
-            else:
-                await interaction.followup.send(content)
+        await interaction.response.send_message(view=ScriptUploadView(clean_title,clean_script))
     except discord.HTTPException as error:
-        message=f"Could not post the script: {error}"
+        message=f"Could not post the script preview: {error}"
         if interaction.response.is_done():
             await interaction.followup.send(message,ephemeral=True)
         else:
