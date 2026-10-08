@@ -14,8 +14,8 @@ from pathlib import Path
 import discord
 from discord import app_commands
 from discord .ext import commands
-from pymongo import MongoClient ,ReturnDocument
-from pymongo .errors import PyMongoError
+from pymongo import MongoClient ,ReturnDocument ,WriteConcern
+from pymongo .errors import AutoReconnect ,NetworkTimeout ,PyMongoError ,ServerSelectionTimeoutError
 
 TOKEN =os .getenv ("DISCORD_TOKEN")
 MONGODB_URI =os .getenv ("MONGODB_URI")
@@ -34,13 +34,17 @@ MONGODB_URI ,
 serverSelectionTimeoutMS =10000 ,
 connectTimeoutMS =10000 ,
 socketTimeoutMS =10000 ,
+retryReads =True ,
+retryWrites =True ,
 )
 
 mongo_db =mongo_client [MONGODB_DATABASE ]
-insights_collection =mongo_db ["server_insights"]
-anti_scam_collection =mongo_db ["anti_scam_channels"]
-reaction_roles_collection =mongo_db ["reaction_roles"]
-member_snapshots_collection =mongo_db ["member_snapshots"]
+MONGO_WRITE_CONCERN =WriteConcern (w ="majority",j =True )
+insights_collection =mongo_db ["server_insights"].with_options (write_concern =MONGO_WRITE_CONCERN )
+anti_scam_collection =mongo_db ["anti_scam_channels"].with_options (write_concern =MONGO_WRITE_CONCERN )
+reaction_roles_collection =mongo_db ["reaction_roles"].with_options (write_concern =MONGO_WRITE_CONCERN )
+member_snapshots_collection =mongo_db ["member_snapshots"].with_options (write_concern =MONGO_WRITE_CONCERN )
+script_uploads_collection =mongo_db ["script_uploads"].with_options (write_concern =MONGO_WRITE_CONCERN )
 
 intents =discord .Intents .default ()
 intents .guilds =True
@@ -309,9 +313,47 @@ def list_reaction_roles_sync ():
     return list (reaction_roles_collection .find ({}))
 
 
+def save_script_upload_sync (record ):
+    script_id =str (record ["script_id"])
+    data =dict (record )
+    data ["_id"] =script_id
+    script_uploads_collection .replace_one ({"_id":script_id },data ,upsert =True )
+
+
+def get_script_upload_sync (script_id ):
+    return script_uploads_collection .find_one ({"_id":str (script_id )})
+
+
+def list_script_uploads_sync ():
+    return list (script_uploads_collection .find ({"message_id":{"$exists":True,"$ne":None }}))
+
+
+def ensure_mongo_indexes_sync ():
+    script_uploads_collection .create_index ("message_id")
+    script_uploads_collection .create_index ("guild_id")
+    script_uploads_collection .create_index ("channel_id")
+    reaction_roles_collection .create_index ("guild_id")
+    reaction_roles_collection .create_index ("channel_id")
+    anti_scam_collection .create_index ("guild_id")
+    anti_scam_collection .create_index ("channel_id")
+    member_snapshots_collection .create_index ("updated_at")
+
+
 
 async def mongo_call (function ,*args ):
     return await asyncio .to_thread (function ,*args )
+
+
+async def mongo_safe_call (function ,*args ,retries =3 ):
+    delay =0.75
+    for attempt in range (retries ):
+        try :
+            return await asyncio .to_thread (function ,*args )
+        except (AutoReconnect ,NetworkTimeout ,ServerSelectionTimeoutError ):
+            if attempt >=retries -1 :
+                raise
+            await asyncio .sleep (delay )
+            delay =min (delay *2 ,3 )
 
 
 def make_container (*items ,accent_color =None ):
@@ -1043,7 +1085,7 @@ class ReactionRoleSetupView (discord .ui .LayoutView ):
             "updated_at":iso_now (),
             }
 
-            await mongo_call (save_reaction_role_sync,record )
+            await mongo_safe_call (save_reaction_role_sync,record )
             reaction_role_cache [message .id ]=record
 
             failed=[]
@@ -1112,9 +1154,7 @@ async def find_message_in_guild (guild ,message_id ):
 
 
 async def restore_reaction_roles ():
-    records =await mongo_call (list_reaction_roles_sync )
-    stale =[]
-
+    records =await mongo_safe_call (list_reaction_roles_sync )
     for record in records :
         try :
             guild_id =int (record ["guild_id"])
@@ -1122,7 +1162,6 @@ async def restore_reaction_roles ():
             message_id =int (record ["message_id"])
             pairs =record ["pairs"]
         except (KeyError ,TypeError ,ValueError ):
-            stale .append (record .get ("_id"))
             continue
 
         guild =bot .get_guild (guild_id )
@@ -1131,13 +1170,11 @@ async def restore_reaction_roles ():
 
         channel =guild .get_channel (channel_id )
         if not isinstance (channel ,discord .TextChannel ):
-            stale .append (message_id )
             continue
 
         try :
             message =await channel .fetch_message (message_id )
         except discord .NotFound :
-            stale .append (message_id )
             continue
         except discord .Forbidden :
             continue
@@ -1170,7 +1207,6 @@ async def restore_reaction_roles ():
                 pass
 
         if not valid_pairs :
-            stale .append (message_id )
             continue
 
         record ["pairs"]=valid_pairs
@@ -1183,9 +1219,6 @@ async def restore_reaction_roles ():
         except (discord .Forbidden ,discord .NotFound ,discord .HTTPException ):
             pass
 
-    for message_id in stale :
-        if message_id is not None :
-            await mongo_call (delete_reaction_role_sync ,message_id )
 
 
 @bot .event
@@ -1195,7 +1228,11 @@ async def on_raw_reaction_add (payload ):
 
     record =reaction_role_cache .get (payload .message_id )
     if record is None :
-        record =await mongo_call (get_reaction_role_sync ,payload .message_id )
+        try :
+            record =await mongo_safe_call (get_reaction_role_sync ,payload .message_id )
+        except PyMongoError as error :
+            print (f"MongoDB reaction-role lookup error: {error }")
+            return
         if record :
             reaction_role_cache [payload .message_id ]=record
 
@@ -1242,7 +1279,11 @@ async def on_raw_reaction_remove (payload ):
 
     record =reaction_role_cache .get (payload .message_id )
     if record is None :
-        record =await mongo_call (get_reaction_role_sync ,payload .message_id )
+        try :
+            record =await mongo_safe_call (get_reaction_role_sync ,payload .message_id )
+        except PyMongoError as error :
+            print (f"MongoDB reaction-role lookup error: {error }")
+            return
         if record :
             reaction_role_cache [payload .message_id ]=record
 
@@ -1422,7 +1463,7 @@ async def anti_scam (interaction :discord .Interaction ,name :str ):
         "violations":0 ,
         }
 
-        await mongo_call (save_anti_scam_sync ,record )
+        await mongo_safe_call (save_anti_scam_sync ,record )
 
         created_channels [channel .id ]={
         "view":view ,
@@ -1488,7 +1529,7 @@ async def server_insights (interaction :discord .Interaction ):
         current_member_ids ,
         )
 
-        document =await mongo_call (
+        document =await mongo_safe_call (
         get_guild_insights_sync ,
         interaction .guild .id ,
         )
@@ -1772,105 +1813,136 @@ script_channel :str |None =None ,
 
 
 class ScriptUploadView(discord.ui.LayoutView):
-    def __init__(self,title,script):
-        super().__init__(timeout=1800)
-        self.title_text=title
-        self.script=script
-        self.copy_button=discord.ui.Button(
-            label="Copy Script",
-            style=discord.ButtonStyle.primary,
-            emoji="📋",
+    def __init__(self ,script_id ,title ,script ):
+        super().__init__ (timeout =None )
+        self.script_id =str (script_id )
+        self.title_text =title
+        self.script =script
+        self.copy_button =discord.ui.Button (
+        label ="Copy Script",
+        style =discord.ButtonStyle.primary,
+        emoji ="📋",
+        custom_id =f"script_upload_copy:{self.script_id}",
         )
-        self.copy_button.callback=self.copy_script
-        parts=self._preview_parts(script)
-        children=[
-            make_text(f"## 📜 {discord.utils.escape_markdown(title)}"),
-            make_text("-# Lua / Luau · Script Upload"),
-            make_separator(),
-        ]
-        if len(parts)==1:
-            children.append(make_text(f"```lua\n{parts[0]}\n```"))
-        else:
-            for index,part in enumerate(parts,1):
-                children.append(make_text(f"```lua\n{part}\n```"))
-                if index<len(parts):
-                    children.append(make_separator())
-        children.extend([
-            make_separator(),
-            discord.ui.ActionRow(self.copy_button),
-        ])
-        self.add_item(make_container(*children,accent_color=0x5865F2))
-
-    def _preview_parts(self,script):
-        limit=3300
-        lines=script.splitlines() or [""]
-        parts=[]
-        current=[]
-        current_length=0
-        for line in lines:
-            pieces=[line[index:index+limit] for index in range(0,len(line),limit)] or [""]
-            for piece in pieces:
-                added=len(piece)+1
-                if current and current_length+added>limit:
-                    parts.append("\n".join(current))
-                    current=[]
-                    current_length=0
-                current.append(piece)
-                current_length+=added
-                if current_length>=limit:
-                    parts.append("\n".join(current))
-                    current=[]
-                    current_length=0
-        if current or not parts:
-            parts.append("\n".join(current))
-        return [part.replace("```","`\u200b``") for part in parts]
-
-    def _copy_parts(self):
-        limit=1900
-        lines=self.script.splitlines() or [""]
-        parts=[]
-        current=[]
-        current_length=0
-        for line in lines:
-            pieces=[line[index:index+limit] for index in range(0,len(line),limit)] or [""]
-            for piece in pieces:
-                added=len(piece)+1
-                if current and current_length+added>limit:
-                    parts.append("\n".join(current))
-                    current=[]
-                    current_length=0
-                current.append(piece)
-                current_length+=added
-                if current_length>=limit:
-                    parts.append("\n".join(current))
-                    current=[]
-                    current_length=0
-        if current or not parts:
-            parts.append("\n".join(current))
-        return [part.replace("```","`\u200b``") for part in parts]
-
-    async def copy_script(self,interaction):
-        parts=self._copy_parts()
-        try:
-            if len(parts)==1:
-                await interaction.response.send_message(f"```lua\n{parts[0]}\n```",ephemeral=True)
-                return
-            await interaction.response.send_message(
-                f"**{discord.utils.escape_markdown(self.title_text)}** · Part 1/{len(parts)}\n```lua\n{parts[0]}\n```",
-                ephemeral=True,
+        self.copy_button.callback =self.copy_script
+        parts =self._display_parts (script )
+        if len(parts) ==1:
+            self.add_item (
+            make_container (
+            make_text (f"## 📜 {discord.utils.escape_markdown(title)}"),
+            make_text ("-# Lua / Luau • Script Upload"),
+            make_separator (),
+            make_text (self._code_block (parts[0])),
+            make_separator (),
+            make_text ("📋 Click **Copy Script** to receive the complete script in a normal Discord code block."),
+            discord.ui.ActionRow (self.copy_button),
+            accent_color =0x5865F2,
             )
-            for index,part in enumerate(parts[1:],2):
-                await interaction.followup.send(
-                    f"**{discord.utils.escape_markdown(self.title_text)}** · Part {index}/{len(parts)}\n```lua\n{part}\n```",
-                    ephemeral=True,
-                )
-        except discord.HTTPException as error:
-            message=f"Could not send the script: {error}"
-            if interaction.response.is_done():
-                await interaction.followup.send(message,ephemeral=True)
-            else:
-                await interaction.response.send_message(message,ephemeral=True)
+            )
+            return
 
+        self.add_item (
+        make_container (
+        make_text (f"## 📜 {discord.utils.escape_markdown(title)}"),
+        make_text (f"-# Lua / Luau • Script Upload • {len(parts)} parts"),
+        make_separator (),
+        make_text ("The script is split only because of Discord's message limits. **Copy Script** sends every part as a normal Lua code block."),
+        accent_color =0x5865F2,
+        )
+        )
+        for index ,part in enumerate(parts ,1 ):
+            self.add_item (
+            make_container (
+            make_text (f"-# Part {index}/{len(parts)}"),
+            make_text (self._code_block (part)),
+            accent_color =0x5865F2,
+            )
+            )
+        self.add_item (
+        make_container (
+        make_text ("📋 **Copy Script** sends the complete script as normal Discord code blocks."),
+        discord.ui.ActionRow (self.copy_button),
+        accent_color =0x5865F2,
+        )
+        )
+
+    def _code_block (self ,text ):
+        longest =max ((len(run.group (0 )) for run in re.finditer (r"`+",text )),default =0 )
+        fence ="`" *max (3 ,longest +1 )
+        return f"{fence}lua\n{text}\n{fence}"
+
+    def _split_parts (self ,script ,limit ):
+        lines =script.splitlines ()or [""]
+        parts=[]
+        current=[]
+        current_length=0
+        for line in lines:
+            pieces=[line[index:index+limit] for index in range (0,len(line),limit)]or [""]
+            for piece in pieces:
+                added=len(piece)+1
+                if current and current_length + added > limit:
+                    parts.append ("\n".join(current ))
+                    current=[]
+                    current_length=0
+                current.append (piece )
+                current_length +=added
+                if current_length >=limit:
+                    parts.append ("\n".join(current ))
+                    current=[]
+                    current_length=0
+        if current or not parts:
+            parts.append ("\n".join(current ))
+        return parts
+
+    def _display_parts (self ,script ):
+        return self._split_parts (script ,3000 )
+
+    def _copy_parts (self ,script ):
+        return self._split_parts (script ,1800 )
+
+    async def copy_script (self ,interaction ):
+        try :
+            await interaction.response.defer (ephemeral =True ,thinking =True )
+            record =None
+            try :
+                record =await mongo_safe_call (get_script_upload_sync ,self.script_id )
+            except PyMongoError :
+                record =None
+            script =record.get ("script")if isinstance (record,dict )else self.script
+            title =record.get ("title",self.title_text )if isinstance (record,dict )else self.title_text
+            if not isinstance (script ,str )or not script.strip ():
+                await interaction.followup.send ("This script is no longer available.",ephemeral =True )
+                return
+
+            parts=self._copy_parts (script.strip ("\n"))
+            if len(parts) ==1:
+                await interaction.followup.send (self._code_block(parts[0]),ephemeral=True)
+                return
+
+            await interaction.followup.send (
+            f"**{discord.utils.escape_markdown(title)}** · Part 1/{len(parts)}\n{self._code_block(parts[0])}",
+            ephemeral =True,
+            )
+            for index ,part in enumerate(parts[1:],2 ):
+                await interaction.followup.send (
+                f"**{discord.utils.escape_markdown(title)}** · Part {index}/{len(parts)}\n{self._code_block(part)}",
+                ephemeral =True,
+                )
+        except (AutoReconnect ,NetworkTimeout ,ServerSelectionTimeoutError ):
+            try :
+                await interaction.followup.send (self._code_block(self.script),ephemeral=True)
+            except Exception :
+                pass
+        except discord.HTTPException as error :
+            try :
+                await interaction.followup.send (f"Could not send the script: {error}",ephemeral=True)
+            except Exception :
+                pass
+        except Exception as error :
+            try :
+                await interaction.followup.send (f"Could not send the script: {error}",ephemeral=True)
+            except Exception :
+                pass
 
 @upload_group .command (
 name ="script",
@@ -1904,14 +1976,42 @@ script :str ,
         await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
         return
 
-    try:
-        await interaction.response.send_message(view=ScriptUploadView(clean_title,clean_script))
-    except discord.HTTPException as error:
-        message=f"Could not post the script preview: {error}"
-        if interaction.response.is_done():
-            await interaction.followup.send(message,ephemeral=True)
-        else:
-            await interaction.response.send_message(message,ephemeral=True)
+    await interaction.response.defer ()
+    script_id=base64.urlsafe_b64encode (os.urandom (18 )).decode ("ascii").rstrip ("=")
+    now=iso_now ()
+    record={
+    "script_id":script_id,
+    "guild_id":interaction.guild.id if interaction.guild else None,
+    "channel_id":interaction.channel.id if interaction.channel else None,
+    "message_id":None,
+    "title":clean_title,
+    "script":clean_script,
+    "created_at":now,
+    "updated_at":now,
+    }
+
+    try :
+        await mongo_safe_call (save_script_upload_sync ,record )
+        view=ScriptUploadView (script_id ,clean_title ,clean_script )
+        sent_message=await interaction.followup.send (view=view ,wait=True )
+        record["message_id"]=sent_message.id
+        record["updated_at"]=iso_now ()
+        await mongo_safe_call (save_script_upload_sync ,record )
+    except (AutoReconnect ,NetworkTimeout ,ServerSelectionTimeoutError ) as error :
+        try :
+            await interaction.followup.send (f"MongoDB is temporarily unavailable: {error}",ephemeral=True)
+        except Exception :
+            pass
+    except PyMongoError as error :
+        try :
+            await interaction.followup.send (f"MongoDB could not save the script: {error}",ephemeral=True)
+        except Exception :
+            pass
+    except discord.HTTPException as error :
+        try :
+            await interaction.followup.send (f"Could not post the script: {error}",ephemeral=True)
+        except Exception :
+            pass
 
 
 @custom_group .command (
@@ -2136,7 +2236,7 @@ async def on_member_join (member :discord .Member ):
         member .guild .id ,
         "join",
         )
-        await mongo_call (add_member_to_snapshot_sync ,member .guild .id ,member .id )
+        await mongo_safe_call (add_member_to_snapshot_sync ,member .guild .id ,member .id )
     except PyMongoError as error :
         print (f"MongoDB join tracking error for guild {member .guild .id }: {error }")
 
@@ -2149,7 +2249,7 @@ async def on_member_remove (member :discord .Member ):
         member .guild .id ,
         "leave",
         )
-        await mongo_call (remove_member_from_snapshot_sync ,member .guild .id ,member .id )
+        await mongo_safe_call (remove_member_from_snapshot_sync ,member .guild .id ,member .id )
     except PyMongoError as error :
         print (f"MongoDB leave tracking error for guild {member .guild .id }: {error }")
 
@@ -2201,9 +2301,7 @@ async def on_message (message :discord .Message ):
 
 
 async def restore_anti_scam_channels ():
-    records =await mongo_call (list_anti_scam_sync )
-    stale =[]
-
+    records =await mongo_safe_call (list_anti_scam_sync )
     for record in records :
         try :
             channel_id =int (record ["channel_id"])
@@ -2212,7 +2310,6 @@ async def restore_anti_scam_channels ():
             kicks =int (record .get ("kicks",0 ))
             violations =int (record .get ("violations",kicks ))
         except (KeyError ,TypeError ,ValueError ):
-            stale .append (record .get ("_id"))
             continue
 
         guild =bot .get_guild (guild_id )
@@ -2223,7 +2320,6 @@ async def restore_anti_scam_channels ():
         channel =guild .get_channel (channel_id )
 
         if not isinstance (channel ,discord .TextChannel ):
-            stale .append (channel_id )
             continue
 
         view =AntiScamView (kicks ,violations )
@@ -2231,7 +2327,6 @@ async def restore_anti_scam_channels ():
         try :
             message =await channel .fetch_message (message_id )
         except discord .NotFound :
-            stale .append (channel_id )
             continue
         except discord .Forbidden :
             created_channels [channel_id ]={
@@ -2258,12 +2353,50 @@ async def restore_anti_scam_channels ():
         "guild_id":guild_id ,
         }
 
-    for channel_id in stale :
-        if channel_id is not None :
-            await mongo_call (
-            delete_anti_scam_sync ,
-            channel_id ,
-            )
+
+
+async def restore_script_uploads ():
+    records=await mongo_safe_call (list_script_uploads_sync )
+    restored=0
+
+    for record in records :
+        try :
+            script_id=str (record ["script_id"])
+            guild_id=int (record ["guild_id"])
+            channel_id=int (record ["channel_id"])
+            message_id=int (record ["message_id"])
+            title=str (record ["title"])
+            script=str (record ["script"])
+        except (KeyError ,TypeError ,ValueError ):
+            continue
+
+        guild=bot.get_guild (guild_id )
+        if guild is None :
+            continue
+
+        channel=guild.get_channel (channel_id )
+        if not isinstance (channel ,(discord.TextChannel ,discord.Thread)):
+            continue
+
+        try :
+            message=await channel.fetch_message (message_id )
+        except (discord.NotFound ,discord.Forbidden ,discord.HTTPException ):
+            continue
+
+        view=ScriptUploadView (script_id ,title ,script )
+        try :
+            bot.add_view (view ,message_id=message.id )
+        except (ValueError ,RuntimeError ):
+            pass
+
+        try :
+            await message.edit (view=view )
+        except (discord.Forbidden ,discord.NotFound ,discord.HTTPException ):
+            pass
+        else :
+            restored +=1
+
+    return restored
 
 
 @bot .event
@@ -2278,9 +2411,15 @@ async def on_ready ():
         mongo_client .admin .command ,
         "ping",
         )
+        try :
+            await mongo_safe_call (ensure_mongo_indexes_sync )
+        except PyMongoError as error :
+            print (f"MongoDB index setup warning: {error }")
 
         for guild in bot .guilds :
             try :
+                if not guild.chunked :
+                    await guild.chunk (cache =True )
                 member_ids =[member .id for member in guild .members ]
                 joined ,left ,initialized =await mongo_call (
                 reconcile_member_snapshot_sync ,
@@ -2291,7 +2430,7 @@ async def on_ready ():
                     print (
                     f"Reconciled {guild .name }: {len (joined )} missed joins, {len (left )} missed departures"
                     )
-                await mongo_call (get_guild_insights_sync ,guild .id )
+                await mongo_safe_call (get_guild_insights_sync ,guild .id )
             except PyMongoError as error :
                 print (f"MongoDB member reconciliation error for guild {guild .id }: {error }")
 
@@ -2299,6 +2438,7 @@ async def on_ready ():
 
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
+        restored_scripts=await restore_script_uploads ()
 
         ready_once =True
 
@@ -2316,6 +2456,9 @@ async def on_ready ():
         )
         print (
         f"Restored {len (reaction_role_cache )} reaction-role message(s)"
+        )
+        print (
+        f"Restored {restored_scripts} script upload(s)"
         )
 
     except PyMongoError as error :
