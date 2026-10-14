@@ -569,6 +569,7 @@ def create_pastefy_paste_sync (filename ,content ,token ):
 
 
 @bot .command (name ="pastefy")
+@commands.has_permissions(manage_messages=True)
 async def pastefy_command (ctx :commands .Context ):
     attachments =list (ctx .message .attachments )
     if len (attachments )!=1 :
@@ -608,7 +609,24 @@ async def pastefy_command (ctx :commands .Context ):
         )
         await status .edit (content =None ,view =PastefyResultView (filename ,raw_url ))
     except Exception as error :
-        await status .edit (content =f"Pastefy upload failed: {error }")
+        print(f"Pastefy upload error for guild {getattr(ctx.guild, 'id', 'DM')}: {error}")
+        await status .edit (content ="Pastefy upload failed. Please check the bot logs and try again.")
+
+
+@pastefy_command.error
+async def pastefy_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        message = "You need the Manage Messages permission to use `.pastefy`."
+    elif isinstance(error, commands.NoPrivateMessage):
+        message = "This command can only be used inside a server."
+    else:
+        original = getattr(error, "original", error)
+        print(f"Pastefy command error: {original}")
+        message = "The Pastefy command failed. Please try again later."
+    try:
+        await ctx.send(message)
+    except discord.HTTPException:
+        pass
 
 
 
@@ -921,6 +939,34 @@ class RolePickerView (discord .ui .View ):
                 ephemeral =True ,
                 )
                 return
+
+            member = interaction.user
+            me = interaction.guild.me
+            if not isinstance(member, discord.Member) or me is None:
+                await interaction.response.send_message(
+                    "I could not verify your role hierarchy or the bot's highest role.",
+                    ephemeral=True,
+                )
+                return
+            for role in resolved:
+                if role.is_default() or role.managed:
+                    await interaction.response.send_message(
+                        f"The role {role.mention} cannot be assigned by reaction roles.",
+                        ephemeral=True,
+                    )
+                    return
+                if role >= me.top_role:
+                    await interaction.response.send_message(
+                        f"The role {role.mention} must be below my highest role.",
+                        ephemeral=True,
+                    )
+                    return
+                if role >= member.top_role and member.id != interaction.guild.owner_id:
+                    await interaction.response.send_message(
+                        f"The role {role.mention} must be below your highest role.",
+                        ephemeral=True,
+                    )
+                    return
 
             self .parent_view .roles =resolved
             self .parent_view .refresh ()
@@ -1326,6 +1372,10 @@ async def on_raw_reaction_remove (payload ):
         if role .is_default ()or role .managed :
             return
 
+        me = guild.me
+        if me is None or role >= me.top_role:
+            return
+
         try :
             await member .remove_roles (
             role ,
@@ -1418,6 +1468,7 @@ description ="Automatic message triggers",
 name ="scam",
 description ="Create an anti-scam protection channel",
 )
+@app_commands.default_permissions(manage_channels=True)
 @app_commands .describe (name ="The exact name of the channel to create")
 @app_commands .checks .has_permissions (manage_channels =True )
 async def anti_scam (interaction :discord .Interaction ,name :str ):
@@ -1529,6 +1580,7 @@ async def anti_scam (interaction :discord .Interaction ,name :str ):
 name ="insights",
 description ="View member activity from the last 30 days",
 )
+@app_commands.default_permissions(manage_guild=True)
 @app_commands .checks .has_permissions (manage_guild =True )
 async def server_insights (interaction :discord .Interaction ):
     if interaction .guild is None :
@@ -1623,6 +1675,8 @@ async def find_guild_message (guild ,message_id ):
 name ="logs",
 description ="Post an update log",
 )
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 @app_commands .describe (
 title ="Update title",
 version ="Update version, such as 2.6",
@@ -1939,6 +1993,8 @@ async def restore_script_uploads ():
 name ="script",
 description ="Post a clean Components V2 Lua/Luau script preview",
 )
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 @app_commands .describe (
 title ="Required title for the script post",
 script ="Required Lua/Luau script text",
@@ -1997,6 +2053,7 @@ script :str ,
 name ="image",
 description ="Set the bot's avatar for this server only",
 )
+@app_commands.default_permissions(manage_guild=True)
 @app_commands .describe (image ="Required PNG, JPG, JPEG, or GIF image")
 @app_commands .checks .has_permissions (manage_guild =True )
 async def custom_image (
@@ -2094,6 +2151,8 @@ image :discord .Attachment ,
 name ="role",
 description ="Create reaction roles on an existing message",
 )
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.checks.has_permissions(manage_roles=True)
 async def add_reaction_role (interaction :discord .Interaction ):
     if interaction .guild is None :
         await interaction .response .send_message (
@@ -2130,6 +2189,7 @@ async def add_reaction_role (interaction :discord .Interaction ):
 name ="trigger",
 description ="Create or update a persistent message trigger",
 )
+@app_commands.default_permissions(manage_guild=True)
 @app_commands .describe (
 channel ="Channel where the trigger will watch for messages",
 message ="Text or phrase to match",
@@ -2144,6 +2204,9 @@ trigger :str ,
 ):
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used inside a server.",ephemeral=True)
+        return
+    if channel.guild.id != interaction.guild.id:
+        await interaction.response.send_message("Choose a channel from this server.",ephemeral=True)
         return
     match_text=re.sub(r"\s+"," ",message.strip())
     response_text=trigger.strip()
@@ -2205,6 +2268,7 @@ trigger :str ,
 name ="purge",
 description ="Delete recent messages from the current channel",
 )
+@app_commands.default_permissions(manage_messages=True)
 @app_commands .describe (count ="Number of messages to delete (1-1000)")
 @app_commands .checks .has_permissions (manage_messages =True )
 async def purge (
@@ -2635,6 +2699,34 @@ error :app_commands .AppCommandError ,
         message ,
         ephemeral =True ,
         )
+
+
+@bot.tree.error
+async def global_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        names = {
+            "manage_guild": "Manage Server",
+            "manage_channels": "Manage Channels",
+            "manage_roles": "Manage Roles",
+            "manage_messages": "Manage Messages",
+        }
+        required = ", ".join(names.get(permission, permission.replace("_", " ").title()) for permission in error.missing_permissions)
+        message = f"You need the following permission(s) to use this command: {required}."
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        required = ", ".join(permission.replace("_", " ").title() for permission in error.missing_permissions)
+        message = f"The bot is missing required permission(s): {required}."
+    else:
+        original = getattr(error, "original", error)
+        command_name = interaction.command.qualified_name if interaction.command else "unknown"
+        print(f"Slash command error in /{command_name}: {original}")
+        message = "This command encountered an error. Please try again later; the bot error has been logged."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 bot .tree .add_command (create_group )
