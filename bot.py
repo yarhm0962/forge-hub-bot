@@ -1444,11 +1444,6 @@ name ="update",
 description ="Post update logs",
 )
 
-upload_group =app_commands .Group (
-name ="upload",
-description ="Upload and preview scripts",
-)
-
 custom_group =app_commands .Group (
 name ="custom",
 description ="Customize this server's bot profile",
@@ -1989,66 +1984,6 @@ async def restore_script_uploads ():
             continue
     script_views_restored=True
     return restored
-
-
-@upload_group .command (
-name ="script",
-description ="Post a clean Components V2 Lua/Luau script preview",
-)
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
-@app_commands .describe (
-title ="Required title for the script post",
-script ="Required Lua/Luau script text",
-)
-async def upload_script (
-interaction :discord .Interaction ,
-title :str ,
-script :str ,
-):
-    clean_title=re.sub(r"^#+\s*", "", title.strip())
-    clean_script=script.strip("\n")
-    if not clean_title:
-        await interaction.response.send_message("The title cannot be empty.",ephemeral=True)
-        return
-    if not clean_script:
-        await interaction.response.send_message("The script cannot be empty.",ephemeral=True)
-        return
-    if len(clean_title)>256:
-        await interaction.response.send_message("The title is too long. Keep it under 256 characters.",ephemeral=True)
-        return
-    if len(clean_script)>6000:
-        await interaction.response.send_message("The script is too long for a slash-command field. Keep it under 6,000 characters.",ephemeral=True)
-        return
-    if interaction.guild is None:
-        await interaction.response.send_message("This command can only be used inside a server.",ephemeral=True)
-        return
-    script_id=hashlib.sha256(
-        f"{interaction.guild.id}:{interaction.channel.id if interaction.channel else 0}:{time.time_ns()}:{clean_title}".encode("utf-8")
-    ).hexdigest()[:24]
-    record={
-        "script_id":script_id,
-        "guild_id":interaction.guild.id,
-        "channel_id":interaction.channel.id if interaction.channel else 0,
-        "message_id":0,
-        "title":clean_title,
-        "script":clean_script,
-        "created_at":iso_now(),
-        "updated_at":iso_now(),
-    }
-    await interaction.response.defer(thinking=True)
-    try:
-        await mongo_call(save_script_upload_sync,record)
-        view=ScriptUploadView(clean_title,clean_script,script_id)
-        sent=await interaction.followup.send(view=view,wait=True)
-        await mongo_call(update_script_upload_message_sync,script_id,sent.id)
-    except PyMongoError as error:
-        await interaction.followup.send(
-            f"MongoDB could not permanently save the script upload.\n`{str(error)[:1200]}`",
-            ephemeral=True,
-        )
-    except discord.HTTPException as error:
-        await interaction.followup.send(f"Could not post the script preview: {error}",ephemeral=True)
 
 
 @custom_group .command (
@@ -2735,7 +2670,6 @@ bot .tree .add_command (create_group )
 bot .tree .add_command (server_group )
 bot .tree .add_command (add_group )
 bot .tree .add_command (update_group )
-bot .tree .add_command (upload_group )
 bot .tree .add_command (custom_group )
 bot .tree .add_command (sticky_group )
 
