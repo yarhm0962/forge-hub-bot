@@ -380,6 +380,19 @@ async def mongo_call (function ,*args ):
     return await asyncio .to_thread (function ,*args )
 
 
+def anti_scam_channel_overwrites (guild ):
+    return {
+    guild .default_role :discord .PermissionOverwrite (
+    view_channel =True ,
+    send_messages =True ,
+    attach_files =True ,
+    use_application_commands =False ,
+    create_public_threads =False ,
+    create_private_threads =False ,
+    ),
+    }
+
+
 def make_container (*items ,accent_color =None ):
     container =discord .ui .Container (*items )
     if accent_color is not None :
@@ -1515,6 +1528,7 @@ async def anti_scam (interaction :discord .Interaction ,name :str ):
     try :
         channel =await interaction .guild .create_text_channel (
         clean_name ,
+        overwrites =anti_scam_channel_overwrites (interaction .guild ),
         reason =f"Anti-scam channel created by {interaction .user }",
         )
 
@@ -2428,6 +2442,14 @@ async def restore_anti_scam_channels ():
 
         if not isinstance (channel ,discord .TextChannel ):
             continue
+
+        try :
+            await channel .edit (
+            overwrites =anti_scam_channel_overwrites (guild ),
+            reason ="Re-apply anti-scam channel permissions after restart",
+            )
+        except (discord .Forbidden ,discord .HTTPException ) as restore_error :
+            print (f"Could not re-apply anti-scam permissions for channel {channel_id }: {restore_error }")
 
         view =AntiScamView (kicks ,violations )
 
