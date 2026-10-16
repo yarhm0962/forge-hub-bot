@@ -391,9 +391,11 @@ def make_text (content ):
     return discord .ui .TextDisplay (content )
 
 
-def make_separator ():
+def make_separator (spacing =None ):
+    if spacing is None :
+        spacing =discord .SeparatorSpacing .small
     return discord .ui .Separator (
-    spacing =discord .SeparatorSpacing .small ,
+    spacing =spacing ,
     visible =True ,
     )
 
@@ -421,31 +423,37 @@ class AntiScamView (discord .ui .LayoutView ):
         status =discord .ui .Section (
         make_text ("### 🟢 Protection is active"),
         make_text (
-        "This channel is monitored continuously. Messages are removed and "
-        "members who can be moderated are kicked automatically."
+        "This channel is watched around the clock. Scam messages are deleted "
+        "instantly and members who keep posting are kicked automatically."
         ),
         accessory =self .kick_button ,
         )
 
         self .add_item (
         make_container (
+        make_text ("-# 🔒 PROTECTED CHANNEL"),
         make_text ("## 🛡️ Anti-Scam Protection"),
-        make_text ("Automatic enforcement for this protected channel."),
-        make_separator (),
+        make_text (
+        "Catch scammers before they reach your members. "
+        "Everything posted in this channel is handled automatically."
+        ),
+        make_separator (discord .SeparatorSpacing .large),
         status ,
         make_separator (),
         make_text (
-        "### Channel rules\n"
-        "• Do not send messages in this channel.\n"
-        "• Messages are removed automatically.\n"
-        "• Moderation is applied when the bot has permission.\n"
-        "• Administrators are not automatically kicked."
+        "### 📜 How this channel works"
+        "\n1. Do not send messages in this channel."
+        "\n2. Anything you post is removed instantly."
+        "\n3. Repeat offenders are kicked from the server."
+        "\n-# Administrators are never kicked automatically."
         ),
         make_separator (),
+        make_text ("### 📊 Protection stats"),
         discord .ui .ActionRow (self .violation_button ),
         accent_color =0xED4245 ,
         )
         )
+
 
     def update_stats (self ,kicks =None ,violations =None ):
         if kicks is not None :
