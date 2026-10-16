@@ -7,6 +7,8 @@ import io
 import hashlib
 import ipaddress
 import time
+import threading
+from http .server import BaseHTTPRequestHandler ,HTTPServer
 import urllib .error
 import urllib .request
 from datetime import datetime ,timedelta ,timezone
@@ -2737,6 +2739,31 @@ bot .tree .add_command (upload_group )
 bot .tree .add_command (custom_group )
 bot .tree .add_command (sticky_group )
 
+
+
+# --- Render keep-alive web server (added) -----------------------------------
+# Render web services must bind a port or the deploy never goes live. This tiny
+# server listens on Render's PORT so the deployment completes while the Discord
+# bot keeps running alongside it.
+KEEPALIVE_PORT =int (os .getenv ("PORT" ,"10000" ))
+
+def run_keepalive_server () :
+    class KeepAliveHandler (BaseHTTPRequestHandler) :
+        def do_GET (self) :
+            self .send_response (200 )
+            self .send_header ("Content-Type" ,"text/plain" )
+            self .end_headers ()
+            self .wfile .write (b"forge-hub-bot is running" )
+
+        def log_message (self ,format ,*args ) :
+            pass
+
+    server =HTTPServer (("0.0.0.0" ,KEEPALIVE_PORT ) ,KeepAliveHandler )
+    print (f"Keep-alive HTTP server listening on port {KEEPALIVE_PORT }" )
+    server .serve_forever ()
+
+threading .Thread (target =run_keepalive_server ,daemon =True ) .start ()
+# ----------------------------------------------------------------------------
 
 async def start_bot ():
     global ready_once
