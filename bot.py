@@ -423,32 +423,26 @@ class AntiScamView (discord .ui .LayoutView ):
         status =discord .ui .Section (
         make_text ("### 🟢 Protection is active"),
         make_text (
-        "This channel is watched around the clock. Scam messages are deleted "
-        "instantly and members who keep posting are kicked automatically."
+        "Scam messages are removed instantly and repeat offenders are kicked."
         ),
         accessory =self .kick_button ,
         )
 
         self .add_item (
         make_container (
-        make_text ("-# 🔒 PROTECTED CHANNEL"),
         make_text ("## 🛡️ Anti-Scam Protection"),
-        make_text (
-        "Catch scammers before they reach your members. "
-        "Everything posted in this channel is handled automatically."
-        ),
+        make_text ("This channel is protected. Everything posted here is handled automatically."),
         make_separator (discord .SeparatorSpacing .large),
         status ,
         make_separator (),
         make_text (
-        "### 📜 How this channel works"
+        "### Rules"
         "\n1. Do not send messages in this channel."
-        "\n2. Anything you post is removed instantly."
-        "\n3. Repeat offenders are kicked from the server."
+        "\n2. Anything you post is removed automatically."
+        "\n3. Members who keep posting are kicked."
         "\n-# Administrators are never kicked automatically."
         ),
         make_separator (),
-        make_text ("### 📊 Protection stats"),
         discord .ui .ActionRow (self .violation_button ),
         accent_color =0xED4245 ,
         )
