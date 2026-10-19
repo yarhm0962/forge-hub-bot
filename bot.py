@@ -1554,6 +1554,7 @@ async def anti_scam (interaction :discord .Interaction ,name :str ):
         created_channels [channel .id ]={
         "view":view ,
         "message":message ,
+        "message_id":message .id ,
         "guild_id":interaction .guild .id ,
         }
 
@@ -2345,8 +2346,10 @@ async def on_message (message :discord .Message ):
                 try :
                     await member .kick (reason ="Message sent in anti-scam channel")
                     kicked =True
-                except (discord .Forbidden ,discord .NotFound ,discord .HTTPException ):
-                    pass
+                except (discord .Forbidden ,discord .NotFound ,discord .HTTPException ) as kick_error :
+                    print (f"Anti-scam: could not kick {member } in channel {message .channel .id }: {kick_error }")
+            else :
+                print (f"Anti-scam: skipped kick for {member } in channel {message .channel .id } (missing Kick Members permission, or their role is at or above mine)")
 
             try :
                 record =await mongo_call (
@@ -2356,15 +2359,28 @@ async def on_message (message :discord .Message ):
                 message .guild .id ,
                 )
                 if record :
-                    data ["view"].update_stats (
-                    kicks =int (record .get ("kicks",0 )),
-                    violations =int (record .get ("violations",0 )),
-                    )
-                    if data .get ("message")is not None :
+                    new_kicks =int (record .get ("kicks",0 ))
+                    new_violations =int (record .get ("violations",0 ))
+                    if kicked :
+                        print (f"Anti-scam: kicked {member } in channel {message .channel .id } (kicks={new_kicks }, blocked={new_violations })")
+                    else :
+                        print (f"Anti-scam: removed message from {member } in channel {message .channel .id } (kicks={new_kicks }, blocked={new_violations })")
+                    new_view =AntiScamView (new_kicks ,new_violations )
+                    data ["view"]=new_view
+                    target_message =data .get ("message")
+                    if target_message is None :
+                        stored_message_id =data .get ("message_id")
+                        if stored_message_id is not None :
+                            try :
+                                target_message =await message .channel .fetch_message (int (stored_message_id ))
+                                data ["message"]=target_message
+                            except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ) as fetch_error :
+                                print (f"Anti-scam: could not fetch status message {stored_message_id } in channel {message .channel .id }: {fetch_error }")
+                    if target_message is not None :
                         try :
-                            await data ["message"].edit (view =data ["view"])
-                        except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ):
-                            pass
+                            await target_message .edit (view =new_view )
+                        except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ) as edit_error :
+                            print (f"Anti-scam: could not update the status message in channel {message .channel .id }: {edit_error }")
             except PyMongoError as error :
                 print (f"MongoDB anti-scam update error for channel {message .channel .id }: {error }")
 
@@ -2396,6 +2412,8 @@ def ensure_persistence_indexes_sync ():
         [("guild_id",1),("channel_id",1)],
         name="guild_channel_idx",
     )
+    anti_scam_collection.create_index([("guild_id",1)], name="guild_idx")
+    reaction_roles_collection.create_index([("message_id",1)], name="message_idx")
 
 
 async def restore_sticky_triggers ():
@@ -2461,6 +2479,7 @@ async def restore_anti_scam_channels ():
             created_channels [channel_id ]={
             "view":view ,
             "message":None ,
+            "message_id":message_id ,
             "guild_id":guild_id ,
             }
             continue
@@ -2479,6 +2498,7 @@ async def restore_anti_scam_channels ():
         created_channels [channel_id ]={
         "view":view ,
         "message":message ,
+        "message_id":message_id ,
         "guild_id":guild_id ,
         }
 
