@@ -11,6 +11,7 @@ import threading
 from http .server import BaseHTTPRequestHandler ,HTTPServer
 import urllib .error
 import urllib .request
+import calendar
 from datetime import datetime ,timedelta ,timezone
 from pathlib import Path
 
@@ -48,6 +49,7 @@ reaction_roles_collection =mongo_db ["reaction_roles"]
 member_snapshots_collection =mongo_db ["member_snapshots"]
 sticky_triggers_collection =mongo_db ["sticky_triggers"]
 script_uploads_collection =mongo_db ["script_uploads"]
+repeat_reminder_collection =mongo_db ["repeat_reminders"]
 
 intents =discord .Intents .default ()
 intents .guilds =True
@@ -2414,6 +2416,11 @@ def ensure_persistence_indexes_sync ():
     )
     anti_scam_collection.create_index([("guild_id",1)], name="guild_idx")
     reaction_roles_collection.create_index([("message_id",1)], name="message_idx")
+    repeat_reminder_collection.create_index(
+        [("guild_id",1),("channel_id",1)],
+        name="guild_channel_idx",
+    )
+    repeat_reminder_collection.create_index([("next_run",1)], name="next_run_idx")
 
 
 async def restore_sticky_triggers ():
@@ -2506,7 +2513,7 @@ async def restore_anti_scam_channels ():
 
 @bot .event
 async def on_ready ():
-    global ready_once
+    global ready_once ,repeat_reminder_task
 
     if ready_once :
         return
@@ -2540,6 +2547,9 @@ async def on_ready ():
         script_restored=await restore_script_uploads ()
         await restore_anti_scam_channels ()
         await restore_reaction_roles ()
+        reminder_restored=await restore_repeat_reminders ()
+        if repeat_reminder_task is None or repeat_reminder_task .done ():
+            repeat_reminder_task =bot .loop .create_task (repeat_reminder_loop ())
 
         ready_once =True
 
@@ -2557,6 +2567,9 @@ async def on_ready ():
         )
         print (
         f"Restored {len (reaction_role_cache )} reaction-role message(s)"
+        )
+        print (
+        f"Restored {reminder_restored } repeat reminder(s)"
         )
         print (
         f"Restored {sticky_restored} sticky trigger(s)"
@@ -2710,12 +2723,332 @@ async def global_app_command_error(interaction: discord.Interaction, error: app_
         pass
 
 
+reminder_group =app_commands .Group (
+name ="reminder",
+description ="Reminder tools",
+)
+
+repeat_reminder_task =None
+
+REPEAT_UNIT_SECONDS ={
+"seconds":1 ,
+"minutes":60 ,
+"hours":3600 ,
+"days":86400 ,
+"months":2629746 ,
+"years":31556952 ,
+}
+
+REPEAT_MIN_INTERVAL_SECONDS =10
+REPEAT_MAX_CONSECUTIVE_FAILURES =5
+
+
+def list_due_repeat_reminders_sync (now ):
+    return list (
+    repeat_reminder_collection .find (
+    {"active":True ,"next_run":{"$lte":now }},
+    )
+    .sort ("next_run",1 )
+    )
+
+
+def list_all_repeat_reminders_sync ():
+    return list (repeat_reminder_collection .find ({}))
+
+
+def list_repeat_reminders_sync (guild_id ):
+    return list (
+    repeat_reminder_collection .find ({"guild_id":guild_id })
+    .sort ("next_run",1 )
+    )
+
+
+def insert_repeat_reminder_sync (document ):
+    result =repeat_reminder_collection .insert_one (document )
+    return result .inserted_id
+
+
+def delete_repeat_reminders_sync (guild_id ,channel_id ):
+    result =repeat_reminder_collection .delete_many (
+    {"guild_id":guild_id ,"channel_id":channel_id }
+    )
+    return result .deleted_count
+
+
+def update_repeat_reminder_after_fire_sync (record_id ,next_run ):
+    return repeat_reminder_collection .find_one_and_update (
+    {"_id":record_id },
+    {"$set":{"next_run":next_run ,"failures":0 }},
+    return_document =ReturnDocument .AFTER ,
+    )
+
+
+def record_repeat_reminder_failure_sync (record_id ,next_run ,failures ):
+    return repeat_reminder_collection .find_one_and_update (
+    {"_id":record_id },
+    {
+    "$set":{
+    "next_run":next_run ,
+    "failures":failures ,
+    "active":failures <REPEAT_MAX_CONSECUTIVE_FAILURES ,
+    }
+    },
+    return_document =ReturnDocument .AFTER ,
+    )
+
+
+def advance_repeat_schedule (start_ts ,amount ,unit ):
+    if unit in ("months","years"):
+        moment =datetime .fromtimestamp (start_ts ,timezone .utc )
+        months =amount *(12 if unit =="years" else 1)
+        month_index =moment .month -1 +months
+        year =moment .year +month_index //12
+        month =month_index %12 +1
+        day =min (moment .day ,calendar .monthrange (year ,month )[1])
+        advanced =moment .replace (year =year ,month =month ,day =day )
+        return advanced .timestamp ()
+    return start_ts +amount *REPEAT_UNIT_SECONDS [unit ]
+
+
+def describe_repeat_interval (amount ,unit ):
+    singular =unit [:-1 ] if amount ==1 and unit .endswith ("s") else unit
+    return f"{amount } {singular }"
+
+
+def describe_delay (seconds ):
+    seconds =max (1 ,int (seconds ))
+    if seconds <60 :
+        return f"{seconds } second(s)"
+    if seconds <3600 :
+        return f"{seconds //60 } minute(s)"
+    if seconds <86400 :
+        return f"{seconds //3600 } hour(s)"
+    return f"{seconds //86400 } day(s)"
+
+
+async def restore_repeat_reminders ():
+    records =await mongo_call (list_all_repeat_reminders_sync)
+    return len (records)
+
+
+async def run_repeat_reminder (record ,now ):
+    record_id =record ["_id"]
+    channel_id =int (record ["channel_id"])
+    amount =int (record ["amount"])
+    unit =str (record ["unit"])
+
+    next_run =advance_repeat_schedule (float (record ["next_run"]),amount ,unit)
+    catch_up =0
+    while next_run <=now and catch_up <1000 :
+        next_run =advance_repeat_schedule (next_run ,amount ,unit)
+        catch_up +=1
+
+    channel =bot .get_channel (channel_id)
+    if channel is None :
+        try :
+            channel =await bot .fetch_channel (channel_id)
+        except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ):
+            channel =None
+
+    if channel is None :
+        failures =int (record .get ("failures",0))+1
+        await mongo_call (
+        record_repeat_reminder_failure_sync ,
+        record_id ,
+        next_run ,
+        failures ,
+        )
+        if failures >=REPEAT_MAX_CONSECUTIVE_FAILURES :
+            print (
+            f"Repeat reminder {record_id } disabled :channel {channel_id } unavailable"
+            )
+        return
+
+    try :
+        message =await channel .send (".")
+    except (discord .Forbidden ,discord .HTTPException ) as error :
+        failures =int (record .get ("failures",0))+1
+        await mongo_call (
+        record_repeat_reminder_failure_sync ,
+        record_id ,
+        next_run ,
+        failures ,
+        )
+        print (
+        f"Repeat reminder {record_id } send failed ({failures } consecutive): {error }"
+        )
+        return
+
+    try :
+        await asyncio .sleep (1.0)
+        await message .delete ()
+    except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ) as error :
+        print (f"Repeat reminder {record_id } delete failed :{error }")
+
+    await mongo_call (update_repeat_reminder_after_fire_sync ,record_id ,next_run)
+
+
+async def repeat_reminder_loop ():
+    await bot .wait_until_ready ()
+    while not bot .is_closed ():
+        try :
+            now =time .time ()
+            due =await mongo_call (list_due_repeat_reminders_sync ,now )
+            for record in due :
+                await run_repeat_reminder (record ,now )
+        except Exception as error :
+            print (f"Repeat reminder loop error :{error }")
+        await asyncio .sleep (5)
+
+
+@reminder_group .command (
+name ="repeat",
+description ="Post a '.' in a channel on a repeating schedule (auto-deleted)",
+)
+@app_commands .default_permissions (manage_guild =True )
+@app_commands .describe (
+channel ="The channel to post the '.' in",
+amount ="How often to post",
+unit ="Interval unit",
+)
+@app_commands .choices (unit =[
+app_commands .Choice (name ="Seconds",value ="seconds"),
+app_commands .Choice (name ="Minutes",value ="minutes"),
+app_commands .Choice (name ="Hours",value ="hours"),
+app_commands .Choice (name ="Days",value ="days"),
+app_commands .Choice (name ="Months",value ="months"),
+app_commands .Choice (name ="Years",value ="years"),
+])
+@app_commands .checks .has_permissions (manage_guild =True )
+async def reminder_repeat (
+interaction :discord .Interaction ,
+channel :discord .TextChannel ,
+amount :app_commands .Range [int ,1 ,1000 ],
+unit :app_commands .Choice [str ],
+):
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return
+
+    interval_seconds =amount *REPEAT_UNIT_SECONDS [unit .value ]
+    if interval_seconds <REPEAT_MIN_INTERVAL_SECONDS :
+        await interaction .response .send_message (
+        "The total interval must be at least 10 seconds (Discord rate limits).",
+        ephemeral =True ,
+        )
+        return
+
+    await interaction .response .defer (ephemeral =True )
+
+    now =time .time ()
+    first_run =advance_repeat_schedule (now ,amount ,unit .value )
+    document ={
+    "guild_id":interaction .guild .id ,
+    "channel_id":channel .id ,
+    "created_by":interaction .user .id ,
+    "amount":amount ,
+    "unit":unit .value ,
+    "next_run":first_run ,
+    "failures":0 ,
+    "active":True ,
+    "created_at":now ,
+    }
+    record_id =await mongo_call (insert_repeat_reminder_sync ,document)
+
+    await interaction .followup .send (
+    f"Repeat reminder set in {channel .mention }: a '.' will be posted and deleted "
+    f"every {describe_repeat_interval (amount ,unit .value )}. "
+    f"First one in about {describe_delay (first_run -now )}. "
+    f"Reminder ID {record_id }. Use /reminder stop to cancel it.",
+    ephemeral =True ,
+    )
+
+
+@reminder_group .command (
+name ="stop",
+description ="Stop the repeating '.' reminders in a channel",
+)
+@app_commands .default_permissions (manage_guild =True )
+@app_commands .describe (channel ="The channel whose reminders to stop")
+@app_commands .checks .has_permissions (manage_guild =True )
+async def reminder_stop (
+interaction :discord .Interaction ,
+channel :discord .TextChannel ,
+):
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return
+
+    await interaction .response .defer (ephemeral =True )
+    removed =await mongo_call (
+    delete_repeat_reminders_sync ,
+    interaction .guild .id ,
+    channel .id ,
+    )
+    if removed :
+        await interaction .followup .send (
+        f"Stopped {removed } repeat reminder(s) in {channel .mention }.",
+        ephemeral =True ,
+        )
+    else :
+        await interaction .followup .send (
+        f"No repeat reminders found in {channel .mention }.",
+        ephemeral =True ,
+        )
+
+
+@reminder_group .command (
+name ="list",
+description ="List the repeating '.' reminders in this server",
+)
+@app_commands .default_permissions (manage_guild =True )
+@app_commands .checks .has_permissions (manage_guild =True )
+async def reminder_list (interaction :discord .Interaction ):
+    if interaction .guild is None :
+        await interaction .response .send_message (
+        "This command can only be used inside a server.",
+        ephemeral =True ,
+        )
+        return
+
+    await interaction .response .defer (ephemeral =True )
+    records =await mongo_call (list_repeat_reminders_sync ,interaction .guild .id)
+    if not records :
+        await interaction .followup .send (
+        "No repeat reminders are set in this server.",
+        ephemeral =True ,
+        )
+        return
+
+    now =time .time ()
+    lines =[]
+    for record in records :
+        channel_id =int (record ["channel_id"])
+        lines .append (
+        f"<#{channel_id }> : every "
+        f"{describe_repeat_interval (int (record ['amount']),str (record ['unit']))} , "
+        f"next in about {describe_delay (float (record ['next_run'])-now )} , "
+        f"{int (record .get ('failures',0))} failure(s)"
+        )
+    await interaction .followup .send (
+    "\n".join (lines ) ,
+    ephemeral =True ,
+    )
+
+
 bot .tree .add_command (create_group )
 bot .tree .add_command (server_group )
 bot .tree .add_command (add_group )
 bot .tree .add_command (update_group )
 bot .tree .add_command (custom_group )
 bot .tree .add_command (sticky_group )
+bot .tree .add_command (reminder_group )
 
 
 
