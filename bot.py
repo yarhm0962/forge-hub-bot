@@ -2314,6 +2314,8 @@ async def on_member_join (member :discord .Member ):
     except PyMongoError as error :
         print (f"MongoDB join tracking error for guild {member .guild .id }: {error }")
 
+    await fire_repeat_reminders_on_join (member .guild .id)
+
 
 @bot .event
 async def on_member_remove (member :discord .Member ):
@@ -2775,6 +2777,12 @@ def delete_repeat_reminders_sync (guild_id ,channel_id ):
     return result .deleted_count
 
 
+def list_active_repeat_reminders_sync (guild_id ):
+    return list (
+    repeat_reminder_collection .find ({"guild_id":guild_id ,"active":True })
+    )
+
+
 def update_repeat_reminder_after_fire_sync (record_id ,next_run ):
     return repeat_reminder_collection .find_one_and_update (
     {"_id":record_id },
@@ -2886,6 +2894,40 @@ async def run_repeat_reminder (record ,now ):
         print (f"Repeat reminder {record_id } delete failed :{error }")
 
     await mongo_call (update_repeat_reminder_after_fire_sync ,record_id ,next_run)
+
+
+last_join_fire ={}
+
+
+async def fire_repeat_reminders_on_join (guild_id ):
+    now =time .time ()
+    previous =last_join_fire .get (guild_id ,0)
+    if now -previous <REPEAT_MIN_INTERVAL_SECONDS :
+        return
+    last_join_fire [guild_id ]=now
+
+    try :
+        records =await mongo_call (list_active_repeat_reminders_sync ,guild_id)
+    except Exception as error :
+        print (f"Join reminder lookup error for guild {guild_id }: {error }")
+        return
+
+    for record in records :
+        channel =bot .get_channel (int (record ["channel_id"]))
+        if channel is None :
+            continue
+        try :
+            message =await channel .send (".")
+        except (discord .Forbidden ,discord .HTTPException ) as error :
+            print (
+            f"Join-triggered reminder send failed in {record ['channel_id']}: {error }"
+            )
+            continue
+        try :
+            await asyncio .sleep (1.0)
+            await message .delete ()
+        except (discord .NotFound ,discord .Forbidden ,discord .HTTPException ) as error :
+            print (f"Join-triggered reminder delete failed :{error }")
 
 
 async def repeat_reminder_loop ():
