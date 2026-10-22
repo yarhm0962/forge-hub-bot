@@ -2408,21 +2408,24 @@ async def on_message (message :discord .Message ):
 
 
 def ensure_persistence_indexes_sync ():
-    sticky_triggers_collection.create_index(
-        [("guild_id",1),("channel_id",1)],
-        name="guild_channel_idx",
-    )
-    script_uploads_collection.create_index(
-        [("guild_id",1),("channel_id",1)],
-        name="guild_channel_idx",
-    )
-    anti_scam_collection.create_index([("guild_id",1)], name="guild_idx")
-    reaction_roles_collection.create_index([("message_id",1)], name="message_idx")
-    repeat_reminder_collection.create_index(
-        [("guild_id",1),("channel_id",1)],
-        name="guild_channel_idx",
-    )
-    repeat_reminder_collection.create_index([("next_run",1)], name="next_run_idx")
+    # Tolerant index setup: a pre-existing index with a different name (for
+    # example MongoDB's auto-named guild_id_1) must not abort bot startup,
+    # because on_ready performs command sync and data restores after this.
+    index_jobs =[
+    (sticky_triggers_collection ,[("guild_id",1),("channel_id",1)],"guild_channel_idx"),
+    (script_uploads_collection ,[("guild_id",1),("channel_id",1)],"guild_channel_idx"),
+    (anti_scam_collection ,[("guild_id",1)],"guild_idx"),
+    (reaction_roles_collection ,[("message_id",1)],"message_idx"),
+    (repeat_reminder_collection ,[("guild_id",1),("channel_id",1)],"guild_channel_idx"),
+    (repeat_reminder_collection ,[("next_run",1)],"next_run_idx"),
+    ]
+    for collection ,keys ,name in index_jobs :
+        try :
+            collection .create_index (keys ,name =name)
+        except PyMongoError as error :
+            print (
+            f"Index warning for {collection .name } ({name }): {error }"
+            )
 
 
 async def restore_sticky_triggers ():
